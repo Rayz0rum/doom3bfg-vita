@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="neo/sys/vita/sce_sys/livearea/contents/startup.png" alt="DOOM 3 BFG Edition" width="560">
+  <img src="logo.png" alt="DOOM 3 BFG Edition" width="560">
 </p>
 
 <h1 align="center">DOOM 3 BFG Edition for PlayStation Vita/TV</h1>
