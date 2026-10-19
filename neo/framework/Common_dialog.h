@@ -242,7 +242,7 @@ public:
     bool renderDuringLoad;
     int startTime;
     int killTime;
-    idStrStatic<256> overrideMsg;
+    idStrStatic<1024> overrideMsg;
 
     idStrId txt1;
     idStrId txt2;
@@ -283,7 +283,7 @@ public:
     void ClearDialogs(bool forceClear = false);
     bool HasDialogMsg(gameDialogMessages_t msg, bool* isNowActive);
     void AddDialog(gameDialogMessages_t msg, dialogType_t type, idSWFScriptFunction* acceptCallback, idSWFScriptFunction* cancelCallback, bool pause, const char* location = NULL, int lineNumber = 0, bool leaveOnMapHeapReset = false, bool waitOnAtlas = false, bool renderDuringLoad = false);
-    void AddDynamicDialog(gameDialogMessages_t msg, const idStaticList<idSWFScriptFunction*, 4>& callbacks, const idStaticList<idStrId, 4>& optionText, bool pause, idStrStatic<256> overrideMsg, bool leaveOnMapHeapReset = false, bool waitOnAtlas = false, bool renderDuringLoad = false);
+    void AddDynamicDialog(gameDialogMessages_t msg, const idStaticList<idSWFScriptFunction*, 4>& callbacks, const idStaticList<idStrId, 4>& optionText, bool pause, idStrStatic<1024> overrideMsg, bool leaveOnMapHeapReset = false, bool waitOnAtlas = false, bool renderDuringLoad = false);
     void AddDialogIntVal(const char* name, int val);
     bool IsDialogActive();
     void ClearDialog(gameDialogMessages_t msg, const char* location = NULL, int lineNumber = 0);

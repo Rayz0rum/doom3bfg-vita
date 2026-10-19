@@ -803,6 +803,152 @@ int M_GetMouseSpeedForMenu( float cvarValue )
 	return roundedMouseSpeed;
 }
 
+#if defined(__vita__)
+extern idCVar vita_classicYawSpeed; // UsercmdGen.cpp: the right stick's turn speed in DOOM / DOOM II
+
+// Camera Sensitivity's 16 notches: 60 to 600 degrees a second, 36 apart
+// (notch 5 = 240, DOOM 3's default stick speed)
+static int M_GetCameraSpeedForMenu()
+{
+	const int notch = ( int )( ( vita_classicYawSpeed.GetFloat() - 60.0f ) / 36.0f + 0.5f );
+	return idMath::ClampInt( 0, 15, notch );
+}
+
+void M_DrawOptions( void )
+{
+	V_DrawPatchDirect( 108, 15, 0, ( patch_t* )W_CacheLumpName( "M_OPTTTL", PU_CACHE_SHARED ) );
+
+	V_DrawPatchDirect( ::g->OptionsDef.x + 120, ::g->OptionsDef.y + LINEHEIGHT * messages, 0,
+					   ( patch_t* )W_CacheLumpName( msgNames[m_show_messages.GetInteger()], PU_CACHE_SHARED ) );
+
+	M_DrawThermo( ::g->OptionsDef.x, ::g->OptionsDef.y + LINEHEIGHT * ( mousesens + 1 ), 16, M_GetCameraSpeedForMenu() );
+}
+
+/*
+================
+The Vita's composed menu graphics
+
+The menu items are pictures in the WAD, so the renamed ones are made at run
+time from the WAD's own letters, column by column: "Camera Sensitivity" (the
+C of "Choose", a / m / e of "Game", r of "Hurt", and "sensitivity" itself)
+and "Change Game" (C and h of "Choose", a of "Game", n of "sensitivity", g of
+"rough", e and then the word "Game"). Column ranges measured from DOOM.WAD and
+DOOM2.WAD (the same pictures in both).
+================
+*/
+struct menuGlyphPart_t
+{
+	const char* lump;	// NULL: blank columns
+	int x0, x1;
+};
+
+static const menuGlyphPart_t menuCameraSensitivity[] =
+{
+	{ "M_SKILL", 0, 16 }, { "M_NGAME", 67, 82 }, { "M_NGAME", 82, 97 }, { "M_NGAME", 97, 110 },
+	{ "M_HURT", 31, 44 }, { "M_NGAME", 67, 82 }, { NULL, 0, 8 }, { "M_MSENS", 83, 206 }, { NULL, 0, 0 }
+};
+static const menuGlyphPart_t menuChangeGame[] =
+{
+	{ "M_SKILL", 0, 16 }, { "M_SKILL", 16, 31 }, { "M_NGAME", 67, 82 }, { "M_MSENS", 114, 126 },
+	{ "M_ROUGH", 214, 229 }, { "M_NGAME", 97, 110 }, { NULL, 0, 7 }, { "M_NGAME", 51, 110 }, { NULL, 0, 0 }
+};
+
+static patch_t* M_ComposeMenuPatch( const menuGlyphPart_t* parts )
+{
+	int width = 0;
+	int height = 0;
+	int dataBytes = 0;
+	for( int i = 0; parts[i].lump != NULL || parts[i].x1 > 0; i++ )
+	{
+		const menuGlyphPart_t& p = parts[i];
+		width += p.x1 - p.x0;
+		if( p.lump == NULL )
+		{
+			dataBytes += p.x1 - p.x0; // a lone end-of-column marker each
+			continue;
+		}
+		if( W_CheckNumForName( p.lump ) < 0 )
+		{
+			return NULL;
+		}
+		const patch_t* src = ( const patch_t* )W_CacheLumpName( p.lump, PU_CACHE_SHARED );
+		if( p.x1 > SHORT( src->width ) )
+		{
+			return NULL;
+		}
+		height = Max( height, ( int )SHORT( src->height ) );
+		for( int x = p.x0; x < p.x1; x++ )
+		{
+			const byte* col = ( const byte* )src + LONG( src->columnofs[x] );
+			while( *col != 0xff )
+			{
+				dataBytes += col[1] + 4;
+				col += col[1] + 4;
+			}
+			dataBytes += 1;
+		}
+	}
+	const int headerBytes = 8 + 4 * width;
+	byte* out = ( byte* )malloc( headerBytes + dataBytes );
+	if( out == NULL )
+	{
+		return NULL;
+	}
+	patch_t* dst = ( patch_t* )out;
+	dst->width = SHORT( ( short )width );
+	dst->height = SHORT( ( short )height );
+	dst->leftoffset = 0;
+	dst->topoffset = 0;
+	int outX = 0;
+	int at = headerBytes;
+	for( int i = 0; parts[i].lump != NULL || parts[i].x1 > 0; i++ )
+	{
+		const menuGlyphPart_t& p = parts[i];
+		const patch_t* src = ( p.lump != NULL ) ? ( const patch_t* )W_CacheLumpName( p.lump, PU_CACHE_SHARED ) : NULL;
+		for( int x = p.x0; x < p.x1; x++, outX++ )
+		{
+			dst->columnofs[outX] = LONG( at );
+			if( src != NULL )
+			{
+				const byte* col = ( const byte* )src + LONG( src->columnofs[x] );
+				while( *col != 0xff )
+				{
+					const int postBytes = col[1] + 4;
+					memcpy( out + at, col, postBytes );
+					at += postBytes;
+					col += postBytes;
+				}
+			}
+			out[at++] = 0xff;
+		}
+	}
+	return dst;
+}
+
+// a menu item's picture: the composed ones by name, else the WAD's lump
+static patch_t* M_MenuItemPatch( const char* name )
+{
+	static patch_t* cameraSensitivity = NULL;
+	static patch_t* changeGame = NULL;
+	static bool tried = false;
+	if( !tried )
+	{
+		tried = true;
+		cameraSensitivity = M_ComposeMenuPatch( menuCameraSensitivity );
+		changeGame = M_ComposeMenuPatch( menuChangeGame );
+		I_Printf( "menu: composed Camera Sensitivity %s, Change Game %s\n", cameraSensitivity ? "ok" : "FAILED (stock picture)", changeGame ? "ok" : "FAILED (stock picture)" );
+	}
+	if( idStr::Cmp( name, "M_CSENS" ) == 0 )
+	{
+		return cameraSensitivity ? cameraSensitivity : ( patch_t* )W_CacheLumpName( "M_MSENS", PU_CACHE_SHARED );
+	}
+	if( idStr::Cmp( name, "M_CHGAME" ) == 0 )
+	{
+		return changeGame ? changeGame : ( patch_t* )W_CacheLumpName( "M_CHG", PU_CACHE_SHARED );
+	}
+	return ( patch_t* )W_CacheLumpName( name, PU_CACHE_SHARED );
+}
+#else
 void M_DrawOptions( void )
 {
 	V_DrawPatchDirect( 108, 15, 0, ( patch_t* )W_CacheLumpName( "M_OPTTTL", PU_CACHE_SHARED ) );
@@ -829,6 +975,7 @@ void M_DrawOptions( void )
 	//M_DrawThermo(::g->OptionsDef.x,::g->OptionsDef.y+LINEHEIGHT*(scrnsize+1),
 	//	9,::g->screenSize);
 }
+#endif
 
 void M_Options( int choice )
 {
@@ -971,6 +1118,20 @@ void M_GameSelection( int choice )
 
 void M_ChangeSensitivity( int choice )
 {
+#if defined(__vita__)
+	// Camera Sensitivity: the right stick's turn speed (vita_classicYawSpeed)
+	int notch = M_GetCameraSpeedForMenu();
+	if( choice == 0 && notch > 0 )
+	{
+		notch--;
+	}
+	else if( choice == 1 && notch < 15 )
+	{
+		notch++;
+	}
+	vita_classicYawSpeed.SetFloat( 60.0f + 36.0f * notch );
+	return;
+#endif
 	extern idCVar in_mouseSpeed;
 
 	int roundedMouseSpeed = M_GetMouseSpeedForMenu( in_mouseSpeed.GetFloat() );
@@ -1693,7 +1854,11 @@ void M_Drawer( void )
 	{
 		if( ::g->currentMenu->menuitems[i].name[0] )
 			V_DrawPatchDirect( ::g->md_x, ::g->md_y, 0,
+#if defined(__vita__)
+							   M_MenuItemPatch( ::g->currentMenu->menuitems[i].name ) );
+#else
 							   ( patch_t* )W_CacheLumpName( ::g->currentMenu->menuitems[i].name , PU_CACHE_SHARED ) );
+#endif
 		::g->md_y += LINEHEIGHT;
 	}
 
@@ -1748,6 +1913,10 @@ void M_Init( void )
 
 	::g->currentMenu = &::g->MainDef;
 	::g->menuactive = 1;
+#if defined(__vita__)
+	// the gamepad is the Vita's only controller: always on (the option is gone)
+	in_useJoystick.SetBool( true );
+#endif
 	::g->itemOn = ::g->currentMenu->lastOn;
 	::g->whichSkull = 0;
 	::g->skullAnimCounter = 10;

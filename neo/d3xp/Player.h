@@ -467,6 +467,10 @@ public:
 
     void UpdateConditions();
     void SetViewAngles(const idAngles& angles);
+    bool VitaWeaponEnabled() const
+    {
+        return weaponEnabled; // (the full verification: a map's script can take the weapon away)
+    }
 
     // Controller Shake
     void ControllerShakeFromDamage(int damage);
@@ -511,6 +515,9 @@ public:
     void ClearChatMessage(int index);
 
     void DrawHUD(idMenuHandler_HUD* hudManager);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    bool VitaHudShown() const; // DrawHUD would draw the HUD (PlayerView.cpp plays it back at 15 Hz only then)
+#endif
 
     void WeaponFireFeedback(const idDict* weaponDef);
 
@@ -580,6 +587,9 @@ public:
         previousWeapon = num;
     }
     void SelectWeapon(int num, bool force);
+    // a bot's weapon change (VitaBots.cpp): weapon index num, held with ammo;
+    // the weapon toggles of SelectWeapon's impulse slots do not apply
+    bool VitaBotSelectWeapon(int num);
     void DropWeapon(bool died);
     void StealWeapon(idPlayer* player);
     void AddProjectilesFired(int count);

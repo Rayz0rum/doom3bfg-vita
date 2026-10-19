@@ -28,6 +28,16 @@ If you have questions concerning this license or the applicable additional terms
 */
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h"
+
+// where the AF solver's time goes, step by step (a few dozen clocked calls a
+// frame while ragdolls move: worth it on the Vita too, where the worst frames
+// of the fights are ragdoll solves)
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+#define LCP_ZONE(name) VITA_ZONE(name)
+#else
+#define LCP_ZONE(name)
+#endif
 
 // this file is full of intentional case fall throughs
 // lint -e616
@@ -46,6 +56,25 @@ const float LCP_DELTA_FORCE_EPSILON = 1e-9f;
 
 #if defined(USE_INTRINSICS)
 #define LCP_SIMD
+#endif
+
+/*
+Vita: NEON for the kernels the AF solver spends its time in - Multiply,
+MultiplyAdd, DotProduct and the two triangular solves (the articulated figure
+LCP: 5 ms a frame, 29 at worst, in the benchmark's fights). The generic code
+below already works in four independent lanes (s0..s3, a0..a3, one per
+column or row); the NEON versions are the same lanes in one register, with
+the same operations in the same order: VMLA/VMLS on the Cortex-A9 round the
+product before the add, as the scalar code does, and the horizontal sums stay
+scalar and left to right. So the results are bit for bit the same -
+tools/vita/neontest checks each kernel against the generic code on random
+matrices - with one exception the emulation cannot show: ARMv7 NEON always
+flushes denormals (below 1.2e-38) to zero where the scalar VFP code keeps
+them, so a value that small comes out as 0 instead.
+*/
+#if !defined(LCP_SIMD) && defined(__vita__) && defined(__ARM_NEON__)
+#define LCP_NEON
+#include <arm_neon.h>
 #endif
 
 #if defined(LCP_SIMD)
@@ -107,6 +136,12 @@ static void Multiply_SIMD(float* dst, const float* src0, const float* src1, cons
         _mm_store_ps(dst + i, s0);
     }
 
+#elif defined(LCP_NEON)
+
+    for (; i + 4 <= count; i += 4) {
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(src0 + i), vld1q_f32(src1 + i)));
+    }
+
 #else
 
     for (; i + 4 <= count; i += 4) {
@@ -160,6 +195,12 @@ static void MultiplyAdd_SIMD(float* dst, const float constant, const float* src,
         _mm_store_ps(dst + i, s);
     }
 
+#elif defined(LCP_NEON)
+
+    for (; i + 4 <= count; i += 4) {
+        vst1q_f32(dst + i, vmlaq_n_f32(vld1q_f32(dst + i), vld1q_f32(src + i), constant));
+    }
+
 #else
 
     for (; i + 4 <= count; i += 4) {
@@ -209,6 +250,33 @@ static float DotProduct_SIMD(const float* src0, const float* src1, const int cou
     float dot;
     _mm_store_ss(&dot, sum);
     return dot;
+
+#elif defined(LCP_NEON)
+
+    float32x4_t sum = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= count; i += 4) {
+        sum = vmlaq_f32(sum, vld1q_f32(src0 + i), vld1q_f32(src1 + i));
+    }
+    float s0 = vgetq_lane_f32(sum, 0);
+    float s1 = vgetq_lane_f32(sum, 1);
+    float s2 = vgetq_lane_f32(sum, 2);
+    float s3 = vgetq_lane_f32(sum, 3);
+    switch (count - i) {
+        NODEFAULT;
+
+    case 4:
+        s3 += src0[i + 3] * src1[i + 3];
+    case 3:
+        s2 += src0[i + 2] * src1[i + 2];
+    case 2:
+        s1 += src0[i + 1] * src1[i + 1];
+    case 1:
+        s0 += src0[i + 0] * src1[i + 0];
+    case 0:
+        break;
+    }
+    return s0 + s1 + s2 + s3;
 
 #else
 
@@ -478,6 +546,45 @@ static void LowerTriangularSolve_SIMD(const idMatX& L, float* x, const float* b,
 
     assert_16_byte_aligned(x);
 
+#if defined(LCP_NEON)
+    for (; i + 3 < n; i += 4) {
+        const float* lptr0 = &lptr[0 * nc];
+        const float* lptr1 = &lptr[1 * nc];
+        const float* lptr2 = &lptr[2 * nc];
+        const float* lptr3 = &lptr[3 * nc];
+
+        // a0 = -l[0] * x[0] + b[i], a1..a3 = -l[k] * x[k]: adding -0 to the
+        // other lanes changes nothing, -0 included
+        const float32x4_t negZero = vdupq_n_f32(-0.0f);
+        const float32x4_t x0 = vld1q_f32(x);
+        float32x4_t va = vaddq_f32(vnegq_f32(vmulq_f32(vld1q_f32(lptr0), x0)), vsetq_lane_f32(b[i + 0], negZero, 0));
+        float32x4_t vb = vaddq_f32(vnegq_f32(vmulq_f32(vld1q_f32(lptr1), x0)), vsetq_lane_f32(b[i + 1], negZero, 0));
+        float32x4_t vc = vaddq_f32(vnegq_f32(vmulq_f32(vld1q_f32(lptr2), x0)), vsetq_lane_f32(b[i + 2], negZero, 0));
+        float32x4_t vd = vaddq_f32(vnegq_f32(vmulq_f32(vld1q_f32(lptr3), x0)), vsetq_lane_f32(b[i + 3], negZero, 0));
+
+        for (int j = 4; j < i; j += 4) {
+            const float32x4_t xj = vld1q_f32(x + j);
+            va = vmlsq_f32(va, vld1q_f32(lptr0 + j), xj);
+            vb = vmlsq_f32(vb, vld1q_f32(lptr1 + j), xj);
+            vc = vmlsq_f32(vc, vld1q_f32(lptr2 + j), xj);
+            vd = vmlsq_f32(vd, vld1q_f32(lptr3 + j), xj);
+        }
+
+        vb = vmlsq_n_f32(vb, va, lptr1[i + 0]);
+        vc = vmlsq_n_f32(vc, va, lptr2[i + 0]);
+        vc = vmlsq_n_f32(vc, vb, lptr2[i + 1]);
+        vd = vmlsq_n_f32(vd, va, lptr3[i + 0]);
+        vd = vmlsq_n_f32(vd, vb, lptr3[i + 1]);
+        vd = vmlsq_n_f32(vd, vc, lptr3[i + 2]);
+
+        x[i + 0] = vgetq_lane_f32(va, 0) + vgetq_lane_f32(va, 1) + vgetq_lane_f32(va, 2) + vgetq_lane_f32(va, 3);
+        x[i + 1] = vgetq_lane_f32(vb, 0) + vgetq_lane_f32(vb, 1) + vgetq_lane_f32(vb, 2) + vgetq_lane_f32(vb, 3);
+        x[i + 2] = vgetq_lane_f32(vc, 0) + vgetq_lane_f32(vc, 1) + vgetq_lane_f32(vc, 2) + vgetq_lane_f32(vc, 3);
+        x[i + 3] = vgetq_lane_f32(vd, 0) + vgetq_lane_f32(vd, 1) + vgetq_lane_f32(vd, 2) + vgetq_lane_f32(vd, 3);
+
+        lptr += 4 * nc;
+    }
+#else
     for (; i + 3 < n; i += 4) {
         const float* lptr0 = &lptr[0 * nc];
         const float* lptr1 = &lptr[1 * nc];
@@ -568,6 +675,7 @@ static void LowerTriangularSolve_SIMD(const idMatX& L, float* x, const float* b,
 
         lptr += 4 * nc;
     }
+#endif
 
     // go through any remaining rows
     for (; i < n; i++) {
@@ -677,6 +785,31 @@ static void LowerTriangularSolveTranspose_SIMD(const idMatX& L, float* x, const 
         assert_16_byte_aligned(xptr);
         assert_16_byte_aligned(lptr);
 
+#if defined(LCP_NEON)
+        // s0..s3 as the lanes of one register: s[k] -= lptr2[k] * t
+        float32x4_t vs = vld1q_f32(&b[i - 4]);
+        const float* xptr2 = xptr; // x + i;
+        const float* lptr2 = lptr; // ptr = L[i] + i - 4;
+        for (int j = i; j < m; j += 4) {
+            vs = vmlsq_n_f32(vs, vld1q_f32(lptr2), xptr2[0]);
+            lptr2 += nc;
+            vs = vmlsq_n_f32(vs, vld1q_f32(lptr2), xptr2[1]);
+            lptr2 += nc;
+            vs = vmlsq_n_f32(vs, vld1q_f32(lptr2), xptr2[2]);
+            lptr2 += nc;
+            vs = vmlsq_n_f32(vs, vld1q_f32(lptr2), xptr2[3]);
+            lptr2 += nc;
+            xptr2 += 4;
+        }
+        for (int j = 0; j < r; j++) {
+            vs = vmlsq_n_f32(vs, vld1q_f32(lptr2), xptr2[j]);
+            lptr2 += nc;
+        }
+        float s0 = vgetq_lane_f32(vs, 0);
+        float s1 = vgetq_lane_f32(vs, 1);
+        float s2 = vgetq_lane_f32(vs, 2);
+        float s3 = vgetq_lane_f32(vs, 3);
+#else
         float s0 = b[i - 4];
         float s1 = b[i - 3];
         float s2 = b[i - 2];
@@ -719,6 +852,7 @@ static void LowerTriangularSolveTranspose_SIMD(const idMatX& L, float* x, const 
             s3 -= lptr2[3] * t;
             lptr2 += nc;
         }
+#endif
         // process left over of the 4 rows
         lptr -= nc;
         s0 -= lptr[0] * s3;
@@ -2445,6 +2579,7 @@ idLCP_Symmetric::FactorClamped
 */
 bool idLCP_Symmetric::FactorClamped()
 {
+    LCP_ZONE("LCP sym: factor (LDLT)");
 
     clampedChangeStart = 0;
 
@@ -2461,6 +2596,7 @@ idLCP_Symmetric::SolveClamped
 */
 void idLCP_Symmetric::SolveClamped(idVecX& x, const float* b)
 {
+    LCP_ZONE("LCP sym: solve clamped (2 triangular solves)");
 
     // solve L
     LowerTriangularSolve(clamped, solveCache1.ToFloatPtr(), b, numClamped, clampedChangeStart);
@@ -2507,6 +2643,7 @@ idLCP_Symmetric::AddClamped
 */
 void idLCP_Symmetric::AddClamped(int r, bool useSolveCache)
 {
+    LCP_ZONE("LCP sym: add clamped");
 
     assert(r >= numClamped);
 
@@ -2560,6 +2697,7 @@ idLCP_Symmetric::RemoveClamped
 */
 void idLCP_Symmetric::RemoveClamped(int r)
 {
+    LCP_ZONE("LCP sym: remove clamped (rank-2 update)");
 
     if (!verify(r < numClamped)) {
         // complete fail, most likely due to exceptional floating point values
@@ -2773,6 +2911,7 @@ Modifies this->delta_a and uses this->delta_f.
 */
 ID_INLINE void idLCP_Symmetric::CalcAccelDelta(int d)
 {
+    LCP_ZONE("LCP sym: accel delta (dot products)");
     // only the not clamped variables, including the current variable, can have a change in acceleration
     for (int j = numClamped; j <= d; j++) {
         // only the clamped variables and the current variable have a force delta unequal zero
@@ -2815,6 +2954,7 @@ idLCP_Symmetric::Solve
 */
 bool idLCP_Symmetric::Solve(const idMatX& o_m, idVecX& o_x, const idVecX& o_b, const idVecX& o_lo, const idVecX& o_hi, const int* o_boxIndex)
 {
+    LCP_ZONE("LCP sym: solve (whole)");
 
     // true when the matrix rows are 16 byte padded
     padded = ((o_m.GetNumRows() + 3) & ~3) == o_m.GetNumColumns();

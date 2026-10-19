@@ -159,6 +159,7 @@ typedef struct renderEntity_s {
     int forceUpdate;     // force an update (NOTE: not a bool to keep this struct a multiple of 4 bytes)
     int timeGroup;
     int xrayIndex;
+    int vitaHalfRateAnim; // Vita: a living monster - may be skinned at 15 Hz when far and not looked at (tr_frontend_addmodels.cpp)
 } renderEntity_t;
 
 typedef struct renderLight_s {

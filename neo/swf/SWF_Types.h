@@ -193,7 +193,12 @@ enum swfEditTextAlign_t {
     SWF_ET_ALIGN_LEFT,
     SWF_ET_ALIGN_RIGHT,
     SWF_ET_ALIGN_CENTER,
-    SWF_ET_ALIGN_JUSTIFY
+    SWF_ET_ALIGN_JUSTIFY,
+    // Serialised to the binary SWF files that ship inside the .resources, which
+    // were written by the x86 tools with a 4 byte enum. ARM defaults to
+    // -fshort-enums, so without this the field is one byte on the Vita and
+    // every later read in the stream is off. See File.h.
+    SWF_ET_ALIGN_FORCE_32BIT = 0x7fffffff
 };
 enum swfTextRenderMode_t {
     SWF_TEXT_RENDER_NORMAL = 0,

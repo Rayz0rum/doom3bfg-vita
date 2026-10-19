@@ -36,7 +36,12 @@ enum swfDictType_t {
     SWF_DICT_SPRITE,
     SWF_DICT_FONT,
     SWF_DICT_TEXT,
-    SWF_DICT_EDITTEXT
+    SWF_DICT_EDITTEXT,
+    // Serialised to the binary SWF files that ship inside the .resources, which
+    // were written by the x86 tools with a 4 byte enum. ARM defaults to
+    // -fshort-enums, so without this the field is one byte on the Vita and
+    // every later read in the stream is off. See File.h.
+    SWF_DICT_FORCE_32BIT = 0x7fffffff
 };
 enum swfTag_t {
     Tag_End = 0,
@@ -100,7 +105,12 @@ enum swfTag_t {
     Tag_DefineSceneAndFrameLabelData = 86,
     Tag_DefineBinaryData = 87,
     Tag_DefineFontName = 88,
-    Tag_StartSound2 = 89
+    Tag_StartSound2 = 89,
+    // Serialised to the binary SWF files that ship inside the .resources, which
+    // were written by the x86 tools with a 4 byte enum. ARM defaults to
+    // -fshort-enums, so without this the field is one byte on the Vita and
+    // every later read in the stream is off. See File.h.
+    Tag_FORCE_32BIT = 0x7fffffff
 };
 enum swfAction_t {
     Action_End = 0,

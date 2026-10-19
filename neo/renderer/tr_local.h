@@ -124,6 +124,16 @@ struct areaReference_t {
     idRenderEntityLocal* entity; // only one of entity / light will be non-NULL
     idRenderLightLocal* light;   // only one of entity / light will be non-NULL
     struct portalArea_s* area;   // so owners can find all the areas they are in
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // an entity reference's copy of what the light jobs' first two checks
+    // read from the entity (AddEntityRefToArea; the references are made again
+    // whenever the entity's model or place changes), so those checks need not
+    // touch the entity: its index, and whether its model is static with no
+    // callback that could change it
+    int vitaEntityIndex;
+    bool vitaStaticModel;
+    bool vitaNoSurfaces; // a model (no callback) with neither lit nor shadow-casting surfaces
+#endif
 };
 
 // idRenderLight should become the new public interface replacing the qhandle_t to light defs in the idRenderWorld interface
@@ -173,6 +183,9 @@ public:
 
     bool lightHasMoved; // the light has changed its position since it was
     // first added, so the prelight model is not valid
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    bool vitaSmallDropped; // dropped for its size last time (vita_lightMinScreenArea's hysteresis)
+#endif
     idRenderWorldLocal* world;
     int index; // in world lightdefs
 
@@ -239,6 +252,10 @@ public:
     int dynamicModelFrameCount;  // continuously animating dynamic models will recreate
     // dynamicModel if this doesn't == tr.viewCount
     idRenderModel* cachedDynamicModel;
+
+    int vitaTraceSlot; // Vita: the posed-positions cache slot of its render model traces (RenderWorld.cpp), -1 none
+    int vitaSkinFrame;                  // Vita: tr.frameCount of its last dynamic model snapshot (15 Hz animation LOD)
+    const idRenderModel* vitaSkinModel; // Vita: the model that snapshot was made from
 
     // the local bounds used to place entityRefs, either from parms for dynamic entities, or a model bounds
     idBounds localReferenceBounds;
@@ -613,6 +630,11 @@ struct glstate_t {
     // RB: 64 bit fixes, changed unsigned int to uintptr_t
     uintptr_t currentVertexBuffer;
     uintptr_t currentIndexBuffer;
+#if defined(__vita__)
+    // The Vita folds a draw's base vertex into the attribute offsets, so the
+    // layout cache has to know which base the current pointers were set up for.
+    uintptr_t currentVertOffset;
+#endif
     // RB end
 
     float polyOfsScale;
@@ -747,6 +769,11 @@ public:
     {
         return frameCount;
     };
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    virtual void VitaGuiCaptureBegin(const void* key);
+    virtual void VitaGuiCaptureEnd();
+    virtual bool VitaGuiReplay(const void* key);
+#endif
 
 public:
     // renderer globals
@@ -1289,6 +1316,25 @@ struct localTrace_t {
 };
 
 localTrace_t R_LocalTrace(const idVec3& start, const idVec3& end, const float radius, const srfTriangles_t* tri);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// R_LocalTrace against bare positions (the posed positions of RenderWorld.cpp's trace cache)
+localTrace_t R_LocalTracePositions(const idVec3& start, const idVec3& end, const float radius, const idVec3* xyz, const int numVerts, const triIndex_t* indexes, const int numIndexes);
+// some of a surface's triangles, with the vertices they use (idMD5Mesh's trace groups)
+struct vitaTraceSubset_t {
+    const triIndex_t* verts;   // the vertices its triangles use, each once
+    int numVerts;
+    const triIndex_t* indexes; // its triangles, three vertex indexes each
+    const int* triPos;         // each triangle's place in the whole surface's index list (/ 3)
+    int numTris;
+};
+// R_LocalTracePositions on those triangles alone - the same result as on the
+// whole surface when no other triangle can be hit (ties go to the triangle
+// first in the surface, as they do there)
+localTrace_t R_LocalTracePositionsSubsets(const idVec3& start, const idVec3& end, const float radius, const idVec3* xyz, const int numVerts,
+    const vitaTraceSubset_t* subsets, const int numSubsets);
+// the entity changed: its cached posed positions are stale (RenderWorld.cpp)
+void Vita_TraceCacheInvalidate(idRenderEntityLocal* def);
+#endif
 void RB_ShowTrace(drawSurf_t** drawSurfs, int numDrawSurfs);
 
 /*

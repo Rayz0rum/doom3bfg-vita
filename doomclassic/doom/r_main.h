@@ -109,6 +109,8 @@ extern void	( *basecolfunc )( lighttable_t* ds_colormap,
 							  byte* ds_source );
 extern void	( *fuzzcolfunc )( lighttable_t* ds_colormap,
 							  byte* ds_source );
+extern void	( *transcolfunc )( lighttable_t* ds_colormap,
+							   byte* ds_source );
 // No shadow effects on floors.
 extern void	( *spanfunc )(
 	fixed_t xfrac,

@@ -38,6 +38,11 @@ idCVar joy_gammaLook("joy_gammaLook", "1", CVAR_INTEGER | CVAR_ARCHIVE, "use a l
 idCVar joy_powerScale("joy_powerScale", "2", CVAR_FLOAT | CVAR_ARCHIVE, "Raise joystick values to this power");
 idCVar joy_pitchSpeed("joy_pitchSpeed", "100", CVAR_ARCHIVE | CVAR_FLOAT, "pitch speed when pressing up or down on the joystick", 60, 600);
 idCVar joy_yawSpeed("joy_yawSpeed", "240", CVAR_ARCHIVE | CVAR_FLOAT, "pitch speed when pressing left or right on the joystick", 60, 600);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// DOOM / DOOM II's own (their options menu: Camera Sensitivity), so tuning one
+// game's camera leaves the other's alone
+idCVar vita_classicYawSpeed("vita_classicYawSpeed", "240", CVAR_ARCHIVE | CVAR_FLOAT, "Vita: turn speed of the right stick in DOOM / DOOM II (degrees a second at full tilt)", 60, 600);
+#endif
 
 // these were a bad idea!
 idCVar joy_dampenLook("joy_dampenLook", "1", CVAR_BOOL | CVAR_ARCHIVE, "Do not allow full acceleration on look");
@@ -46,7 +51,18 @@ idCVar joy_deltaPerMSLook("joy_deltaPerMSLook", "0.003", CVAR_FLOAT | CVAR_ARCHI
 idCVar in_mouseSpeed("in_mouseSpeed", "1", CVAR_ARCHIVE | CVAR_FLOAT, "speed at which the mouse moves", 0.25f, 4.0f);
 idCVar in_alwaysRun("in_alwaysRun", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "always run (reverse _speed button) - only in MP");
 
+#if defined(__vita__)
+// The Vita has no keyboard or mouse, so the pad is the only input device
+// there is. Leaving this at the PC default of 0 meant BuildCurrentUsercmd()
+// never called Joystick(), which is also the only thing that drains the
+// event list Sys_GetEvent() appends to - so the pad did nothing in game and
+// the list grew for the whole session.
+// Read-only and not archived, so a config written with it off can never
+// leave the Vita with no input at all.
+idCVar in_useJoystick("in_useJoystick", "1", CVAR_ROM | CVAR_BOOL, "the gamepad is the Vita's only input and is always on");
+#else
 idCVar in_useJoystick("in_useJoystick", "0", CVAR_ARCHIVE | CVAR_BOOL, "enables/disables the gamepad for PC use");
+#endif
 idCVar in_joystickRumble("in_joystickRumble", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "enable joystick rumble");
 idCVar in_invertLook("in_invertLook", "0", CVAR_ARCHIVE | CVAR_BOOL, "inverts the look controls so the forward looks up (flight controls) - the proper way to play games!");
 idCVar in_mouseInvertLook("in_mouseInvertLook", "0", CVAR_ARCHIVE | CVAR_BOOL, "inverts the look controls so the forward looks up (flight controls) - the proper way to play games!");
@@ -298,6 +314,29 @@ idCVar idUsercmdGenLocal::in_pitchSpeed("in_pitchspeed", "140", CVAR_SYSTEM | CV
 idCVar idUsercmdGenLocal::in_angleSpeedKey("in_anglespeedkey", "1.5", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT, "angle change scale when holding down _speed button");
 idCVar idUsercmdGenLocal::in_toggleRun("in_toggleRun", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "pressing _speed button toggles run on/off - only in MP");
 idCVar idUsercmdGenLocal::in_toggleCrouch("in_toggleCrouch", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "pressing _movedown button toggles player crouching/standing");
+
+#if defined(__vita__)
+// Sprint lives on the rear touch pad, where holding a finger down for a whole
+// sprint is uncomfortable: one tap starts it, the next stops it - in single
+// player too (stock BFG only honours in_toggleRun in multiplayer).
+idCVar vita_toggleSprint("vita_toggleSprint", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL,
+    "Vita: _speed toggles sprint on/off (single player too); 0 = hold to sprint");
+// Crouching (sneaking) on O: one press crouches, the next stands up.
+idCVar vita_toggleCrouch("vita_toggleCrouch", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL,
+    "Vita: _movedown toggles crouching on/off; 0 = hold to crouch");
+idCVar vita_quickTurnTime("vita_quickTurnTime", "150", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_INTEGER,
+    "Vita: milliseconds the 180 degree quick turn takes (0 = instant)", 0, 1000);
+
+// degrees of the current quick turn still to apply
+static float vitaQuickTurnLeft = 0.0f;
+
+CONSOLE_COMMAND(vita_quickTurn, "Vita: turn around 180 degrees (rear touch pad, left half)", 0)
+{
+    if (vitaQuickTurnLeft <= 0.0f) {
+        vitaQuickTurnLeft = 180.0f;
+    }
+}
+#endif
 idCVar idUsercmdGenLocal::in_toggleZoom("in_toggleZoom", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "pressing _zoom button toggles zoom on/off");
 idCVar idUsercmdGenLocal::sensitivity("sensitivity", "5", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT, "mouse view sensitivity");
 idCVar idUsercmdGenLocal::m_pitch("m_pitch", "0.022", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT, "mouse pitch scale");
@@ -914,7 +953,11 @@ void idUsercmdGenLocal::JoystickMove2()
     const transferFunction_t shape = (transferFunction_t)joy_gammaLook.GetInteger();
     const bool mergedThreshold = joy_mergedThreshold.GetBool();
     const float pitchSpeed = joy_pitchSpeed.GetFloat();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    const float yawSpeed = (common->GetCurrentGame() != DOOM3_BFG) ? vita_classicYawSpeed.GetFloat() : joy_yawSpeed.GetFloat();
+#else
     const float yawSpeed = joy_yawSpeed.GetFloat();
+#endif
 
     idGame* game = common->Game();
     const float aimAssist = game != NULL ? game->GetAimAssistSensitivity() : 1.0f;
@@ -1021,8 +1064,16 @@ void idUsercmdGenLocal::MakeCurrent()
 
     if (!Inhibited()) {
         // update toggled key states
+#if defined(__vita__)
+        toggled_crouch.SetKeyState(ButtonState(UB_MOVEDOWN), vita_toggleCrouch.GetBool() || in_toggleCrouch.GetBool());
+#else
         toggled_crouch.SetKeyState(ButtonState(UB_MOVEDOWN), in_toggleCrouch.GetBool());
+#endif
+#if defined(__vita__)
+        toggled_run.SetKeyState(ButtonState(UB_SPEED), vita_toggleSprint.GetBool() || (in_toggleRun.GetBool() && common->IsMultiplayer()));
+#else
         toggled_run.SetKeyState(ButtonState(UB_SPEED), in_toggleRun.GetBool() && common->IsMultiplayer());
+#endif
         toggled_zoom.SetKeyState(ButtonState(UB_ZOOM), in_toggleZoom.GetBool());
 
         // get basic movement from mouse
@@ -1039,6 +1090,20 @@ void idUsercmdGenLocal::MakeCurrent()
         // keyboard angle adjustment
         AdjustAngles();
 
+#if defined(__vita__)
+        // 180 degree quick turn, spread over vita_quickTurnTime so it reads
+        // as a turn rather than a cut
+        if (vitaQuickTurnLeft > 0.0f) {
+            const int ms = vita_quickTurnTime.GetInteger();
+            float step = (ms <= 0) ? vitaQuickTurnLeft : 180.0f * (float)(pollTime - lastPollTime) / (float)ms;
+            if (step > vitaQuickTurnLeft) {
+                step = vitaQuickTurnLeft;
+            }
+            viewangles[YAW] += step;
+            vitaQuickTurnLeft -= step;
+        }
+#endif
+
         // set button bits
         CmdButtons();
 
@@ -1047,6 +1112,10 @@ void idUsercmdGenLocal::MakeCurrent()
 
         // aim assist
         AimAssist();
+
+        // the benchmark's scripted input (VitaBench.cpp)
+        extern void VitaBench_ApplyInput(usercmd_t & cmd, idVec3 & viewangles, int msec);
+        VitaBench_ApplyInput(cmd, viewangles, pollTime - lastPollTime);
 
         // check to make sure the angles haven't wrapped
         if (viewangles[PITCH] - oldAngles[PITCH] > 90) {
@@ -1126,6 +1195,9 @@ idUsercmdGenLocal::InitForNewMap
 */
 void idUsercmdGenLocal::InitForNewMap()
 {
+#if defined(__vita__)
+    vitaQuickTurnLeft = 0.0f;
+#endif
     impulseSequence = 0;
     impulse = 0;
 
@@ -1358,6 +1430,12 @@ void idUsercmdGenLocal::BuildCurrentUsercmd(int deviceNum)
     // process the system joystick events
     if (deviceNum >= 0 && in_useJoystick.GetBool()) {
         Joystick(deviceNum);
+    } else {
+        // Joystick() is what calls Sys_EndJoystickInputEvents(). Without this
+        // the platform layer keeps appending pad samples to a list nothing
+        // ever empties, which grows unbounded and reallocates as it goes.
+        Sys_PollJoystickInputEvents(deviceNum);
+        Sys_EndJoystickInputEvents();
     }
 
     // create the usercmd

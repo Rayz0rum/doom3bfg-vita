@@ -30,6 +30,12 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 #pragma hdrstop
 
+#if defined(__vita__)
+// the newlib heap's own allocator, bypassing the link's --wrap (vita_mem.cpp)
+extern "C" void* __real_malloc(size_t size);
+extern "C" void __real_free(void* ptr);
+#endif
+
 #include "Unzip.h"
 #include "Zip.h"
 
@@ -188,6 +194,7 @@ public:
     virtual void StopPreload();
     idFile* GetResourceFile(const char* fileName, bool memFile);
     bool GetResourceCacheEntry(const char* fileName, idResourceCacheEntry& rc);
+    virtual bool GetResourceLocation(const char* fileName, idStr& osPath, int& offset, int& length);
     virtual int ReadFromBGL(idFile* _resourceFile, void* _buffer, int _offset, int _len);
     virtual bool IsBinaryModel(const idStr& resName) const;
     virtual bool IsSoundSample(const idStr& resName) const;
@@ -316,6 +323,12 @@ idFileSystemLocal::ReadFromBGL
 */
 int idFileSystemLocal::ReadFromBGL(idFile* _resourceFile, void* _buffer, int _offset, int _len)
 {
+    // Every file inside a .resources container shares the container's one
+    // handle, and the game/draw thread reads through it (decls, sounds) while
+    // the main thread does too (images loaded at their first draw): the seek
+    // and the read must not interleave with another thread's.
+    static idSysMutex* bglLock = new idSysMutex();
+    idScopedCriticalSection lock(*bglLock);
     if (_resourceFile->Tell() != _offset) {
         _resourceFile->Seek(_offset, FS_SEEK_SET);
     }
@@ -524,6 +537,35 @@ idFileHandle idFileSystemLocal::OpenOSFile(const char* fileName, fsMode_t mode)
         }
     }
 
+#if defined(__vita__)
+    // newlib's stdio buffer is about 1 KB, and every refill is a separate
+    // memory card read with a high fixed cost. The .resources containers are
+    // read through these handles in small pieces (binary models, anims,
+    // collision, image level headers): a big buffer turns thousands of those
+    // reads into a few dozen. Seeks inside the buffer stay in memory.
+    //
+    // The buffer must come from the newlib heap itself. setvbuf( fp, NULL, ... )
+    // allocates it with plain malloc() - which the link wraps (vita_mem.cpp) and
+    // which, once the newlib heap is down to its reserve, hands out vitaGL pool
+    // memory - while fclose() frees it with newlib's internal _free_r(), which
+    // only knows its own heap. After a long play of mars_city2 every file opened
+    // got a pool buffer, and the first fclose() of one (the main menu's
+    // background video, leaving the game) wrote newlib chunk headers into the
+    // pool and died in _free_r(). So the buffer is taken from newlib directly
+    // and marked as stdio's own (__SMBF), so fclose() frees it as before; if
+    // newlib has no 64 KB to spare the file keeps its default buffer.
+    if (fp != NULL && mode == FS_READ) {
+        static const size_t bufferSize = 64 * 1024;
+        void* buffer = __real_malloc(bufferSize);
+        if (buffer != NULL) {
+            if (setvbuf(fp, (char*)buffer, _IOFBF, bufferSize) == 0) {
+                fp->_flags |= __SMBF;
+            } else {
+                __real_free(buffer);
+            }
+        }
+    }
+#endif
 #endif
     // RB end
 
@@ -1784,7 +1826,14 @@ int idFileSystemLocal::ReadFile(const char* relativePath, void** buffer, ID_TIME
     }
 
     // look for it in the filesystem or pack files
+#if defined(__vita__)
+    // not into a memory file first: it is read whole into its own buffer
+    // below anyway, and the two copies at once doubled the peak (5.5 MB for
+    // a 2.7 MB image source)
+    f = OpenFileRead(relativePath, false);
+#else
     f = OpenFileRead(relativePath, (buffer != NULL));
+#endif
     if (f == NULL) {
         // RB: moved here
         if (buffer == NULL && timestamp != NULL && resourceFiles.Num() > 0) {
@@ -1820,6 +1869,12 @@ int idFileSystemLocal::ReadFile(const char* relativePath, void** buffer, ID_TIME
 
     buf = (byte*)Mem_ClearedAlloc(len + 1, TAG_IDFILE);
     *buffer = buf;
+    if (buf == NULL) {
+        idLib::Warning("ReadFile: out of memory - %d bytes for '%s'", len + 1, relativePath);
+        CloseFile(f);
+        loadStack--;
+        return -1;
+    }
 
     f->Read(buf, len);
 
@@ -2880,6 +2935,26 @@ bool idFileSystemLocal::GetResourceCacheEntry(const char* fileName, idResourceCa
 
 /*
 ========================
+idFileSystemLocal::GetResourceLocation
+========================
+*/
+bool idFileSystemLocal::GetResourceLocation(const char* fileName, idStr& osPath, int& offset, int& length)
+{
+    idResourceCacheEntry rc;
+    if (!GetResourceCacheEntry(fileName, rc)) {
+        return false;
+    }
+    if (rc.containerIndex < 0 || rc.containerIndex >= resourceFiles.Num() || resourceFiles[rc.containerIndex]->resourceFile == NULL) {
+        return false;
+    }
+    osPath = resourceFiles[rc.containerIndex]->resourceFile->GetFullPath();
+    offset = rc.offset;
+    length = rc.length;
+    return true;
+}
+
+/*
+========================
 idFileSystemLocal::GetResourceFile
 
 Returns NULL
@@ -2893,7 +2968,11 @@ idFile* idFileSystemLocal::GetResourceFile(const char* fileName, bool memFile)
         return NULL;
     }
 
-    static idResourceCacheEntry rc;
+    // Not static: the game/draw thread (decls, sounds, images first used
+    // during play) and the main thread (images loaded at their first draw)
+    // both open files, and a shared entry's idStr was reassigned under the
+    // other thread's feet.
+    idResourceCacheEntry rc;
     if (GetResourceCacheEntry(fileName, rc)) {
         if (fs_debugResources.GetBool()) {
             idLib::Printf("RES: loading file %s\n", rc.filename.c_str());
@@ -2902,7 +2981,7 @@ idFile* idFileSystemLocal::GetResourceFile(const char* fileName, bool memFile)
         // DG: add parenthesis to make sure this block is only entered when file != NULL - bug found by clang.
         if (file != NULL && ((memFile || rc.length <= resourceBufferAvailable) || rc.length < 8 * 1024 * 1024)) {
             byte* buf = NULL;
-            if (rc.length < resourceBufferAvailable) {
+            if (rc.length < resourceBufferAvailable && resourceBufferPtr != NULL) {
                 buf = resourceBufferPtr;
                 resourceBufferAvailable = 0;
             } else {
@@ -2910,6 +2989,16 @@ idFile* idFileSystemLocal::GetResourceFile(const char* fileName, bool memFile)
                     idLib::Printf("MEM: Allocating %05d bytes for a resource load\n", rc.length);
                 }
                 buf = (byte*)Mem_Alloc(rc.length, TAG_TEMP);
+                if (buf == NULL && rc.length == 0) {
+                    return file; // an empty file: nothing to buffer (Mem_Alloc(0) is NULL)
+                }
+                if (buf == NULL) {
+                    // read from the container as it is needed instead (stock
+                    // BFG read into NULL: the Vita verification, phobos3's
+                    // 2.7 MB tram_track2 image with the memory gone)
+                    idLib::Warning("no %d bytes to buffer '%s' - read from its container instead", rc.length, rc.filename.c_str());
+                    return file;
+                }
             }
             file->Read((void*)buf, rc.length);
 
@@ -2974,6 +3063,9 @@ idFile* idFileSystemLocal::OpenFileReadFlags(const char* relativePath, int searc
     if (fs_debug.GetBool()) {
         idLib::Printf("FILE DEBUG: opening %s\n", relativePath);
     }
+#if defined(__vita__)
+    const uint64 vitaOpenStart = Sys_Microseconds();
+#endif
 
     if (resourceFiles.Num() > 0 && fs_resourceLoadPriority.GetInteger() == 1) {
         idFile* rf = GetResourceFile(relativePath, (searchFlags & FSFLAG_RETURN_FILE_MEM) != 0);
@@ -3096,6 +3188,20 @@ idFile* idFileSystemLocal::OpenFileReadFlags(const char* relativePath, int searc
     if (fs_debug.GetInteger()) {
         common->Printf("Can't find %s\n", relativePath);
     }
+#if defined(__vita__)
+    // A miss looks through every search path on the memory card: during play
+    // (a game/draw frame running) one that takes long is logged - a collision
+    // model lookup repeated at every spawn cost 150 ms a time.
+    {
+        extern volatile uint64 vita_gdFrameStartUs; // common_frame.cpp
+        const uint64 vitaMissUs = Sys_Microseconds() - vitaOpenStart;
+        static int vitaMissesLogged = 0;
+        if (vita_gdFrameStartUs != 0 && vitaMissUs > 5000 && vitaMissesLogged < 40) {
+            vitaMissesLogged++;
+            common->Printf("filesystem: '%s' not found, %.1f ms looking for it during play\n", relativePath, vitaMissUs / 1000.0);
+        }
+    }
+#endif
 
     return NULL;
 }

@@ -238,6 +238,11 @@ private:
     int spawnId;
 };
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// the most a tic lasts (ms): a half-rate think covers at most three tics' time
+#define USERCMD_MSEC_VITA_MAX 34
+#endif
+
 struct timeState_t {
     int time;
     int previousTime;
@@ -617,6 +622,11 @@ private:
 
     idMenuHandler_Shell* shellHandler;
 
+    // the full verification (VitaVerify_game.cpp) reaches the main menu through it
+    friend bool Vita_VerifyShellActive();
+    friend int Vita_VerifyShellArea();
+    friend bool Vita_VerifyShellGoto(int area);
+
     idStrList aasNames;
 
     idEntityPtr<idActor> lastAIAlertEntity;
@@ -708,6 +718,33 @@ private:
 //============================================================================
 
 extern idGameLocal gameLocal;
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+Vita: a half-rate think (idEntity::VitaHalfRateTic). Span() moves the game's
+previous time back to the entity's last think for the rest of the think; the
+destructor puts it back and records this think's time.
+*/
+struct vitaThinkSpan_t {
+    int* lastThink;
+    int savedPrevious;
+    bool spanned;
+    explicit vitaThinkSpan_t(int* last) : lastThink(last), savedPrevious(0), spanned(false) {}
+    void Span()
+    {
+        savedPrevious = gameLocal.previousTime;
+        gameLocal.previousTime = *lastThink;
+        spanned = true;
+    }
+    ~vitaThinkSpan_t()
+    {
+        if (spanned) {
+            gameLocal.previousTime = savedPrevious;
+        }
+        *lastThink = gameLocal.time;
+    }
+};
+#endif
 extern idAnimManager animationLib;
 
 //============================================================================
@@ -899,5 +936,7 @@ const int CINEMATIC_SKIP_DELAY = SEC2MS(2.0f);
 #include "script/Script_Compiler.h"
 #include "script/Script_Interpreter.h"
 #include "script/Script_Thread.h"
+
+#include "VitaPhysCheck.h" // tick-rate gameplay checks
 
 #endif /* !__GAME_LOCAL_H__ */

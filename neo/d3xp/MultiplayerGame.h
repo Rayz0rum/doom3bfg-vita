@@ -228,6 +228,9 @@ private:
     gameState_t nextState; // state to switch to when nextStateSwitch is hit
 
     mpPlayerState_t playerState[MAX_CLIENTS];
+    friend int Vita_MPPlayers(struct vitaMPPlayer_t* out, int max); // VitaBots.cpp
+    friend void Vita_MPTimes(int& serverTime, int& nextSwitch, int& nextState);
+    friend void VitaBot_FragsDeaths(int client, int& frags, int& deaths); // VitaBots.cpp (the bots' log)
 
     // keep track of clients which are willingly in spectator mode
     // time related

@@ -32,6 +32,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 #include "Model_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_ADD: the model trace counts in the perf log
 
 #include "../idlib/geometry/DrawVert_intrinsics.h"
 
@@ -635,3 +636,330 @@ localTrace_t R_LocalTrace(const idVec3& start, const idVec3& end, const float ra
 
     return hit;
 }
+
+#if defined(__vita__) && defined(__ARM_NEON__)
+#include <arm_neon.h>
+/*
+====================
+Vita_TraceCullBitsPositions_NEON
+
+R_LocalTracePositions' per-vertex sidedness bits, four vertices at a time:
+the same distances (a*x + b*y + c*z + d, in that order), the same sign bits,
+so the same bytes (tools/vita/neontest).
+====================
+*/
+static void Vita_TraceCullBitsPositions_NEON(byte* cullBits, byte& totalOr, const float radius, const float* planes, const float* xyz, const int numVerts)
+{
+    const float32x4_t r = vdupq_n_f32(radius);
+    // the four planes loaded once and multiplied by lane (as float scalars GCC
+    // re-materialized them inside the loop); the same multiply-adds
+    const float32x4_t pl[4] = { vld1q_f32(planes + 0), vld1q_f32(planes + 4), vld1q_f32(planes + 8), vld1q_f32(planes + 12) };
+    uint32x4_t total = vdupq_n_u32(0);
+    int i = 0;
+    for (; i + 4 <= numVerts; i += 4) {
+        const float32x4x3_t v = vld3q_f32(xyz + i * 3); // x, y, z of four vertices
+        uint32x4_t bits = vdupq_n_u32(0);
+        for (int k = 0; k < 4; k++) {
+            const float32x2_t p01 = vget_low_f32(pl[k]);
+            const float32x2_t p23 = vget_high_f32(pl[k]);
+            const float32x4_t d = vaddq_f32(vmlaq_lane_f32(vmlaq_lane_f32(vmulq_lane_f32(v.val[0], p01, 0), v.val[1], p01, 1), v.val[2], p23, 0), vdupq_lane_f32(p23, 1));
+            const uint32x4_t tSign = vshrq_n_u32(vreinterpretq_u32_f32(vaddq_f32(d, r)), 31);
+            const uint32x4_t sSign = vshrq_n_u32(vreinterpretq_u32_f32(vsubq_f32(d, r)), 31);
+            bits = vorrq_u32(bits, vshlq_u32(tSign, vdupq_n_s32(k)));
+            bits = vorrq_u32(bits, vshlq_u32(sSign, vdupq_n_s32(k + 4)));
+        }
+        bits = veorq_u32(bits, vdupq_n_u32(0x0F)); // flip lower four bits
+        total = vorrq_u32(total, bits);
+        const uint16x4_t b16 = vmovn_u32(bits);
+        const uint8x8_t b8 = vmovn_u16(vcombine_u16(b16, b16));
+        vst1_lane_u32((uint32_t*)(cullBits + i), vreinterpret_u32_u8(b8), 0);
+    }
+    const uint32x2_t t2 = vorr_u32(vget_low_u32(total), vget_high_u32(total));
+    byte tOr = (byte)(vget_lane_u32(t2, 0) | vget_lane_u32(t2, 1));
+    for (; i < numVerts; i++) {
+        const float* vp = xyz + i * 3;
+        byte bits = 0;
+        for (int k = 0; k < 4; k++) {
+            const float* p = planes + k * 4;
+            const float d = p[0] * vp[0] + p[1] * vp[1] + p[2] * vp[2] + p[3];
+            const float tt = d + radius;
+            const float s = d - radius;
+            bits |= (byte)(IEEE_FLT_SIGNBITSET(tt) << k);
+            bits |= (byte)(IEEE_FLT_SIGNBITSET(s) << (k + 4));
+        }
+        bits ^= 0x0F;
+        tOr |= bits;
+        cullBits[i] = bits;
+    }
+    totalOr = tOr;
+}
+#endif
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+====================
+R_LocalTracePositions
+
+R_LocalTrace for a surface given as bare positions - the same planes, the same
+per-vertex sidedness bits (R_TracePointCullStatic's generic code) and the same
+triangle tests, so the same result as R_LocalTrace on draw verts holding those
+positions.
+====================
+*/
+localTrace_t R_LocalTracePositions(const idVec3& start, const idVec3& end, const float radius, const idVec3* xyz, const int numVerts, const triIndex_t* indexes, const int numIndexes)
+{
+    localTrace_t hit;
+    hit.fraction = 1.0f;
+
+    ALIGNTYPE16 idPlane planes[4];
+    // create two planes orthogonal to each other that intersect along the trace
+    idVec3 startDir = end - start;
+    startDir.Normalize();
+    startDir.NormalVectors(planes[0].Normal(), planes[1].Normal());
+    planes[0][3] = -start * planes[0].Normal();
+    planes[1][3] = -start * planes[1].Normal();
+    // create front and end planes so the trace is on the positive sides of both
+    planes[2] = startDir;
+    planes[2][3] = -start * planes[2].Normal();
+    planes[3] = -startDir;
+    planes[3][3] = -end * planes[3].Normal();
+
+    // catagorize each point against the four planes
+    byte* cullBits = (byte*)_alloca16(ALIGN(numVerts, 4));
+    byte totalOr = 0;
+    VITA_ZONE_ADD("model trace: vertices given sidedness bits", numVerts);
+#if defined(__vita__) && defined(__ARM_NEON__)
+    Vita_TraceCullBitsPositions_NEON(cullBits, totalOr, radius, planes[0].ToFloatPtr(), xyz[0].ToFloatPtr(), numVerts);
+#else
+    for (int i = 0; i < numVerts; i++) {
+        const idVec3& v = xyz[i];
+
+        const float d0 = planes[0].Distance(v);
+        const float d1 = planes[1].Distance(v);
+        const float d2 = planes[2].Distance(v);
+        const float d3 = planes[3].Distance(v);
+
+        const float t0 = d0 + radius;
+        const float t1 = d1 + radius;
+        const float t2 = d2 + radius;
+        const float t3 = d3 + radius;
+
+        const float s0 = d0 - radius;
+        const float s1 = d1 - radius;
+        const float s2 = d2 - radius;
+        const float s3 = d3 - radius;
+
+        byte bits;
+        bits = IEEE_FLT_SIGNBITSET(t0) << 0;
+        bits |= IEEE_FLT_SIGNBITSET(t1) << 1;
+        bits |= IEEE_FLT_SIGNBITSET(t2) << 2;
+        bits |= IEEE_FLT_SIGNBITSET(t3) << 3;
+
+        bits |= IEEE_FLT_SIGNBITSET(s0) << 4;
+        bits |= IEEE_FLT_SIGNBITSET(s1) << 5;
+        bits |= IEEE_FLT_SIGNBITSET(s2) << 6;
+        bits |= IEEE_FLT_SIGNBITSET(s3) << 7;
+
+        bits ^= 0x0F; // flip lower four bits
+
+        totalOr |= bits;
+        cullBits[i] = bits;
+    }
+#endif
+
+    // if we don't have points on both sides of both the ray planes, no intersection
+    if ((totalOr ^ (totalOr >> 4)) & 3) {
+        return hit;
+    }
+
+    // if we don't have any points between front and end, no intersection
+    if ((totalOr ^ (totalOr >> 1)) & 4) {
+        return hit;
+    }
+
+    VITA_ZONE_ADD("model trace: triangles culled by sidedness", numIndexes / 3);
+    int exactTests = 0;
+    for (int i = 0; i + 3 <= numIndexes; i += 3) {
+        const int i0 = indexes[i + 0];
+        const int i1 = indexes[i + 1];
+        const int i2 = indexes[i + 2];
+
+        // get sidedness info for the triangle
+        const byte triOr = cullBits[i0] | cullBits[i1] | cullBits[i2];
+
+        // if we don't have points on both sides of both the ray planes, no intersection
+        if (likely((triOr ^ (triOr >> 4)) & 3)) {
+            continue;
+        }
+
+        // if we don't have any points between front and end, no intersection
+        if (unlikely((triOr ^ (triOr >> 1)) & 4)) {
+            continue;
+        }
+
+        exactTests++;
+        if (R_LineIntersectsTriangleExpandedWithCircle(hit, start, end, radius, xyz[i0], xyz[i1], xyz[i2])) {
+            hit.indexes[0] = i0;
+            hit.indexes[1] = i1;
+            hit.indexes[2] = i2;
+        }
+    }
+    VITA_ZONE_ADD("model trace: triangles given the exact (radius) test", exactTests);
+    if (radius > 0.0f) {
+        VITA_ZONE_COUNT("model trace: traces with a radius");
+    }
+
+    return hit;
+}
+
+/*
+====================
+R_LocalTracePositionsSubsets
+
+R_LocalTracePositions on some of a surface's triangles: the same planes, the
+same sidedness bits for the vertices those triangles use, the same triangle
+tests. The whole-surface loop keeps the closest hit and, on a tie, the
+triangle first in the surface (a later one must be strictly closer); here the
+triangles come in another order, so a tie goes to the lower place in the
+surface explicitly - the same hit as the whole loop's when the triangles left
+out cannot be hit. (Its early outs over all vertices only skip a loop that
+would hit nothing, so leaving them out changes no result.)
+
+Game/draw thread only, like the traces (one scratch buffer).
+====================
+*/
+localTrace_t R_LocalTracePositionsSubsets(const idVec3& start, const idVec3& end, const float radius, const idVec3* xyz, const int numVerts,
+    const vitaTraceSubset_t* subsets, const int numSubsets)
+{
+    localTrace_t hit;
+    hit.fraction = 1.0f;
+
+    ALIGNTYPE16 idPlane planes[4];
+    // create two planes orthogonal to each other that intersect along the trace
+    idVec3 startDir = end - start;
+    startDir.Normalize();
+    startDir.NormalVectors(planes[0].Normal(), planes[1].Normal());
+    planes[0][3] = -start * planes[0].Normal();
+    planes[1][3] = -start * planes[1].Normal();
+    // create front and end planes so the trace is on the positive sides of both
+    planes[2] = startDir;
+    planes[2][3] = -start * planes[2].Normal();
+    planes[3] = -startDir;
+    planes[3][3] = -end * planes[3].Normal();
+
+    // the sidedness bits of the vertices the subsets use: gathered, then
+    // computed exactly as for a whole surface, then put back in place
+    static idVec3* gathered = NULL;
+    static byte* gatheredBits = NULL;
+    static byte* cullBits = NULL;
+    static int capacity = 0;
+    if (numVerts + 4 > capacity) {
+        Mem_Free16(gathered);
+        Mem_Free16(gatheredBits);
+        Mem_Free16(cullBits);
+        capacity = ALIGN(numVerts + 4, 256);
+        gathered = (idVec3*)Mem_Alloc16(capacity * sizeof(idVec3), TAG_RENDER);
+        gatheredBits = (byte*)Mem_Alloc16(capacity, TAG_RENDER);
+        cullBits = (byte*)Mem_Alloc16(capacity, TAG_RENDER);
+    }
+    int vertsBits = 0;
+    for (int s = 0; s < numSubsets; s++) {
+        const vitaTraceSubset_t& sub = subsets[s];
+        for (int v = 0; v < sub.numVerts; v++) {
+            gathered[v] = xyz[sub.verts[v]];
+        }
+        byte totalOr = 0;
+#if defined(__vita__) && defined(__ARM_NEON__)
+        Vita_TraceCullBitsPositions_NEON(gatheredBits, totalOr, radius, planes[0].ToFloatPtr(), gathered[0].ToFloatPtr(), sub.numVerts);
+#else
+        for (int i = 0; i < sub.numVerts; i++) {
+            const idVec3& v = gathered[i];
+
+            const float d0 = planes[0].Distance(v);
+            const float d1 = planes[1].Distance(v);
+            const float d2 = planes[2].Distance(v);
+            const float d3 = planes[3].Distance(v);
+
+            const float t0 = d0 + radius;
+            const float t1 = d1 + radius;
+            const float t2 = d2 + radius;
+            const float t3 = d3 + radius;
+
+            const float s0 = d0 - radius;
+            const float s1 = d1 - radius;
+            const float s2 = d2 - radius;
+            const float s3 = d3 - radius;
+
+            byte bits;
+            bits = IEEE_FLT_SIGNBITSET(t0) << 0;
+            bits |= IEEE_FLT_SIGNBITSET(t1) << 1;
+            bits |= IEEE_FLT_SIGNBITSET(t2) << 2;
+            bits |= IEEE_FLT_SIGNBITSET(t3) << 3;
+
+            bits |= IEEE_FLT_SIGNBITSET(s0) << 4;
+            bits |= IEEE_FLT_SIGNBITSET(s1) << 5;
+            bits |= IEEE_FLT_SIGNBITSET(s2) << 6;
+            bits |= IEEE_FLT_SIGNBITSET(s3) << 7;
+
+            bits ^= 0x0F; // flip lower four bits
+
+            totalOr |= bits;
+            gatheredBits[i] = bits;
+        }
+#endif
+        for (int v = 0; v < sub.numVerts; v++) {
+            cullBits[sub.verts[v]] = gatheredBits[v];
+        }
+        vertsBits += sub.numVerts;
+    }
+    VITA_ZONE_ADD("model trace: vertices given sidedness bits", vertsBits);
+
+    int tris = 0;
+    int exactTests = 0;
+    int bestPos = INT_MAX;
+    for (int s = 0; s < numSubsets; s++) {
+        const vitaTraceSubset_t& sub = subsets[s];
+        tris += sub.numTris;
+        for (int t = 0; t < sub.numTris; t++) {
+            const int i0 = sub.indexes[t * 3 + 0];
+            const int i1 = sub.indexes[t * 3 + 1];
+            const int i2 = sub.indexes[t * 3 + 2];
+
+            // get sidedness info for the triangle
+            const byte triOr = cullBits[i0] | cullBits[i1] | cullBits[i2];
+
+            // if we don't have points on both sides of both the ray planes, no intersection
+            if (likely((triOr ^ (triOr >> 4)) & 3)) {
+                continue;
+            }
+
+            // if we don't have any points between front and end, no intersection
+            if (unlikely((triOr ^ (triOr >> 1)) & 4)) {
+                continue;
+            }
+
+            exactTests++;
+            // an earlier triangle wins a tie: it may equal the best so far
+            const int pos = sub.triPos[t];
+            localTrace_t tri;
+            tri.fraction = (bestPos != INT_MAX && pos < bestPos) ? nextafterf(hit.fraction, 2.0f) : hit.fraction;
+            if (R_LineIntersectsTriangleExpandedWithCircle(tri, start, end, radius, xyz[i0], xyz[i1], xyz[i2])) {
+                hit.fraction = tri.fraction;
+                hit.point = tri.point;
+                hit.normal = tri.normal;
+                hit.indexes[0] = i0;
+                hit.indexes[1] = i1;
+                hit.indexes[2] = i2;
+                bestPos = pos;
+            }
+        }
+    }
+    VITA_ZONE_ADD("model trace: triangles culled by sidedness", tris);
+    VITA_ZONE_ADD("model trace: triangles given the exact (radius) test", exactTests);
+    if (radius > 0.0f) {
+        VITA_ZONE_COUNT("model trace: traces with a radius");
+    }
+
+    return hit;
+}
+#endif

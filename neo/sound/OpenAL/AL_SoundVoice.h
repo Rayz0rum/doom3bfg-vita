@@ -41,25 +41,39 @@ public:
     idSoundVoice_OpenAL();
     ~idSoundVoice_OpenAL();
 
+    // Every voice gets all three every frame; each OpenAL call takes OpenAL
+    // Soft's context and source-list locks, so a value OpenAL already has is
+    // not sent again (alPosition/alGain/alPitch: what it was last told).
     void SetPosition(const idVec3& p)
     {
         idSoundVoice_Base::SetPosition(p);
 
-        alSource3f(openalSource, AL_POSITION, -p.y, p.z, -p.x);
+        const idVec3 al(-p.y, p.z, -p.x);
+        if (al != alPosition) {
+            alPosition = al;
+            alSource3f(openalSource, AL_POSITION, al.x, al.y, al.z);
+        }
     }
 
     void SetGain(float gain)
     {
         idSoundVoice_Base::SetGain(gain);
 
-        alSourcef(openalSource, AL_GAIN, (gain) < (1.0f) ? (gain) : (1.0f));
+        const float al = (gain) < (1.0f) ? (gain) : (1.0f);
+        if (al != alGain) {
+            alGain = al;
+            alSourcef(openalSource, AL_GAIN, al);
+        }
     }
 
     void SetPitch(float p)
     {
         idSoundVoice_Base::SetPitch(p);
 
-        alSourcef(openalSource, AL_PITCH, p);
+        if (p != alPitch) {
+            alPitch = p;
+            alSourcef(openalSource, AL_PITCH, p);
+        }
     }
 
     void Create(const idSoundSample* leadinSample, const idSoundSample* loopingSample);
@@ -113,6 +127,79 @@ private:
 
     // Adjust the voice frequency based on the new sample rate for the buffer
     void SetSampleRate(uint32 newSampleRate, uint32 operationSet);
+
+    // what the source was last set to (see SetPosition); Create() sets
+    // position and gain, and makes the next pitch go through
+    idVec3 alPosition;
+    float alGain;
+    float alPitch;
+    void ResetALCache()
+    {
+        alPosition.Zero();
+        alGain = 1.0f;
+        alPitch = -1.0f; // no pitch is negative: the next SetPitch is sent
+    }
+
+#if defined(ID_SOUND_STREAM)
+    // decode-as-you-play (AL_SoundStream.cpp)
+    static const int NUM_STREAM_BUFFERS = 4;
+    void StreamClearQueue(); // both of these
+    void StreamClearAL();    // stops the source and takes every buffer back
+    void StreamClearState(); // forgets what was being decoded and read
+    idSoundSample_OpenAL* StreamNextSample(idSoundSample_OpenAL* s) const;
+    void StreamSetFetch(idSoundSample_OpenAL* s, int block);
+    void StreamFetch();
+    const byte* StreamBlockData(idSoundSample_OpenAL* s, int block, int& half);
+    int StreamDecodeChunk(int16* dst, int maxFrames);
+    void StreamFillQueue(int maxBuffers = NUM_STREAM_BUFFERS);
+    void StreamReleaseProcessed();
+    void StreamKeepPlaying();
+
+    // The sound worker thread (AL_SoundStream.cpp) keeps a playing voice's
+    // queue full - the decoding, the disk reads, the OpenAL buffers - while
+    // the game/draw thread only starts, stops, pauses and steers it. The lock
+    // guards the stream state (everything in this block) and the source's
+    // queue and play state between the two.
+    idSysMutex streamLock;
+    volatile bool streamActive;       // there is something to keep queued
+    volatile bool streamStartPending; // Start() set it up: the worker queues the first buffers and plays
+    volatile bool streamStopPending;  // the worker stops the source and takes its buffers back (StreamClearAL)
+
+public:
+    // the worker's turn at this voice, under streamLock
+    void StreamService();
+
+private:
+
+    ALuint streamBuffers[NUM_STREAM_BUFFERS];
+    ALuint freeStreamBuffers[NUM_STREAM_BUFFERS];
+    int numFreeStreamBuffers;
+    bool streamBuffersCreated;
+
+    idSoundSample_OpenAL* streamSample; // being decoded
+    int streamQueueRate;                // format of what is queued in OpenAL
+    int streamQueueChannels;
+    int streamBlock;
+    int streamSkip; // frames of streamBlock already used
+    bool streamEnded;
+
+    // two halves of a ring that the reader thread fills for streamed samples
+    byte* streamRing;
+    soundStreamRequest_t streamReq[2];
+    idSoundSample_OpenAL* streamHalfSample[2];
+    int streamHalfBlock[2];
+    int streamHalfBlocks[2];
+    bool streamHalfValid[2];
+    bool streamHalfConsumed[2];
+    idSoundSample_OpenAL* fetchSample; // what the reader brings in next
+    int fetchBlock;
+    bool fetchDone;
+
+public:
+    // decodes every loaded sample through the streaming path and compares it
+    // with a straight decode of the whole file (s_streamSelfTest)
+    static void StreamSelfTest();
+#endif
 
     // IXAudio2SourceVoice* 	pSourceVoice;
     bool triggered;

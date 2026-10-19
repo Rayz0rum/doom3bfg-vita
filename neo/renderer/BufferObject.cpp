@@ -329,7 +329,21 @@ void* idVertexBuffer::MapBuffer(bufferMapType_t mapType) const
     GLintptrARB bufferObject = reinterpret_cast<GLintptrARB>(apiObject);
     // RB end
 
+#if defined(__vita__)
+    // vitaGL's buffers are plain memory and "mapping" one only hands back its
+    // pointer. The game/draw thread maps the static set when a model first
+    // used during play is uploaded, and the bind that the GL path needs would
+    // change the main thread's current buffer under its draws (vitaGL keeps
+    // one global binding). The named calls touch neither.
+    if (mapType == BM_READ || mapType == BM_WRITE) {
+        buffer = glMapNamedBufferRange((GLuint)bufferObject, 0, GetAllocedSize(), mapType == BM_READ ? GL_MAP_READ_BIT : GL_MAP_WRITE_BIT);
+        if (buffer != NULL) {
+            buffer = (byte*)buffer + GetOffset();
+        }
+    } else
+#else
     qglBindBufferARB(GL_ARRAY_BUFFER_ARB, bufferObject);
+#endif
     if (mapType == BM_READ) {
         // buffer = qglMapBufferARB( GL_ARRAY_BUFFER_ARB, GL_READ_ONLY_ARB );
         buffer = qglMapBufferRange(GL_ARRAY_BUFFER_ARB, 0, GetAllocedSize(), GL_MAP_READ_BIT);
@@ -369,10 +383,14 @@ void idVertexBuffer::UnmapBuffer() const
     GLintptrARB bufferObject = reinterpret_cast<GLintptrARB>(apiObject);
     // RB end
 
+#if defined(__vita__)
+    glUnmapNamedBuffer((GLuint)bufferObject);
+#else
     qglBindBufferARB(GL_ARRAY_BUFFER_ARB, bufferObject);
     if (!qglUnmapBufferARB(GL_ARRAY_BUFFER_ARB)) {
         idLib::Printf("idVertexBuffer::UnmapBuffer failed\n");
     }
+#endif
 
     SetUnmapped();
 }
@@ -595,7 +613,17 @@ void* idIndexBuffer::MapBuffer(bufferMapType_t mapType) const
     GLintptrARB bufferObject = reinterpret_cast<GLintptrARB>(apiObject);
     // RB end
 
+#if defined(__vita__)
+    // see idVertexBuffer::MapBuffer
+    if (mapType == BM_READ || mapType == BM_WRITE) {
+        buffer = glMapNamedBufferRange((GLuint)bufferObject, 0, GetAllocedSize(), mapType == BM_READ ? GL_MAP_READ_BIT : GL_MAP_WRITE_BIT);
+        if (buffer != NULL) {
+            buffer = (byte*)buffer + GetOffset();
+        }
+    } else
+#else
     qglBindBufferARB(GL_ELEMENT_ARRAY_BUFFER_ARB, bufferObject);
+#endif
     if (mapType == BM_READ) {
         // buffer = qglMapBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, GL_READ_ONLY_ARB );
         buffer = qglMapBufferRange(GL_ELEMENT_ARRAY_BUFFER_ARB, 0, GetAllocedSize(), GL_MAP_READ_BIT);
@@ -635,10 +663,14 @@ void idIndexBuffer::UnmapBuffer() const
     GLintptrARB bufferObject = reinterpret_cast<GLintptrARB>(apiObject);
     // RB end
 
+#if defined(__vita__)
+    glUnmapNamedBuffer((GLuint)bufferObject);
+#else
     qglBindBufferARB(GL_ELEMENT_ARRAY_BUFFER_ARB, bufferObject);
     if (!qglUnmapBufferARB(GL_ELEMENT_ARRAY_BUFFER_ARB)) {
         idLib::Printf("idIndexBuffer::UnmapBuffer failed\n");
     }
+#endif
 
     SetUnmapped();
 }
@@ -841,14 +873,17 @@ float* idJointBuffer::MapBuffer(bufferMapType_t mapType) const
 
     void* buffer = NULL;
 
+    numBytes = numBytes;
+    assert(GetOffset() == 0);
+#if defined(__vita__)
+    buffer = glMapNamedBufferRange((GLuint)reinterpret_cast<GLintptrARB>(apiObject), 0, GetAllocedSize(), GL_MAP_WRITE_BIT);
+#else
     // RB: 64 bit fixes, changed GLuint to GLintptrARB
     qglBindBufferARB(GL_UNIFORM_BUFFER, reinterpret_cast<GLintptrARB>(apiObject));
     // RB end
-
-    numBytes = numBytes;
-    assert(GetOffset() == 0);
     // buffer = qglMapBufferARB( GL_UNIFORM_BUFFER, GL_WRITE_ONLY_ARB );
     buffer = qglMapBufferRange(GL_UNIFORM_BUFFER, 0, GetAllocedSize(), GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+#endif
     if (buffer != NULL) {
         buffer = (byte*)buffer + GetOffset();
     }
@@ -871,6 +906,9 @@ void idJointBuffer::UnmapBuffer() const
     assert(apiObject != NULL);
     assert(IsMapped());
 
+#if defined(__vita__)
+    glUnmapNamedBuffer((GLuint)reinterpret_cast<GLintptrARB>(apiObject));
+#else
     // RB: 64 bit fixes, changed GLuint to GLintptrARB
     qglBindBufferARB(GL_UNIFORM_BUFFER, reinterpret_cast<GLintptrARB>(apiObject));
     // RB end
@@ -878,6 +916,7 @@ void idJointBuffer::UnmapBuffer() const
     if (!qglUnmapBufferARB(GL_UNIFORM_BUFFER)) {
         idLib::Printf("idJointBuffer::UnmapBuffer failed\n");
     }
+#endif
 
     SetUnmapped();
 }

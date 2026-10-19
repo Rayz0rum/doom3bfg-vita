@@ -31,6 +31,9 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "DeviceContext.h"
 #include "../renderer/GuiModel.h"
+#if defined(__vita__)
+#include "../sys/vita/vita_ui.h"
+#endif
 
 extern idCVar in_useJoystick;
 
@@ -71,10 +74,14 @@ void idDeviceContext::Init()
     cursorImages[CURSOR_HAND_JOY2] = declManager->FindMaterial("ui/assets/guicursor_hand_circle.tga");
     cursorImages[CURSOR_HAND_JOY3] = declManager->FindMaterial("ui/assets/guicursor_hand_square.tga");
     cursorImages[CURSOR_HAND_JOY4] = declManager->FindMaterial("ui/assets/guicursor_hand_triangle.tga");
+#if !defined(__vita__)
+    // (the Vita keeps the PlayStation shapes above: the world screens'
+    // cursor showed the Xbox Y for Use, which is Triangle here)
     cursorImages[CURSOR_HAND_JOY1] = declManager->FindMaterial("ui/assets/guicursor_hand_a.tga");
     cursorImages[CURSOR_HAND_JOY2] = declManager->FindMaterial("ui/assets/guicursor_hand_b.tga");
     cursorImages[CURSOR_HAND_JOY3] = declManager->FindMaterial("ui/assets/guicursor_hand_x.tga");
     cursorImages[CURSOR_HAND_JOY4] = declManager->FindMaterial("ui/assets/guicursor_hand_y.tga");
+#endif
     scrollBarImages[SCROLLBAR_HBACK] = declManager->FindMaterial("ui/assets/scrollbarh.tga");
     scrollBarImages[SCROLLBAR_VBACK] = declManager->FindMaterial("ui/assets/scrollbarv.tga");
     scrollBarImages[SCROLLBAR_THUMB] = declManager->FindMaterial("ui/assets/scrollbar_thumb.tga");
@@ -530,6 +537,35 @@ void idDeviceContext::DrawCursor(float* x, float* y, float size)
 
     renderSystem->SetColor(colorWhite);
     DrawStretchPic(*x, *y, size, size, 0, 0, 1, 1, cursorImages[cursor]);
+#if defined(__vita__)
+    // The world screens' "press to use" cursor: the button in it is drawn from
+    // the Vita UI atlas (the same art as every other prompt in the port) over
+    // the stock PS3 one. Measured in the 64x64 cursor picture
+    // (guis/assets/guicursor_hand_triangle): the dark button disc spans
+    // x 5.5-32, y 30.5-56, centre (18.75, 43.25), ~26 across, inside a white
+    // ring ~34 across. (The first version took the ring's box for the disc and
+    // sat 6 px low.) The atlas glyph's button is centred in its 38x34 cell and
+    // 31 of its 38 px wide, so a 33-unit glyph puts a 27-unit button exactly
+    // over the dark disc, its symbol centred, the white ring still around it.
+    if (cursor >= CURSOR_HAND_JOY1 && cursor <= CURSOR_HAND_JOY4 && Vita_UI_Material() != NULL) {
+        static const char* glyphNames[4] = { "face_cross", "face_circle", "face_square", "face_triangle" };
+        static int glyphs[4] = { -2, -2, -2, -2 };
+        const int k = cursor - CURSOR_HAND_JOY1;
+        if (glyphs[k] == -2) {
+            glyphs[k] = Vita_UI_FindGlyph(glyphNames[k]);
+        }
+        if (glyphs[k] >= 0) {
+            float s1, t1, s2, t2;
+            Vita_UI_GlyphST(glyphs[k], s1, t1, s2, t2);
+            const float unit = size / 64.0f;
+            const float gw = 33.0f * unit;
+            const float gh = gw * 34.0f / 38.0f;
+            const float cx = *x + 18.75f * unit;
+            const float cy = *y + 43.25f * unit;
+            DrawStretchPic(cx - gw * 0.5f, cy - gh * 0.5f, gw, gh, s1, t1, s2, t2, Vita_UI_Material());
+        }
+    }
+#endif
 }
 /*
  =======================================================================================================================

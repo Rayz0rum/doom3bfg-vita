@@ -135,7 +135,22 @@ ID_FORCE_INLINE void FlushCacheLine(const void* ptr, int offset)
 
 #define CACHE_LINE_SIZE 128
 
+#if defined(__vita__)
+// Vita: a real prefetch (PLD) of the 128 bytes the engine calls a cache line -
+// four of the Cortex-A9's 32-byte lines. The streamed arrays the shadow and
+// interaction jobs walk (idODS*, SoftwareCache.h) ask for their next blocks
+// with it; empty, every block was a stall on memory when first read.
+ID_INLINE void Prefetch(const void* ptr, int offset)
+{
+    const char* bytePtr = ((const char*)ptr) + offset;
+    __builtin_prefetch(bytePtr + 0);
+    __builtin_prefetch(bytePtr + 32);
+    __builtin_prefetch(bytePtr + 64);
+    __builtin_prefetch(bytePtr + 96);
+}
+#else
 ID_INLINE void Prefetch(const void* ptr, int offset) { }
+#endif
 ID_INLINE void ZeroCacheLine(void* ptr, int offset)
 {
     byte* bytePtr = (byte*)((((uintptr_t)(ptr)) + (offset)) & ~(CACHE_LINE_SIZE - 1));

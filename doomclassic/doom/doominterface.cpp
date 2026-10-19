@@ -32,6 +32,14 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "globaldata.h"
 #include "doominterface.h"
+
+#if defined(__vita__)
+extern uint64 vitaClassicTicUs, vitaClassicWallsUs, vitaClassicFlatsUs, vitaClassicSpritesUs;
+extern uint64 vitaClassicNetUs, vitaClassicDisplayUs, vitaClassicSndPosUs, vitaClassicSndSubmitUs, vitaClassicSndEventsUs;
+#define VITA_CLASSIC_TIME(acc, stmt) do { const uint64 vitaT0_ = Sys_Microseconds(); stmt; acc += Sys_Microseconds() - vitaT0_; } while (0)
+#else
+#define VITA_CLASSIC_TIME(acc, stmt) do { stmt; } while (0)
+#endif
 #include "Main.h"
 #include "m_menu.h"
 #include "g_game.h"
@@ -168,7 +176,8 @@ bool DoomInterface::Frame( int iTime, idUserCmdMgr* userCmdMgr )
 				{
 					if( !waitingForWipe )
 					{
-						const bool didRunTic = DoomLib::Tic( userCmdMgr );
+						bool didRunTic = false;
+						VITA_CLASSIC_TIME( vitaClassicTicUs, didRunTic = DoomLib::Tic( userCmdMgr ) );
 						if( didRunTic == false )
 						{
 							//printf( "Skipping tic and yielding because not enough time has passed.\n" );
@@ -197,7 +206,7 @@ bool DoomInterface::Frame( int iTime, idUserCmdMgr* userCmdMgr )
 
 		DoomLib::SetPlayer( 0 );
 		DoomLib::SendNetwork();
-		DoomLib::RunSound();
+		VITA_CLASSIC_TIME( vitaClassicSndEventsUs, DoomLib::RunSound() );
 		DoomLib::SetPlayer( -1 );
 
 		lastTicRun = iTime;

@@ -105,6 +105,15 @@ void 	R_DrawSpan(
 	lighttable_t* ds_colormap,
 	byte* ds_source );
 
+#if defined(__vita__) || defined(ID_TEST_CLASSIC_MT)
+// multithreaded drawing: record while a view renders, draw on every core at
+// its end (r_draw.cpp)
+void	R_VitaDeferBegin();
+void	R_VitaDeferEnd();
+void	R_VitaDeferFlushIfActive();
+struct player_s;
+#endif
+
 // Low resolution mode, 160x200?
 void 	R_DrawSpanLow( fixed_t xfrac,
 					   fixed_t yfrac,

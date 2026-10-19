@@ -61,7 +61,26 @@ typedef struct portalArea_s {
     portal_t* portals;          // never changes after load
     areaReference_t entityRefs; // head/tail of doubly linked list, may change
     areaReference_t lightRefs;  // head/tail of doubly linked list, may change
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // the entity references as a packed array in list order, for the light
+    // jobs' walk (tr_frontend_addlights.cpp): remade before the light jobs
+    // when the list changed (vitaRefsDirty, set where references are added
+    // and removed); freed with the world (FreeWorld)
+    struct vitaAreaEntityRef_t* vitaRefs;
+    int vitaNumRefs;
+    int vitaRefsAlloced;
+    bool vitaRefsDirty;
+#endif
 } portalArea_t;
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+struct vitaAreaEntityRef_t {
+    class idRenderEntityLocal* edef;
+    int index;          // edef->index
+    bool staticModel;   // areaReference_t::vitaStaticModel
+    bool noSurfaces;    // areaReference_t::vitaNoSurfaces
+};
+#endif
 
 static const int CHILDREN_HAVE_MULTIPLE_AREAS = -2;
 static const int AREANUM_SOLID = -1;
@@ -184,9 +203,15 @@ public:
     // cache access, because the table is accessed by light in idRenderWorldLocal::CreateLightDefInteractions()
     // Growing this table is time consuming, so we add a pad value to the number
     // of entityDefs and lightDefs
-    idInteraction** interactionTable;
+    // [light index][entity index]: a row of its own per light rather than
+    // one block of width * height (7.6 MB on most maps, the sizes being the
+    // high-water marks of the lists): a long session's fragmented heap had
+    // no 7.6 MB piece left (the Vita verification, phobos3, 2026-10-18)
+    idInteraction*** interactionTable;
     int interactionTableWidth;  // entityDefs
     int interactionTableHeight; // lightDefs
+    void AllocInteractionTable();
+    void FreeInteractionTable(idInteraction*** table, int height);
 
     bool generateAllInteractionsCalled;
 

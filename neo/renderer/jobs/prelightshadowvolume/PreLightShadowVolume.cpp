@@ -28,6 +28,8 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "PreLightShadowVolume_local.h"
 
+bool R_ForceZFailStencilShadows(); // tr_backend_draw.cpp: the verification's z-fail check (r_forceZFailStencilShadows)
+
 /*
 ===================
 PreLightShadowVolumeJob
@@ -67,6 +69,9 @@ void PreLightShadowVolumeJob(const preLightShadowVolumeParms_t* parms)
             }
         }
 
+        if (R_ForceZFailStencilShadows()) {
+            renderZFail = true; // the z-fail check (pre-light volumes always have their caps)
+        }
         // must always draw the caps because pre-light shadows do not project to infinity
         numShadowIndices = parms->numIndexes;
     }

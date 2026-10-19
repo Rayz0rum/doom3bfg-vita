@@ -29,10 +29,20 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "snd_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 idCVar s_lockListener("s_lockListener", "0", CVAR_BOOL, "lock listener updates");
+idCVar s_occlusionBound("s_occlusionBound", "1", CVAR_BOOL, "skip portal chains that cannot beat the best sound path found so far (the straight line to the listener is the shortest the rest can be); same result as the full search");
+idCVar s_occlusionVerify("s_occlusionVerify", "0", CVAR_BOOL, "run the full portal search next to the bounded one and report any emitter where they differ");
 idCVar s_constantAmplitude("s_constantAmplitude", "-1", CVAR_FLOAT, "");
+#if defined(__vita__)
+// OpenAL Soft mixes every voice on the CPU: 48 took ~30% of a core in
+// mars_city2 (14 ms a frame). The quietest voices are dropped first, so 32
+// keeps every sound that is actually audible.
+idCVar s_maxEmitterChannels("s_maxEmitterChannels", "32", CVAR_INTEGER, "Can be set lower than the absolute max of MAX_HARDWARE_VOICES");
+#else
 idCVar s_maxEmitterChannels("s_maxEmitterChannels", "48", CVAR_INTEGER, "Can be set lower than the absolute max of MAX_HARDWARE_VOICES");
+#endif
 idCVar s_cushionFadeChannels("s_cushionFadeChannels", "2", CVAR_INTEGER, "Ramp currentCushionDB so this many emitter channels should be silent");
 idCVar s_cushionFadeRate("s_cushionFadeRate", "60", CVAR_FLOAT, "DB / second change to currentCushionDB");
 idCVar s_cushionFadeLimit("s_cushionFadeLimit", "-30", CVAR_FLOAT, "Never cushion fade beyond this level");
@@ -318,6 +328,7 @@ void idSoundWorldLocal::Update()
     int totalEmitterChannels = 0;
 
     int currentTime = GetSoundTime();
+    VITA_ZONE_BEGIN(emitterZone, "sound: emitters");
     for (int e = emitters.Num() - 1; e >= 0; e--) {
         // check for freeing a one-shot emitter that is finished playing
         if (emitters[e]->CheckForCompletion(currentTime)) {
@@ -337,6 +348,7 @@ void idSoundWorldLocal::Update()
         emitters[e]->Update(currentTime);
 
         totalEmitterChannels += emitters[e]->channels.Num();
+        VITA_ZONE_COUNT("sound: emitters walked");
 
         // sort the active channels into the hardware list
         for (int i = 0; i < emitters[e]->channels.Num(); i++) {
@@ -345,7 +357,11 @@ void idSoundWorldLocal::Update()
             // check if this channel contributes at all
             const bool canMute = channel->CanMute();
             if (canMute && channel->volumeDB <= DB_SILENCE) {
-#if !defined(USE_OPENAL)
+#if !defined(USE_OPENAL) || defined(ID_SOUND_STREAM)
+                // Out of earshot: give the voice back. With streamed playback
+                // a voice costs decoding, disk reads and OpenAL mixing even
+                // when silent; it restarts at the right offset (Start) when the
+                // listener comes back in range.
                 channel->Mute();
                 continue;
 #endif
@@ -395,6 +411,7 @@ void idSoundWorldLocal::Update()
         }
     }
 
+    VITA_ZONE_END(emitterZone);
     const float secondsPerFrame = 1.0f / com_engineHz_latched;
 
     // ------------------
@@ -422,6 +439,7 @@ void idSoundWorldLocal::Update()
             soundSystemLocal.hardware.GetNumFreeVoices(), soundSystemLocal.hardware.GetNumZombieVoices(),
             soundSystemLocal.activeStreamBufferContexts.Num(), soundSystemLocal.freeStreamBufferContexts.Num());
     }
+    VITA_ZONE_BEGIN(voiceZone, "sound: voices (UpdateHardware)");
     for (int i = 0; i < activeEmitterChannels.Num(); i++) {
         idSoundChannel* chan = activeEmitterChannels[i].channel;
         chan->UpdateHardware(0.0f, currentTime);
@@ -448,6 +466,7 @@ void idSoundWorldLocal::Update()
 
         shakeAmp += chan->parms.shakes * chan->hardwareVoice->GetGain() * chan->currentAmplitude;
     }
+    VITA_ZONE_END(voiceZone);
     if (showVoices) {
         static idOverlayHandle handle;
         console->PrintOverlay(handle, JUSTIFY_LEFT, showVoiceTable.c_str());
@@ -671,12 +690,30 @@ set at maxDistance
 */
 static const int MAX_PORTAL_TRACE_DEPTH = 10;
 
+int idSoundWorldLocal::resolveSteps = 0;
+bool idSoundWorldLocal::resolveBound = false;
+
 void idSoundWorldLocal::ResolveOrigin(const int stackDepth, const soundPortalTrace_t* prevStack, const int soundArea, const float dist, const idVec3& soundOrigin, idSoundEmitterLocal* def)
 {
+    resolveSteps++;
+    VITA_ZONE_COUNT("sound: occlusion portal steps");
 
     if (dist >= def->spatializedDistance) {
         // we can't possibly hear the sound through this chain of portals
         return;
+    }
+
+    if (resolveBound && soundArea != listener.area) {
+        // Whatever chain of portals continues from here, the rest of the path
+        // is at least the straight line to the listener (each step is a
+        // straight segment, door penalties only add). A chain that can't beat
+        // the best path found so far is not worth walking: on the Vita the
+        // exhaustive walk visited thousands of portals a frame in big maps.
+        // The 0.999 keeps float rounding in the per-step sums from ever
+        // pruning a chain the full search would have picked.
+        if (dist + (soundOrigin - listener.pos).LengthFast() * 0.999f >= def->spatializedDistance) {
+            return;
+        }
     }
 
     if (soundArea == listener.area) {
@@ -809,9 +846,13 @@ void idSoundWorldLocal::ProcessDemoCommand(idDemoFile* readDemo)
     int index;
     soundDemoCommand_t dc;
 
-    if (!readDemo->ReadInt((int&)dc)) {
+    // soundDemoCommand_t is a one byte enum on ARM, so it cannot be aliased as
+    // an int& to be written into.
+    int dcValue;
+    if (!readDemo->ReadInt(dcValue)) {
         return;
     }
+    dc = (soundDemoCommand_t)dcValue;
 
     switch (dc) {
     case SCMD_STATE:

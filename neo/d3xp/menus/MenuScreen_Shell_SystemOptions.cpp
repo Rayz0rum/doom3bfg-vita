@@ -28,6 +28,9 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "../Game_local.h"
+#if defined(__vita__)
+#include "../../sys/vita/vita_public.h"
+#endif
 
 const static int NUM_SYSTEM_OPTIONS_OPTIONS = 8;
 
@@ -69,52 +72,87 @@ void idMenuScreen_Shell_SystemOptions::Initialize(idMenuHandler* data)
     AddChild(btnBack);
 
     idMenuWidget_ControlButton* control;
+    // Vita: Render Resolution, Dynamic Resolution, Frame Rate Cap and Shadows
+    // are not shown - they stay at the tuned values (960x544 display, the 3D
+    // view dynamic from 544x312 to 720x408, 30 FPS cap, shadows on; see
+    // Vita_ApplyFixedSettings in Common.cpp). Each command carries its field
+    // and its row, as the rows no longer line up with the fields.
+#if !defined(__vita__)
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TEXT);
+#if defined(__vita__)
+    control->SetLabel("Render Resolution");
+#else
     control->SetLabel("#str_02154");
+#endif
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FULLSCREEN);
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FULLSCREEN);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FULLSCREEN, options->GetChildren().Num());
     options->AddChild(control);
 
+    // Vita: the PC-only rows (engine Hz, vsync, MSAA, motion blur - each one
+    // either a restart or a big frame-rate cost here) become Vita options in
+    // the same slots; the command ids double as list positions, so the rows
+    // stay where they are.
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TEXT);
+#if defined(__vita__)
+    control->SetLabel("Dynamic Resolution");
+#else
     control->SetLabel("#str_swf_framerate");
+#endif
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FRAMERATE);
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FRAMERATE);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FRAMERATE, options->GetChildren().Num());
     options->AddChild(control);
+
+#endif
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TEXT);
+#if defined(__vita__)
+    control->SetLabel("#str_vita_classic_screen");
+#else
     control->SetLabel("#str_04126");
+#endif
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_VSYNC);
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_VSYNC);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_VSYNC, options->GetChildren().Num());
     options->AddChild(control);
 
+#if !defined(__vita__)
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TEXT);
+#if defined(__vita__)
+    control->SetLabel("Frame Rate Cap");
+#else
     control->SetLabel("#str_04128");
+#endif
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_ANTIALIASING);
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_ANTIALIASING);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_ANTIALIASING, options->GetChildren().Num());
     options->AddChild(control);
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TEXT);
+#if defined(__vita__)
+    control->SetLabel("Shadows");
+#else
     control->SetLabel("#str_swf_motionblur");
+#endif
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_MOTIONBLUR);
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_MOTIONBLUR);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_MOTIONBLUR, options->GetChildren().Num());
     options->AddChild(control);
+
+#endif
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_BAR);
     control->SetLabel("#str_swf_lodbias");
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_LODBIAS);
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_LODBIAS);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_LODBIAS, options->GetChildren().Num());
     options->AddChild(control);
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
@@ -122,7 +160,7 @@ void idMenuScreen_Shell_SystemOptions::Initialize(idMenuHandler* data)
     control->SetLabel("#str_02155"); // Brightness
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BRIGHTNESS);
     control->SetupEvents(2, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BRIGHTNESS);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BRIGHTNESS, options->GetChildren().Num());
     options->AddChild(control);
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
@@ -130,7 +168,7 @@ void idMenuScreen_Shell_SystemOptions::Initialize(idMenuHandler* data)
     control->SetLabel("#str_02163"); // Volume
     control->SetDataSource(&systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_VOLUME);
     control->SetupEvents(2, options->GetChildren().Num());
-    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_VOLUME);
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_VOLUME, options->GetChildren().Num());
     options->AddChild(control);
 
     options->AddEventAction(WIDGET_EVENT_SCROLL_DOWN).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_SCROLL_DOWN_START_REPEATER, WIDGET_EVENT_SCROLL_DOWN));
@@ -276,10 +314,13 @@ bool idMenuScreen_Shell_SystemOptions::HandleAction(idWidgetAction& action, cons
         return true;
     }
     case WIDGET_ACTION_ADJUST_FIELD:
+#if !defined(__vita__)
+        // (Vita: the resolution field cycles in place, like any other field)
         if (widget->GetDataSourceFieldIndex() == idMenuDataSource_SystemSettings::SYSTEM_FIELD_FULLSCREEN) {
             menuData->SetNextScreen(SHELL_AREA_RESOLUTION, MENU_TRANSITION_SIMPLE);
             return true;
         }
+#endif
         break;
     case WIDGET_ACTION_COMMAND: {
 
@@ -288,7 +329,9 @@ bool idMenuScreen_Shell_SystemOptions::HandleAction(idWidgetAction& action, cons
         }
 
         int selectionIndex = options->GetFocusIndex();
-        if (parms.Num() > 0) {
+        if (parms.Num() > 1) {
+            selectionIndex = parms[1].ToInteger(); // the row (parms[0] is the field)
+        } else if (parms.Num() > 0) {
             selectionIndex = parms[0].ToInteger();
         }
 
@@ -298,10 +341,12 @@ bool idMenuScreen_Shell_SystemOptions::HandleAction(idWidgetAction& action, cons
         }
 
         switch (parms[0].ToInteger()) {
+#if !defined(__vita__)
         case idMenuDataSource_SystemSettings::SYSTEM_FIELD_FULLSCREEN: {
             menuData->SetNextScreen(SHELL_AREA_RESOLUTION, MENU_TRANSITION_SIMPLE);
             return true;
         }
+#endif
         default: {
             systemData.AdjustField(parms[0].ToInteger(), 1);
             options->Update();
@@ -348,12 +393,30 @@ idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::idMenuDataSou
 idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData
 ========================
 */
+#if defined(__vita__)
+extern idCVar vita_dynamicResolution;
+extern idCVar vita_classicAspect;
+extern idCVar vita_maxFPS;
+extern idCVar r_skipShadows;
+extern idCVar vita_renderResolution;
+static idStr vitaOriginalResolution;
+#endif
+
 void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData()
 {
+#if defined(__vita__)
+    // the Vita rows reuse the PC rows' slots (see the constructor)
+    originalFramerate = vita_dynamicResolution.GetInteger();
+    originalAntialias = vita_maxFPS.GetInteger();
+    originalMotionBlur = r_skipShadows.GetInteger();
+    originalVsync = vita_classicAspect.GetInteger();
+    vitaOriginalResolution = vita_renderResolution.GetString();
+#else
     originalFramerate = com_engineHz.GetInteger();
     originalAntialias = r_multiSamples.GetInteger();
     originalMotionBlur = r_motionBlur.GetInteger();
     originalVsync = r_swapInterval.GetInteger();
+#endif
     originalBrightness = r_lightScale.GetFloat();
     originalVolume = s_volume_dB.GetFloat();
 
@@ -372,6 +435,9 @@ idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsRestartRequ
 */
 bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsRestartRequired() const
 {
+#if defined(__vita__)
+    return false; // every Vita option applies at once
+#endif
     if (originalAntialias != r_multiSamples.GetInteger()) {
         return true;
     }
@@ -430,9 +496,46 @@ float LinearAdjust(float input, float currentMin, float currentMax, float desire
 idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustField
 ========================
 */
+#if defined(__vita__)
+extern idCVar vita_renderResolution;
+// the top of the 3D view's range (dynamic resolution works below it, down to 640x360)
+static const char* const vitaResolutions[] = { "720x408", "640x360" };
+static const int numVitaResolutions = 2;
+#endif
+
 void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustField(const int fieldIndex, const int adjustAmount)
 {
     switch (fieldIndex) {
+#if defined(__vita__)
+    case SYSTEM_FIELD_FULLSCREEN: {
+        int cur = 0;
+        for (int i = 0; i < numVitaResolutions; i++) {
+            if (!idStr::Cmp(vita_renderResolution.GetString(), vitaResolutions[i])) {
+                cur = i;
+            }
+        }
+        cur = (cur + adjustAmount + numVitaResolutions * 4) % numVitaResolutions;
+        vita_renderResolution.SetString(vitaResolutions[cur]);
+        common->Printf("vita: 3D render resolution set to %s from the menu (HUD and menus stay 960x544)\n", vitaResolutions[cur]);
+        break;
+    }
+    case SYSTEM_FIELD_FRAMERATE:
+        vita_dynamicResolution.SetBool(!vita_dynamicResolution.GetBool());
+        break;
+    case SYSTEM_FIELD_VSYNC: {
+        static const int values[4] = { 0, 1, 3, 2 };
+        vita_classicAspect.SetInteger(AdjustOption(vita_classicAspect.GetInteger(), values, 4, adjustAmount));
+        break;
+    }
+    case SYSTEM_FIELD_ANTIALIASING: {
+        static const int values[2] = { 30, 0 };
+        vita_maxFPS.SetInteger(AdjustOption(vita_maxFPS.GetInteger(), values, 2, adjustAmount));
+        break;
+    }
+    case SYSTEM_FIELD_MOTIONBLUR:
+        r_skipShadows.SetBool(!r_skipShadows.GetBool());
+        break;
+#else
     case SYSTEM_FIELD_FRAMERATE: {
         static const int numValues = 2;
         static const int values[numValues] = { 60, 120 };
@@ -457,6 +560,7 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
         r_motionBlur.SetInteger(AdjustOption(r_motionBlur.GetInteger(), values, numValues, adjustAmount));
         break;
     }
+#endif
     case SYSTEM_FIELD_LODBIAS: {
         const float percent = LinearAdjust(r_lodBias.GetFloat(), -1.0f, 1.0f, 0.0f, 100.0f);
         const float adjusted = percent + (float)adjustAmount * 5.0f;
@@ -490,6 +594,30 @@ idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::GetField
 idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::GetField(const int fieldIndex) const
 {
     switch (fieldIndex) {
+#if defined(__vita__)
+    case SYSTEM_FIELD_FULLSCREEN: {
+        int w = 960, h = 544;
+        sscanf(vita_renderResolution.GetString(), "%dx%d", &w, &h);
+        return va("%d x %d", w, h);
+    }
+    case SYSTEM_FIELD_FRAMERATE:
+        return vita_dynamicResolution.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
+    case SYSTEM_FIELD_VSYNC:
+        switch (vita_classicAspect.GetInteger()) {
+        case 2:
+            return "#str_vita_screen_full";
+        case 3:
+            return "16:10";
+        case 1:
+            return "4:3";
+        default:
+            return "#str_vita_screen_original";
+        }
+    case SYSTEM_FIELD_ANTIALIASING:
+        return vita_maxFPS.GetInteger() > 0 ? va("%d FPS", vita_maxFPS.GetInteger()) : "#str_swf_disabled";
+    case SYSTEM_FIELD_MOTIONBLUR:
+        return r_skipShadows.GetBool() ? "#str_swf_disabled" : "#str_swf_enabled";
+#else
     case SYSTEM_FIELD_FULLSCREEN: {
         const int fullscreen = r_fullscreen.GetInteger();
         const int vidmode = r_vidMode.GetInteger();
@@ -525,6 +653,7 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
             return "#str_swf_disabled";
         }
         return va("%dx", idMath::IPow(2, r_motionBlur.GetInteger()));
+#endif
     case SYSTEM_FIELD_LODBIAS:
         return LinearAdjust(r_lodBias.GetFloat(), -1.0f, 1.0f, 0.0f, 100.0f);
     case SYSTEM_FIELD_BRIGHTNESS:
@@ -543,6 +672,17 @@ idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsDataChanged
 */
 bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsDataChanged() const
 {
+#if defined(__vita__)
+    // also decides whether the config is written (AdjustField clears the
+    // archive flags), which is why a changed resolution used not to stick
+    if (originalFramerate != vita_dynamicResolution.GetInteger() || originalAntialias != vita_maxFPS.GetInteger()
+        || originalMotionBlur != r_skipShadows.GetInteger() || originalVsync != vita_classicAspect.GetInteger()
+        || vitaOriginalResolution.Cmp(vita_renderResolution.GetString()) != 0
+        || originalBrightness != r_lightScale.GetFloat() || originalVolume != s_volume_dB.GetFloat()) {
+        return true;
+    }
+    return false;
+#endif
     if (originalFramerate != com_engineHz.GetInteger()) {
         return true;
     }

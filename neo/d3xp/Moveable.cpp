@@ -904,9 +904,9 @@ void idExplodingBarrel::Restore(idRestoreGame* savefile)
     savefile->ReadVec3(spawnOrigin);
     savefile->ReadMat3(spawnAxis);
 
-    savefile->ReadInt((int&)state);
-    savefile->ReadInt((int&)particleModelDefHandle);
-    savefile->ReadInt((int&)lightDefHandle);
+    savefile->ReadEnum(state);
+    savefile->ReadEnum(particleModelDefHandle);
+    savefile->ReadEnum(lightDefHandle);
 
     savefile->ReadRenderEntity(particleRenderEntity);
     savefile->ReadRenderLight(light);

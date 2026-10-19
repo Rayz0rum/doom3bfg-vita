@@ -221,6 +221,10 @@ Sys_Error
 Show the early console as an error dialog
 =============
 */
+// automated test runs (the Vita port's PC test bed): a fatal error quits at
+// once, without opening the error console on the user's desktop
+idCVar win_silentErrors("win_silentErrors", "0", CVAR_SYSTEM | CVAR_BOOL, "quit on a fatal error without showing the error window (automated runs)");
+
 void Sys_Error(const char* error, ...)
 {
     va_list argptr;
@@ -233,6 +237,14 @@ void Sys_Error(const char* error, ...)
 
     Conbuf_AppendText(text);
     Conbuf_AppendText("\n");
+
+    if (win_silentErrors.GetBool()) {
+        OutputDebugStringA(text);
+        Sys_ShutdownInput();
+        GLimp_Shutdown();
+        Sys_DestroyConsole();
+        exit(1);
+    }
 
     Win_SetErrorText(text);
     Sys_ShowConsole(1, true);

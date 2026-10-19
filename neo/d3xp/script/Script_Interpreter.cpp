@@ -31,6 +31,79 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "../Game_local.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
+
+#if !defined(__vita__) && defined(ID_VITA_PHYSCHECK)
+// PC test build: every script event timed on its own zone ("event <name>"), so
+// the benchmark's pc zones line says which ones the scripts spend their time in
+// (too many calls a frame to clock them all on the Vita itself)
+static vitaZone_t* Script_EventZone(const idEventDef* evdef)
+{
+    static vitaZone_t* zones[MAX_EVENTS];
+    const int n = evdef->GetEventNum();
+    if (n < 0 || n >= MAX_EVENTS) {
+        static vitaZone_t other = { "event (other)", 0, 0, true, 0, 0 };
+        return &other;
+    }
+    if (zones[n] == NULL) {
+        const char* name = evdef->GetName();
+        char* zoneName = (char*)malloc(strlen(name) + 8);
+        sprintf(zoneName, "event %s", name);
+        vitaZone_t* z = (vitaZone_t*)calloc(1, sizeof(vitaZone_t));
+        z->name = zoneName;
+        z->timed = true;
+        zones[n] = z;
+    }
+    return zones[n];
+}
+#define SCRIPT_EVENT_ZONE(evdef) vitaZoneTimer_t scriptEventTimer(*Script_EventZone(evdef))
+#else
+#define SCRIPT_EVENT_ZONE(evdef)
+#endif
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+================
+Vita: slow script events
+
+The benchmark's fights had frames of 150-165 ms spent inside script threads,
+once or twice a fight. Every event a script calls is timed (two clock reads,
+~1 us) and one over 10 ms is logged - the event, its entity, the script thread
+and where in the script - the first 40 of them.
+================
+*/
+idCVar vita_slowScriptMs("vita_slowScriptMs", "10", CVAR_FLOAT | CVAR_GAME, "log a script event that takes longer than this many ms (the first 40)");
+static void Vita_SlowScriptEvent(const idEventDef* evdef, uint64 us, const idInterpreter* interp, const idClass* obj)
+{
+    static int logged = 0;
+    if (logged >= 40) {
+        return;
+    }
+    logged++;
+    idThread* thread = interp->GetThread();
+    const function_t* func = interp->GetCurrentFunction();
+    const char* objName = "?";
+    if (obj != NULL && obj->IsType(idEntity::Type)) {
+        objName = static_cast<const idEntity*>(obj)->GetName();
+    } else if (obj != NULL) {
+        objName = obj->GetClassname();
+    }
+    common->Printf("slow script event: '%s' took %.1f ms - on '%s', script thread '%s', in %s (%s:%d), game time %d\n",
+        evdef->GetName(), us / 1000.0, objName, thread ? thread->GetThreadName() : "?",
+        func ? func->Name() : "?", interp->CurrentFile(), interp->CurrentLine(), gameLocal.time);
+}
+#define SCRIPT_EVENT_SLOW_BEGIN() const uint64 vitaEventStart = Sys_Microseconds()
+#define SCRIPT_EVENT_SLOW_END(evdef, obj) \
+    do { \
+        const uint64 vitaEventUs = Sys_Microseconds() - vitaEventStart; \
+        if (vitaEventUs > (uint64)(vita_slowScriptMs.GetFloat() * 1000.0f)) { \
+            Vita_SlowScriptEvent(evdef, vitaEventUs, this, obj); \
+        } \
+    } while (0)
+#else
+#define SCRIPT_EVENT_SLOW_BEGIN()
+#define SCRIPT_EVENT_SLOW_END(evdef, obj)
+#endif
 
 /*
 ================
@@ -822,7 +895,10 @@ void idInterpreter::CallEvent(const function_t* func, int argsize)
     }
 
     popParms = argsize;
+    SCRIPT_EVENT_ZONE(evdef);
+    SCRIPT_EVENT_SLOW_BEGIN();
     eventEntity->ProcessEventArgPtr(evdef, data);
+    SCRIPT_EVENT_SLOW_END(evdef, eventEntity);
 
     if (!multiFrameEvent) {
         if (popParms) {
@@ -959,7 +1035,10 @@ void idInterpreter::CallSysEvent(const function_t* func, int argsize)
     }
 
     popParms = argsize;
+    SCRIPT_EVENT_ZONE(evdef);
+    SCRIPT_EVENT_SLOW_BEGIN();
     thread->ProcessEventArgPtr(evdef, data);
+    SCRIPT_EVENT_SLOW_END(evdef, thread);
     if (popParms) {
         PopParms(popParms);
     }

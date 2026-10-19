@@ -192,7 +192,7 @@ void idMenuScreen_Shell_Root::ShowScreen(const mainMenuTransition_t transitionTy
 
             idMenuWidget_Button* buttonWidget = NULL;
 
-#if !defined(ID_RETAIL)
+#if !defined(ID_RETAIL) && !defined(__vita__) // (no DEV map list on the Vita's title screen)
             option.Append("DEV"); // DEV
             menuOptions.Append(option);
             options->GetChildByIndex(index).ClearEventActions();
@@ -248,7 +248,9 @@ void idMenuScreen_Shell_Root::ShowScreen(const mainMenuTransition_t transitionTy
             }
             index++;
 
-            // only add quit option for PC
+#if !defined(__vita__)
+            // only add quit option for PC (the Vita leaves through the PS
+            // button; Circle goes back to the game selection)
             option.Clear();
             option.Append("#str_swf_quit"); // quit
             menuOptions.Append(option);
@@ -259,6 +261,7 @@ void idMenuScreen_Shell_Root::ShowScreen(const mainMenuTransition_t transitionTy
                 buttonWidget->SetDescription("#str_01976");
             }
             index++;
+#endif
         }
         options->SetListData(menuOptions);
     } else {

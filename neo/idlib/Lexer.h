@@ -60,7 +60,8 @@ typedef enum {
     LEXFL_ALLOWFLOATEXCEPTIONS = BIT(10),       // allow float exceptions like 1.#INF or 1.#IND to be parsed
     LEXFL_ALLOWMULTICHARLITERALS = BIT(11),     // allow multi character literals
     LEXFL_ALLOWBACKSLASHSTRINGCONCAT = BIT(12), // allow multiple strings separated by '\' to be concatenated
-    LEXFL_ONLYSTRINGS = BIT(13)                 // parse as whitespace deliminated strings (quoted strings keep quotes)
+    LEXFL_ONLYSTRINGS = BIT(13),                // parse as whitespace deliminated strings (quoted strings keep quotes)
+    LEXFL_STREAMLARGEFILES = BIT(14)            // LoadFile reads a big file through a window instead of whole (see idLexer::StreamRefill)
 } lexerFlags_t;
 
 // punctuation ids
@@ -131,6 +132,8 @@ typedef struct punctuation_s {
     const char* p; // punctuation character(s)
     int n;         // punctuation id
 } punctuation_t;
+
+class idFile;
 
 class idLexer {
 
@@ -268,6 +271,9 @@ private:
     idToken token;                     // available token
     idLexer* next;                     // next script in a chain
     bool hadError;                     // set by idLexer::Error, even if the error is supressed
+    idFile* streamFile;                // LEXFL_STREAMLARGEFILES: the file still being read into the window
+    int streamLeft;                    // bytes of it not read yet
+    int streamWindow;                  // the window's size
 
     static char baseFolder[256]; // base folder to load files from
 
@@ -282,6 +288,7 @@ private:
     int ReadPrimitive(idToken* token);
     int CheckString(const char* str) const;
     int NumLinesCrossed();
+    void StreamRefill();
 };
 
 ID_INLINE const char* idLexer::GetFileName()

@@ -747,6 +747,8 @@ bool Sys_CompareNetAdrBase(const netadr_t a, const netadr_t b);
 
 int Sys_GetLocalIPCount();
 const char* Sys_GetLocalIP(int i);
+bool Sys_GetLocalIPMask(int i, unsigned int& mask);
+void Sys_RefreshNetworking();
 
 void Sys_InitNetworking();
 void Sys_ShutdownNetworking();

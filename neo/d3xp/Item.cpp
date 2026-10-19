@@ -30,6 +30,12 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "Game_local.h"
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT (gib pieces)
+extern idCVar vita_debrisHalfRate;
+extern idCVar vita_debrisClipBox;
+extern idCVar vita_debrisTranslationSweep;
+#endif
 
 /*
 ===============================================================================
@@ -1616,6 +1622,9 @@ idMoveableItem::idMoveableItem()
     smokeTime = 0;
     nextSoundTime = 0;
     repeatSmoke = false;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaGib = false;
+#endif
 }
 
 /*
@@ -1736,6 +1745,39 @@ void idMoveableItem::Spawn()
     repeatSmoke = spawnArgs.GetBool("repeatSmoke", "0");
 }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+================
+idMoveableItem::VitaSimplifyGib
+
+Vita (a cut): the pieces a gibbed monster bursts into (idAFEntity_Gibbable::
+SpawnGibs) only fly for the 4 s before they are removed, touch nothing but the
+world and cast no shadow, yet each collided as a shape made from its model:
+a shotgun fight against the zombie soldiers had 5-8 of them moving at once,
+0.5 ms of physics each per tic. They now collide as the box around that shape,
+keep their mass, sweep their movement only (not their rotation) and simulate
+at half rate (Think), as debris do.
+================
+*/
+void idMoveableItem::VitaSimplifyGib()
+{
+    vitaGib = true;
+    if (!vita_debrisClipBox.GetBool() || physicsObj.GetClipModel() == NULL) {
+        return;
+    }
+    const idBounds bounds = physicsObj.GetClipModel()->GetBounds();
+    const idVec3 size = bounds[1] - bounds[0];
+    if (bounds.IsCleared() || size.x < 1.0f || size.y < 1.0f || size.z < 1.0f) {
+        return;
+    }
+    VITA_ZONE_COUNT("gib pieces given a box clip model (vita_debrisClipBox)");
+    const float mass = physicsObj.GetMass();
+    physicsObj.SetClipBox(bounds, 1.0f);
+    physicsObj.SetMass(mass);
+    physicsObj.vitaTranslationSweepOnly = vita_debrisTranslationSweep.GetBool();
+}
+#endif
+
 /*
 ================
 idItem::ClientThink
@@ -1761,6 +1803,21 @@ idMoveableItem::Think
 */
 void idMoveableItem::Think()
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): moving gib pieces simulate every other tic, two tics at a
+    // time, like debris (idEntity::VitaHalfRateTic)
+    int vitaSkipTime = 0;
+    vitaThinkSpan_t vitaSpan(&vitaLastThinkTime);
+    const int vitaTic = VitaHalfRateTic(vitaGib && vita_debrisHalfRate.GetBool() && !physicsObj.IsAtRest());
+    if (vitaTic == VITA_THINK_SKIP) {
+        VITA_ZONE_COUNT("half-rate think: gib piece tics off (vita_debrisHalfRate)");
+        vitaSpan.lastThink = &vitaSkipTime;
+        return;
+    }
+    if (vitaTic == VITA_THINK_TWO_TICS) {
+        vitaSpan.Span();
+    }
+#endif
 
     RunPhysics();
 

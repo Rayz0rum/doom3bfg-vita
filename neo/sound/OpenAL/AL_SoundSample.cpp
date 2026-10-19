@@ -83,6 +83,18 @@ idSoundSample_OpenAL::idSoundSample_OpenAL()
     lastPlayedTime = 0;
 
     openalBuffer = 0;
+
+#if defined(ID_SOUND_STREAM)
+    streamPathId = -1;
+    streamDataOffset = 0;
+    dataBytes = 0;
+    residentBytes = 0;
+    blockAlign = 0;
+    framesPerBlock = 0;
+    numBlocks = 0;
+    residentBlocks = 0;
+    accountedBytes = 0;
+#endif
 }
 
 /*
@@ -190,6 +202,8 @@ idSoundSample_OpenAL::Load
 */
 void idSoundSample_OpenAL::LoadResource()
 {
+    extern int vita_benchLoads[3]; // VitaBench.cpp: sounds loaded, per frame in the benchmark log
+    vita_benchLoads[1]++;
     FreeData();
 
     if (idStr::Icmpn(GetName(), "_default", 8) == 0) {
@@ -220,7 +234,11 @@ void idSoundSample_OpenAL::LoadResource()
             }
             generatedName.Append(".idwav");
         }
+#if defined(ID_SOUND_STREAM)
+        loaded = LoadGeneratedSampleStreaming(generatedName) || LoadWav(sampleName);
+#else
         loaded = LoadGeneratedSample(generatedName) || LoadWav(sampleName);
+#endif
 
         if (!loaded && s_useCompression.GetBool()) {
             sampleName.SetFileExtension("wav");
@@ -245,8 +263,16 @@ void idSoundSample_OpenAL::LoadResource()
                 }
             }
 
+#if defined(ID_SOUND_STREAM)
+            // nothing goes to OpenAL now: voices decode the compressed data as
+            // they play it (AL_SoundStream.cpp)
+            SetupBlocks();
+            accountedBytes = residentBytes;
+            SoundStream_AccountSample(accountedBytes, IsStreamed());
+#else
             // upload PCM data to OpenAL
             CreateOpenALBuffer();
+#endif
 
             return;
         }
@@ -282,7 +308,26 @@ void idSoundSample_OpenAL::CreateOpenALBuffer()
             bufferSize = buffers[0].bufferSize;
 
             if (MS_ADPCM_decode((uint8**)&buffer, &bufferSize) < 0) {
+#if defined(__vita__)
+                // Not fatal here. The realistic failure is simply that there is
+                // no memory left for this sample's PCM - these ambience loops
+                // decode to several megabytes each - and losing one sound is a
+                // far better outcome than refusing to load the map.
+                //
+                // MS_ADPCM_decode() returns before its Mem_Free() on that path,
+                // so the encoded data is still ours to release. alBufferData()
+                // below is happy with the replacement: GetOpenALBufferFormat()
+                // reports 16-bit PCM for an ADPCM sample either way.
+                idLib::Printf("adpcm SILENCED '%s': could not decode, substituting silence\n", GetName());
+                Mem_Free(buffers[0].buffer);
+                bufferSize = 4096;
+                buffer = Mem_ClearedAlloc(bufferSize, TAG_AUDIO);
+                if (buffer == NULL) {
+                    common->Error("idSoundSample_OpenAL::CreateOpenALBuffer: out of memory substituting silence for '%s'", GetName());
+                }
+#else
                 common->Error("idSoundSample_OpenAL::CreateOpenALBuffer: could not decode ADPCM '%s' to 16 bit format", GetName());
+#endif
             }
 
             buffers[0].buffer = buffer;
@@ -522,6 +567,13 @@ void idSoundSample_OpenAL::MakeDefault()
     playBegin = 0;
     playLength = DEFAULT_NUM_SAMPLES;
 
+#if defined(ID_SOUND_STREAM)
+    SetupBlocks();
+    accountedBytes = residentBytes;
+    SoundStream_AccountSample(accountedBytes, false);
+    return;
+#endif
+
     CheckALErrors();
     alGenBuffers(1, &openalBuffer);
 
@@ -562,6 +614,19 @@ void idSoundSample_OpenAL::FreeData()
     totalBufferSize = 0;
     playBegin = 0;
     playLength = 0;
+
+#if defined(ID_SOUND_STREAM)
+    if (accountedBytes > 0) {
+        SoundStream_AccountSample(-accountedBytes, streamPathId >= 0);
+    }
+    accountedBytes = 0;
+    streamPathId = -1;
+    streamDataOffset = 0;
+    dataBytes = 0;
+    residentBytes = 0;
+    numBlocks = 0;
+    residentBlocks = 0;
+#endif
 
     if (alIsBuffer(openalBuffer)) {
         CheckALErrors();
@@ -956,14 +1021,75 @@ int idSoundSample_OpenAL::MS_ADPCM_decode(uint8** audio_buf, uint32* audio_len)
     encoded = *audio_buf;
     freeable = *audio_buf;
 
+#if defined(__vita__)
+    // The loops below advance `encoded` and `decoded` purely from the header
+    // geometry and never test either against the end of its buffer, so if
+    // blockSize, samplesPerBlock and numChannels disagree with each other both
+    // pointers walk off the end. That is what crashed loading mars_city2: the
+    // faulting thread had encoded = 0x64ac93d0, which is not a mapped address.
+    //
+    // A block is a per-channel preamble - predictor byte, iDelta, iSamp1, iSamp2
+    // = 7 bytes per channel - followed by one byte per two decoded samples. If
+    // that does not come to exactly blockSize the file cannot be decoded by this
+    // routine, so say which sample it was and how it disagrees, rather than
+    // running off the heap to find out.
+    {
+        const uint32 bs = format.basic.blockSize;
+        const uint32 spb = format.extra.adpcm.samplesPerBlock;
+        const uint32 nch = format.basic.numChannels;
+        const uint32 needed = (spb >= 2) ? ((nch * 7) + (((spb - 2) * nch) / 2)) : 0;
+
+        if (bs == 0 || nch < 1 || nch > 2 || spb < 2 || (spb & 1) != 0 || needed != bs) {
+            // Printf, not Warning: idLib::Warning queues into the list that is
+            // flushed at the end of a level load, and the common->Error at the
+            // call site aborts before that happens - which is why the first run
+            // to hit this named the sample but printed none of its numbers.
+            idLib::Printf("adpcm BAD '%s': blockSize=%u samplesPerBlock=%u channels=%u numCoef=%u encodedBytes=%u; a block of this shape needs %u bytes\n",
+                GetName(), bs, spb, nch, (uint32)format.extra.adpcm.numCoef,
+                (uint32)encoded_len, needed);
+            // Deliberately not fatal. The bounds added to the decode loops below
+            // make a malformed header produce a truncated sample instead of a
+            // heap overrun, and one bad ambience loop is not worth refusing to
+            // load the map for.
+        }
+
+        static int logged = 0;
+        if (logged < 5) {
+            logged++;
+            idLib::Printf("adpcm ok '%s': blockSize=%u samplesPerBlock=%u channels=%u encodedBytes=%u blocks=%u\n",
+                GetName(), bs, spb, nch, (uint32)encoded_len, (uint32)(encoded_len / bs));
+        }
+    }
+#endif
+
     *audio_len = (encoded_len / format.basic.blockSize) * format.extra.adpcm.samplesPerBlock * format.basic.numChannels * sizeof(int16);
 
     *audio_buf = (uint8*)Mem_Alloc(*audio_len, TAG_AUDIO);
     if (*audio_buf == NULL) {
         // SDL_Error( SDL_ENOMEM );
+#if defined(__vita__)
+        idLib::Printf("adpcm OOM '%s': Mem_Alloc(%u) failed decoding %u encoded bytes (blockSize=%u spb=%u ch=%u)\n",
+            GetName(), (uint32)*audio_len, (uint32)encoded_len,
+            (uint32)format.basic.blockSize,
+            (uint32)format.extra.adpcm.samplesPerBlock,
+            (uint32)format.basic.numChannels);
+#endif
         return (-1);
     }
     decoded = *audio_buf;
+
+    // Neither loop below ever compared either of its pointers against the end of
+    // its buffer - the walk is driven entirely by the header geometry. Bound both.
+    //
+    // Bounding only the output was not enough: the crash came back with the input
+    // pointer at 0x64ac34d7 and no "adpcm BAD" line, so the header geometry was
+    // self-consistent and `encoded` still ran off. That points at encoded_len
+    // claiming more bytes than are actually behind buffers[0].buffer, which the
+    // block loop cannot detect on its own because it only ever decrements its own
+    // counter. The report below says which side overran and by how much.
+    const uint8* const decoded_end = *audio_buf + *audio_len;
+    const uint8* const encoded_end = freeable + encoded_len;
+    bool overran = false;
 
     assert(format.basic.numChannels == 1 || format.basic.numChannels == 2);
 
@@ -973,6 +1099,13 @@ int idSoundSample_OpenAL::MS_ADPCM_decode(uint8** audio_buf, uint32* audio_len)
     state[1] = &states[stereo];
 
     while (encoded_len >= format.basic.blockSize) {
+        // The preamble writes two samples per channel and reads blockSize bytes.
+        if (decoded + (4 * (stereo ? 2 : 1)) > decoded_end
+            || encoded + format.basic.blockSize > encoded_end) {
+            overran = true;
+            break;
+        }
+
         // Grab the initial information for this block
         state[0]->hPredictor = *encoded++;
 
@@ -1035,7 +1168,7 @@ int idSoundSample_OpenAL::MS_ADPCM_decode(uint8** audio_buf, uint32* audio_len)
         // Decode and store the other samples in this block
         samplesleft = (format.extra.adpcm.samplesPerBlock - 2) * format.basic.numChannels;
 
-        while (samplesleft > 0) {
+        while (samplesleft > 0 && decoded + 4 <= decoded_end && encoded < encoded_end) {
             nybble = (*encoded) >> 4;
             new_sample = MS_ADPCM_nibble(state[0], nybble);
 
@@ -1056,6 +1189,18 @@ int idSoundSample_OpenAL::MS_ADPCM_decode(uint8** audio_buf, uint32* audio_len)
 
         encoded_len -= format.basic.blockSize;
     }
+
+#if defined(__vita__)
+    if (overran) {
+        idLib::Printf("adpcm TRUNC '%s': stopped early - encoded %d/%d bytes left, decoded %d/%d bytes short, blockSize=%u spb=%u ch=%u\n",
+            GetName(),
+            (int)(encoded_end - encoded), (int)encoded_len,
+            (int)(decoded_end - decoded), (int)*audio_len,
+            (uint32)format.basic.blockSize,
+            (uint32)format.extra.adpcm.samplesPerBlock,
+            (uint32)format.basic.numChannels);
+    }
+#endif
 
     Mem_Free(freeable);
 

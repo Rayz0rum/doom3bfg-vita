@@ -96,6 +96,9 @@ void R_FreeEntityDefDerivedData(idRenderEntityLocal* def, bool keepDecals, bool 
     if (def->dynamicModel) {
         def->dynamicModel = NULL;
     }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    Vita_TraceCacheInvalidate(def);
+#endif
 
     if (!keepDecals) {
         R_FreeEntityDefDecals(def);
@@ -115,6 +118,9 @@ void R_FreeEntityDefDerivedData(idRenderEntityLocal* def, bool keepDecals, bool 
         // unlink from the area
         ref->areaNext->areaPrev = ref->areaPrev;
         ref->areaPrev->areaNext = ref->areaNext;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        ref->area->vitaRefsDirty = true;
+#endif
 
         // put it back on the free list for reuse
         def->world->areaReferenceAllocator.Free(ref);

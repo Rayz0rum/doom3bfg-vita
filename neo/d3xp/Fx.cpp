@@ -849,6 +849,9 @@ void idTeleporter::Event_DoAction(idEntity* activator)
 {
     float angle;
 
+    if (activator == NULL) {
+        return; // removed before the delayed activation fired: nothing to move
+    }
     angle = spawnArgs.GetFloat("angle");
     idAngles a(0, spawnArgs.GetFloat("angle"), 0);
     activator->Teleport(GetPhysics()->GetOrigin(), a, NULL);

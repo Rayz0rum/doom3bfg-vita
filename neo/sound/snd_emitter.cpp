@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "snd_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 idCVar s_singleEmitter("s_singleEmitter", "0", CVAR_INTEGER, "mute all sounds but this emitter");
 idCVar s_showStartSound("s_showStartSound", "0", CVAR_BOOL, "print a message every time a sound starts/stops");
@@ -325,7 +326,10 @@ void idSoundChannel::UpdateHardware(float volumeAdd, int currentTime)
             return;
         }
 
-        hardwareVoice = soundSystemLocal.AllocateVoice(leadinSample, loopingSample);
+        {
+            VITA_ZONE("sound: allocate voice");
+            hardwareVoice = soundSystemLocal.AllocateVoice(leadinSample, loopingSample);
+        }
 
         if (hardwareVoice == NULL) {
             return;
@@ -335,6 +339,7 @@ void idSoundChannel::UpdateHardware(float volumeAdd, int currentTime)
         startOffset = currentTime - startTime;
     }
 
+    VITA_ZONE_COUNT("sound: voices updated");
     if (omni || global || emitterIsListener) {
         hardwareVoice->SetPosition(vec3_zero);
     } else {
@@ -359,8 +364,10 @@ void idSoundChannel::UpdateHardware(float volumeAdd, int currentTime)
     }
 
     if (issueStart) {
+        VITA_ZONE("sound: voice start");
         hardwareVoice->Start(startOffset, parms.soundShaderFlags | (parms.shakes == 0.0f ? SSF_NO_FLICKER : 0));
     } else {
+        // (no timing zone: with the sound worker running this is a return)
         hardwareVoice->Update();
     }
 }
@@ -412,6 +419,9 @@ void idSoundEmitterLocal::Init(int i, idSoundWorldLocal* sw)
 
     directDistance = 0.0f;
     lastValidPortalArea = -1;
+    areaCacheOrigin.Zero();
+    areaCacheArea = -1;
+    areaCacheWorld = NULL;
     spatializedDistance = 0.0f;
     spatializedOrigin.Zero();
 
@@ -505,6 +515,7 @@ void idSoundEmitterLocal::Update(int currentTime)
     if (channels.Num() == 0) {
         return;
     }
+    VITA_ZONE_COUNT("sound: emitters with channels");
 
     directDistance = (soundWorld->listener.pos - origin).LengthFast() * DOOM_TO_METERS;
 
@@ -550,21 +561,65 @@ void idSoundEmitterLocal::Update(int currentTime)
         // work out virtual origin and distance, which may be from a portal instead of the actual origin
         if (soundWorld->renderWorld != NULL) {
             // we have a valid renderWorld
-            int soundInArea = soundWorld->renderWorld->PointInArea(origin);
+            int soundInArea;
+            if (areaCacheWorld == soundWorld->renderWorld && areaCacheOrigin == origin) {
+                soundInArea = areaCacheArea;
+            } else {
+                soundInArea = soundWorld->renderWorld->PointInArea(origin);
+                areaCacheWorld = soundWorld->renderWorld;
+                areaCacheOrigin = origin;
+                areaCacheArea = soundInArea;
+            }
             if (soundInArea == -1) {
                 soundInArea = lastValidPortalArea;
             } else {
                 lastValidPortalArea = soundInArea;
             }
             if (soundInArea != -1 && soundInArea != soundWorld->listener.area) {
-                spatializedDistance = maxDistance * METERS_TO_DOOM;
-                soundWorld->ResolveOrigin(0, NULL, soundInArea, 0.0f, origin, this);
+                VITA_ZONE("sound: occlusion (ResolveOrigin)");
+                extern idCVar s_occlusionBound, s_occlusionVerify;
+                if (s_occlusionVerify.GetBool()) {
+                    // both searches, compared: the bound must never change the answer
+                    static int verifyEmitters, verifyMismatches, verifyFullSteps, verifyBoundSteps, verifyLastReport;
+                    spatializedDistance = maxDistance * METERS_TO_DOOM;
+                    spatializedOrigin = origin;
+                    idSoundWorldLocal::resolveBound = false;
+                    idSoundWorldLocal::resolveSteps = 0;
+                    soundWorld->ResolveOrigin(0, NULL, soundInArea, 0.0f, origin, this);
+                    const float fullDistance = spatializedDistance;
+                    const idVec3 fullOrigin = spatializedOrigin;
+                    verifyFullSteps += idSoundWorldLocal::resolveSteps;
+                    spatializedDistance = maxDistance * METERS_TO_DOOM;
+                    spatializedOrigin = origin;
+                    idSoundWorldLocal::resolveBound = true;
+                    idSoundWorldLocal::resolveSteps = 0;
+                    soundWorld->ResolveOrigin(0, NULL, soundInArea, 0.0f, origin, this);
+                    verifyBoundSteps += idSoundWorldLocal::resolveSteps;
+                    verifyEmitters++;
+                    if (spatializedDistance != fullDistance || spatializedOrigin != fullOrigin) {
+                        if (verifyMismatches++ < 20) {
+                            common->Printf("s_occlusionVerify: emitter %d MISMATCH full %.4f (%.2f %.2f %.2f) bounded %.4f (%.2f %.2f %.2f)\n", index,
+                                fullDistance, fullOrigin.x, fullOrigin.y, fullOrigin.z, spatializedDistance, spatializedOrigin.x, spatializedOrigin.y, spatializedOrigin.z);
+                        }
+                    }
+                    const int now = Sys_Milliseconds();
+                    if (now - verifyLastReport > 5000) {
+                        verifyLastReport = now;
+                        common->Printf("s_occlusionVerify: %d emitter searches, %d mismatches, portal steps full %d bounded %d (%.1fx fewer)\n",
+                            verifyEmitters, verifyMismatches, verifyFullSteps, verifyBoundSteps, verifyBoundSteps > 0 ? (double)verifyFullSteps / verifyBoundSteps : 0.0);
+                    }
+                } else {
+                    spatializedDistance = maxDistance * METERS_TO_DOOM;
+                    idSoundWorldLocal::resolveBound = s_occlusionBound.GetBool();
+                    soundWorld->ResolveOrigin(0, NULL, soundInArea, 0.0f, origin, this);
+                }
                 spatializedDistance *= DOOM_TO_METERS;
             }
         }
     }
 
     for (int j = 0; j < channels.Num(); j++) {
+        VITA_ZONE_COUNT("sound: channel volumes");
         channels[j]->UpdateVolume(currentTime);
     }
 

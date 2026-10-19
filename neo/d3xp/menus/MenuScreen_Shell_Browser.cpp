@@ -28,11 +28,19 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "../Game_local.h"
+#include "../../sys/sys_net_friends.h"
 
 enum browserCommand_t {
     BROWSER_COMMAND_REFRESH_SERVERS,
     BROWSER_COMMAND_SHOW_GAMERTAG,
+    BROWSER_COMMAND_ADD_FRIEND_BY_ADDRESS,
 };
+
+// Rows for friends who are not hosting a game right now: their list index
+// is this plus the friend's index (games use the session's server index).
+static const int FRIEND_ROW_BASE = 10000;
+// the "+ Add Friend by Address" row
+static const int ADD_FRIEND_ROW = FRIEND_ROW_BASE - 1;
 
 static const int NUM_SERVER_LIST_ITEMS = 10;
 
@@ -246,48 +254,85 @@ void idMenuScreen_Shell_GameBrowser::OnServerListReady()
     mgr->HidePacifier();
 
     idList<idPair<serverInfo_t, int>> servers;
+    idList<idPair<serverInfo_t, int>> online; // players on, not hosting a game we may join
     for (int i = 0; i < session->NumServers(); ++i) {
         const serverInfo_t* const server = session->ServerInfo(i);
         if (server != NULL && server->joinable) {
             idPair<serverInfo_t, int>& serverPair = servers.Alloc();
             serverPair.first = *server;
             serverPair.second = i;
+        } else if (server != NULL) {
+            idPair<serverInfo_t, int>& p = online.Alloc();
+            p.first = *server;
+            p.second = i;
         }
     }
 
     servers.SortWithTemplate(idSort_PlayerGamesList());
 
+    const int keepFocus = listWidget->GetFocusIndex();
     listWidget->ClearGames();
     for (int i = 0; i < servers.Num(); ++i) {
         idPair<serverInfo_t, int>& serverPair = servers[i];
         DescribeServer(serverPair.first, serverPair.second);
     }
 
-    if (servers.Num() > 0) {
-        listWidget->Update();
-        listWidget->SetViewOffset(0);
-        listWidget->SetViewIndex(0);
-        listWidget->SetFocusIndex(0);
-    } else {
-        listWidget->AddGame("#str_swf_no_servers_found", idStrId(), idStr(), -1, 0, 0, false, false);
-        listWidget->Update();
-        listWidget->SetViewOffset(0);
-        listWidget->SetViewIndex(0);
-        listWidget->SetFocusIndex(0);
+    // players online who are not hosting: under the games
+    for (int i = 0; i < online.Num(); i++) {
+        listWidget->AddGame(online[i].first.serverName, idStrId(), idLocalization::GetString("#str_vita_online"), online[i].second, 0, 0, false, false);
     }
+
+    // the game-specific friends who are not hosting: listed under the games
+    // (Cross tries their last address, Triangle removes them)
+    int friendRows = 0;
+    for (int f = 0; f < netFriends.Num(); f++) {
+        const netFriend_t& fr = netFriends.Get(f);
+        bool hosting = false;
+        for (int i = 0; i < servers.Num(); i++) {
+            if (idStr::FindText(servers[i].first.serverName, fr.name, false) == 0 && idStr::FindText(servers[i].first.serverName, idLocalization::GetString("#str_vita_friend_suffix"), false) > 0) {
+                hosting = true;
+            }
+        }
+        for (int i = 0; i < online.Num(); i++) { // online, already listed above
+            if (idStr::FindText(online[i].first.serverName, fr.name, false) == 0 && idStr::FindText(online[i].first.serverName, idLocalization::GetString("#str_vita_friend_suffix"), false) > 0) {
+                hosting = true;
+            }
+        }
+        if (hosting) {
+            continue;
+        }
+        listWidget->AddGame(va("%s %s", fr.name.c_str(), idLocalization::GetString("#str_vita_friend_suffix")), idStrId(),
+            idLocalization::GetString(fr.addr.type == NA_BAD ? "#str_vita_no_address" : "#str_vita_not_hosting"),
+            FRIEND_ROW_BASE + f, 0, 0, false, false);
+        friendRows++;
+    }
+
+    int rows = servers.Num() + online.Num() + friendRows;
+    if (rows == 0) {
+        listWidget->AddGame("#str_swf_no_servers_found", idStrId(), idStr(), -1, 0, 0, false, false);
+        rows++;
+    }
+    // last row: a friend's game over the internet, typed in (also on Select)
+    listWidget->AddGame(va("+ %s", idLocalization::GetString("#str_vita_add_friend_addr")), idStrId(), idLocalization::GetString("#str_vita_ip_hint"), ADD_FRIEND_ROW, 0, 0, false, false);
+    rows++;
+
+    listWidget->Update();
+    const int focus = (keepFocus >= 0 && keepFocus < rows) ? keepFocus : 0;
+    listWidget->SetViewOffset(0);
+    listWidget->SetViewIndex(focus);
+    listWidget->SetFocusIndex(focus);
 
     if (mgr->GetCmdBar() != NULL) {
         idMenuWidget_CommandBar::buttonInfo_t* buttonInfo;
 
         mgr->GetCmdBar()->ClearAllButtons();
 
-        if (servers.Num() > 0) {
-            buttonInfo = mgr->GetCmdBar()->GetButton(idMenuWidget_CommandBar::BUTTON_JOY1);
-            if (menuData->GetPlatform() != 2) {
-                buttonInfo->label = "#STR_SWF_SELECT";
-            }
-            buttonInfo->action.Set(WIDGET_ACTION_PRESS_FOCUSED);
+        // (always: the last row adds a friend by address)
+        buttonInfo = mgr->GetCmdBar()->GetButton(idMenuWidget_CommandBar::BUTTON_JOY1);
+        if (menuData->GetPlatform() != 2) {
+            buttonInfo->label = "#STR_SWF_SELECT";
         }
+        buttonInfo->action.Set(WIDGET_ACTION_PRESS_FOCUSED);
 
         buttonInfo = mgr->GetCmdBar()->GetButton(idMenuWidget_CommandBar::BUTTON_JOY2);
         if (menuData->GetPlatform() != 2) {
@@ -299,11 +344,17 @@ void idMenuScreen_Shell_GameBrowser::OnServerListReady()
         buttonInfo->label = "#str_02276";
         buttonInfo->action.Set(WIDGET_ACTION_COMMAND, BROWSER_COMMAND_REFRESH_SERVERS);
 
-        if (servers.Num() > 0) {
+        if (servers.Num() + online.Num() + friendRows > 0) {
+            // add / remove the focused game's host (or friend) as a friend
             buttonInfo = mgr->GetCmdBar()->GetButton(idMenuWidget_CommandBar::BUTTON_JOY4);
-            buttonInfo->label = "#str_swf_view_profile";
+            buttonInfo->label = "#str_vita_add_remove_friend";
             buttonInfo->action.Set(WIDGET_ACTION_COMMAND, BROWSER_COMMAND_SHOW_GAMERTAG);
         }
+
+        // a friend's game over the internet: typed in on the on-screen keyboard
+        buttonInfo = mgr->GetCmdBar()->GetButton(idMenuWidget_CommandBar::BUTTON_JOY10);
+        buttonInfo->label = "#str_vita_add_friend_addr";
+        buttonInfo->action.Set(WIDGET_ACTION_COMMAND, BROWSER_COMMAND_ADD_FRIEND_BY_ADDRESS);
 
         mgr->GetCmdBar()->Update();
     }
@@ -385,9 +436,21 @@ bool idMenuScreen_Shell_GameBrowser::HandleAction(idWidgetAction& action, const 
         }
         case BROWSER_COMMAND_SHOW_GAMERTAG: {
             int index = listWidget->GetServerIndex();
-            if (index != -1) {
+            if (index >= FRIEND_ROW_BASE) {
+                const int f = index - FRIEND_ROW_BASE;
+                if (f < netFriends.Num()) {
+                    const idStr id = netFriends.Get(f).id;
+                    netFriends.Remove(id);
+                    UpdateServerList();
+                }
+            } else if (index != -1) {
+                // (the session adds / removes the host as a friend)
                 session->ShowServerGamerCardUI(index);
             }
+            break;
+        }
+        case BROWSER_COMMAND_ADD_FRIEND_BY_ADDRESS: {
+            cmdSystem->AppendCommandText("net_addFriendPrompt\n");
             break;
         }
         }
@@ -406,7 +469,15 @@ bool idMenuScreen_Shell_GameBrowser::HandleAction(idWidgetAction& action, const 
         }
 
         int index = listWidget->GetServerIndex();
-        if (index != -1) {
+        if (index == ADD_FRIEND_ROW) {
+            cmdSystem->AppendCommandText("net_addFriendPrompt\n");
+        } else if (index >= FRIEND_ROW_BASE) {
+            // a friend not seen hosting: try their last address anyway
+            const int f = index - FRIEND_ROW_BASE;
+            if (f < netFriends.Num() && netFriends.Get(f).addr.type != NA_BAD) {
+                cmdSystem->AppendCommandText(va("net_joinFriend %s\n", netFriends.Get(f).id.c_str()));
+            }
+        } else if (index != -1) {
             session->ConnectToServer(index);
         }
         return true;

@@ -279,6 +279,9 @@ idRenderModel* idRenderModelManagerLocal::GetModel(const char* _modelName, bool 
 
         if (canonical.Icmp(model->Name()) == 0) {
             if (!model->IsLoaded()) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                const uint64 vitaReloadStart = Sys_Microseconds();
+#endif
                 // reload it if it was purged
                 idStr generatedFileName = "generated/rendermodels/";
                 generatedFileName.AppendPath(canonical);
@@ -292,6 +295,15 @@ idRenderModel* idRenderModelManagerLocal::GetModel(const char* _modelName, bool 
                 } else {
                     model->LoadModel();
                 }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                // a model the level load purged, brought back during play (the
+                // benchmark's fights had 150 ms stalls spawning a particle model)
+                static int vitaReloadsLogged = 0;
+                if (!insideLevelLoad && vitaReloadsLogged < 30 && Sys_Microseconds() - vitaReloadStart >= 1000) {
+                    vitaReloadsLogged++;
+                    common->Printf("model manager: '%s' reloaded during play (it had been purged) in %.1f ms\n", canonical.c_str(), (Sys_Microseconds() - vitaReloadStart) / 1000.0);
+                }
+#endif
             } else if (insideLevelLoad && !model->IsLevelLoadReferenced()) {
                 // we are reusing a model already in memory, but
                 // touch all the materials to make sure they stay
@@ -323,7 +335,12 @@ idRenderModel* idRenderModelManagerLocal::GetModel(const char* _modelName, bool 
 
     idStrStatic<MAX_OSPATH> generatedFileName;
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    const uint64 vitaLoadStart = Sys_Microseconds();
+#endif
     if (model != NULL) {
+        extern int vita_benchLoads[3]; // VitaBench.cpp: models loaded, per frame in the benchmark log
+        vita_benchLoads[2]++;
 
         generatedFileName = "generated/rendermodels/";
         generatedFileName.AppendPath(canonical);
@@ -352,6 +369,16 @@ idRenderModel* idRenderModelManagerLocal::GetModel(const char* _modelName, bool 
             } */
         }
     }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (model != NULL && !insideLevelLoad) {
+        static int vitaLoadsLogged = 0;
+        if (vitaLoadsLogged < 30) {
+            vitaLoadsLogged++;
+            common->Printf("model manager: '%s' loaded during play in %.1f ms\n", canonical.c_str(), (Sys_Microseconds() - vitaLoadStart) / 1000.0);
+        }
+    }
+#endif
 
     // Not one of the known formats
     if (model == NULL) {

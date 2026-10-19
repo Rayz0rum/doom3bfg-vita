@@ -93,6 +93,10 @@ public:
     virtual int BoundsReachableAreaNum(const idBounds& bounds, const int areaFlags) const;
     virtual void PushPointIntoAreaNum(int areaNum, idVec3& origin) const;
     virtual idVec3 AreaCenter(int areaNum) const;
+    virtual int NumAreas() const
+    {
+        return (file != NULL) ? file->GetNumAreas() : 0;
+    }
     virtual int AreaFlags(int areaNum) const;
     virtual int AreaTravelFlags(int areaNum) const;
     virtual bool Trace(aasTrace_t& trace, const idVec3& start, const idVec3& end) const;

@@ -27,6 +27,7 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "precompiled.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 #pragma hdrstop
 
 #include "Game_local.h"
@@ -39,6 +40,10 @@ If you have questions concerning this license or the applicable additional terms
 ===============================================================================
 */
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_logEntity("vita_logEntity", "", CVAR_GAME, "Vita diagnostics: every game tic, log where entities whose name or class contains this text are presented (origin, the joint they are bound to, whether the renderer was updated)");
+idCVar vita_afHalfRate("vita_afHalfRate", "1", CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "Vita: ragdolls (dead monsters, corpses) simulate every other tic, two tics at a time (ragdolls take turns)");
+#endif
 idCVar net_errorSmoothingMaxDecay("net_errorSmoothingMaxDecay", "25.0", CVAR_FLOAT, "Max rate at which origin error smoothing decays (in units per game frame)");
 idCVar net_errorSmoothingDecay("net_errorSmoothingDecay", "0.06", CVAR_FLOAT, "Rate at which error smoothing decays (in percent per game frame)");
 
@@ -1160,7 +1165,10 @@ void idEntity::SetModel(const char* modelname)
 
     FreeModelDef();
 
-    renderEntity.hModel = renderModelManager->FindModel(modelname);
+    {
+        VITA_ZONE("set model: FindModel");
+        renderEntity.hModel = renderModelManager->FindModel(modelname);
+    }
 
     if (renderEntity.hModel) {
         renderEntity.hModel->Reset();
@@ -1323,6 +1331,7 @@ idEntity::UpdateVisuals
 */
 void idEntity::UpdateVisuals()
 {
+    VITA_ZONE_COUNT("update visuals");
     UpdateModel();
     UpdateSound();
 }
@@ -1506,6 +1515,27 @@ Present is called to allow entities to generate refEntities, lights, etc for the
 */
 void idEntity::Present()
 {
+    VITA_ZONE("present");
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (vita_logEntity.GetString()[0] != 0
+        && (idStr::FindText(name.c_str(), vita_logEntity.GetString(), false) >= 0 || idStr::FindText(spawnArgs.GetString("classname"), vita_logEntity.GetString(), false) >= 0)) {
+        idVec3 jointPos = vec3_zero;
+        idMat3 jointAxis;
+        const bool onJoint = bindMaster != NULL && bindJoint != INVALID_JOINT && bindMaster->GetAnimator() != NULL;
+        if (onJoint) {
+            bindMaster->GetAnimator()->GetJointTransform(bindJoint, gameLocal.time, jointPos, jointAxis);
+            jointPos = bindMaster->GetRenderEntity()->origin + jointPos * bindMaster->GetRenderEntity()->axis;
+        }
+        gameLocal.Printf("entity log [%d ms, new frame %d]: '%s' (%s) render origin (%.2f %.2f %.2f) physics origin (%.2f %.2f %.2f) visuals %s%s%s, master '%s' joint %d at (%.2f %.2f %.2f), master render origin (%.2f %.2f %.2f)\n",
+            gameLocal.time, gameLocal.isNewFrame ? 1 : 0, name.c_str(), GetType()->classname,
+            renderEntity.origin.x, renderEntity.origin.y, renderEntity.origin.z,
+            GetPhysics()->GetOrigin().x, GetPhysics()->GetOrigin().y, GetPhysics()->GetOrigin().z,
+            (thinkFlags & TH_UPDATEVISUALS) ? "changed" : "unchanged", IsHidden() ? " (hidden)" : "", (thinkFlags & TH_THINK) ? " thinks" : "",
+            bindMaster != NULL ? bindMaster->name.c_str() : "-", (int)bindJoint, jointPos.x, jointPos.y, jointPos.z,
+            bindMaster != NULL ? bindMaster->GetRenderEntity()->origin.x : 0.0f, bindMaster != NULL ? bindMaster->GetRenderEntity()->origin.y : 0.0f, bindMaster != NULL ? bindMaster->GetRenderEntity()->origin.z : 0.0f);
+    }
+#endif
 
     if (!gameLocal.isNewFrame) {
         return;
@@ -2749,12 +2779,18 @@ bool idEntity::RunPhysics()
 
             // if moved or forced to update the visual position and orientation from the physics
             if (moved || part->fl.forcePhysicsUpdate) {
+                VITA_ZONE("physics: update from physics (visuals)");
                 part->UpdateFromPhysics(false);
             }
 
             // update any animation controllers here so an entity bound
             // to a joint of this entity gets the correct position
-            if (part->UpdateAnimationControllers()) {
+            bool animControllers;
+            {
+                VITA_ZONE("physics: animation controllers (IK)");
+                animControllers = part->UpdateAnimationControllers();
+            }
+            if (animControllers) {
                 part->BecomeActive(TH_ANIMATE);
             }
         }
@@ -2924,12 +2960,18 @@ void idEntity::InterpolatePhysics(const float fraction)
 
             // if moved or forced to update the visual position and orientation from the physics
             if (moved || part->fl.forcePhysicsUpdate) {
+                VITA_ZONE("physics: update from physics (visuals)");
                 part->UpdateFromPhysics(false);
             }
 
             // update any animation controllers here so an entity bound
             // to a joint of this entity gets the correct position
-            if (part->UpdateAnimationControllers()) {
+            bool animControllers;
+            {
+                VITA_ZONE("physics: animation controllers (IK)");
+                animControllers = part->UpdateAnimationControllers();
+            }
+            if (animControllers) {
                 part->BecomeActive(TH_ANIMATE);
             }
         }
@@ -3057,6 +3099,46 @@ int idEntity::GetPhysicsTimeStep() const
 {
     return gameLocal.time - gameLocal.previousTime;
 }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+================
+idEntity::VitaHalfRateTic
+
+Vita (a cut): an entity that wants to think at half rate thinks every other
+tic - entities take turns, by entity number - and, when it does, covers the
+two tics: the caller moves the game's previous time back to its last think
+(vitaThinkSpan_t), so everything that steps by gameLocal.time -
+gameLocal.previousTime (physics, ragdolls, monster movement and turning,
+animation and its frame commands) spans both. On the tic between nothing of
+it runs; its render entity is not updated, so the renderer keeps (and does
+not redo) its last mesh.
+================
+*/
+int idEntity::VitaHalfRateTic(bool wanted)
+{
+    if (!wanted) {
+        return VITA_THINK_FULL;
+    }
+    if ((gameLocal.framenum + entityNumber) & 1) {
+        // its tic off - only right after a tic it thought (never two off)
+        if (vitaLastThinkTime == gameLocal.previousTime) {
+            return VITA_THINK_SKIP; // (counted by the caller)
+        }
+        VITA_ZONE_COUNT("half-rate think: thought on its tic off (it had not thought the tic before)");
+        if (vitaLastThinkTime > 0 && vitaLastThinkTime < gameLocal.previousTime && gameLocal.time - vitaLastThinkTime <= 3 * USERCMD_MSEC_VITA_MAX) {
+            return VITA_THINK_TWO_TICS; // covers the tics it missed (2 or 3)
+        }
+        return VITA_THINK_FULL;
+    }
+    if (vitaLastThinkTime > 0 && vitaLastThinkTime < gameLocal.previousTime && gameLocal.time - vitaLastThinkTime <= 3 * USERCMD_MSEC_VITA_MAX) {
+        VITA_ZONE_COUNT("half-rate think: thinks covering two tics");
+        return VITA_THINK_TWO_TICS;
+    }
+    VITA_ZONE_COUNT("half-rate think: thinks covering one tic (first, or after a pause)");
+    return VITA_THINK_FULL;
+}
+#endif
 
 /*
 ================
@@ -3954,10 +4036,26 @@ idEntity::ActivateTargets
 "activator" should be set to the entity that initiated the firing.
 ==============================
 */
+idCVar vita_logStory("vita_logStory", "1", CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE,
+    "log the story's moving parts: every entity activating its targets, frame command triggers, door locks and opens, story characters' script states");
+
 void idEntity::ActivateTargets(idEntity* activator) const
 {
     idEntity* ent;
     int i, j;
+
+    if (vita_logStory.GetBool() && targets.Num() > 0) {
+        idStr list;
+        for (i = 0; i < targets.Num() && i < 12; i++) {
+            ent = targets[i].GetEntity();
+            list += va("%s%s", i ? ", " : "", ent ? ent->name.c_str() : "(gone)");
+        }
+        if (targets.Num() > 12) {
+            list += va(" +%d more", targets.Num() - 12);
+        }
+        common->Printf("story [%d ms]: '%s' (%s) activates %s%s%s\n", gameLocal.time, name.c_str(), GetClassname(), list.c_str(),
+            activator ? " - by " : "", activator ? activator->name.c_str() : "");
+    }
 
     for (i = 0; i < targets.Num(); i++) {
         ent = targets[i].GetEntity();
@@ -4004,6 +4102,7 @@ idEntity::TouchTriggers
 */
 bool idEntity::TouchTriggers() const
 {
+    VITA_ZONE_COUNT("touch triggers");
     int i, numClipModels, numEntities;
     idClipModel* cm;
     idClipModel* clipModels[MAX_GENTITIES];
@@ -5670,6 +5769,7 @@ idAnimatedEntity::UpdateAnimation
 */
 void idAnimatedEntity::UpdateAnimation()
 {
+    VITA_ZONE("update animation");
     // don't do animations if they're not enabled
     if (!(thinkFlags & TH_ANIMATE)) {
         return;

@@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
 #include "ConsoleHistory.h"
 #include "../renderer/ResolutionScale.h"
 #include "Common_local.h"
+#if defined(__vita__)
+#include "../sys/sys_net_friends.h" // Sys_TextInputStart / Poll
+static bool vitaConsoleTyping = false;
+#endif
 
 #define CON_TEXTSIZE 0x30000
 #define NUM_CON_TIMES 4
@@ -780,7 +784,44 @@ ProcessEvent
 */
 bool idConsoleLocal::ProcessEvent(const sysEvent_t* event, bool forceAccept)
 {
-    const bool consoleKey = event->evType == SE_KEY && event->evValue == K_GRAVE && com_allowConsole.GetBool();
+    bool consoleKey = event->evType == SE_KEY && event->evValue == K_GRAVE && com_allowConsole.GetBool();
+#if defined(__vita__)
+    // The Vita pad (no keyboard): L + R pressed together opens the console
+    // and closes it again; while it is open Square brings up the on-screen
+    // keyboard for the command line, Cross is Enter, the D-pad walks the
+    // history and the right stick scrolls.
+    if (!forceAccept && event->evType == SE_KEY && event->evValue2 == 1
+        && ((event->evValue == K_JOY5 && idKeyInput::IsDown(K_JOY6)) || (event->evValue == K_JOY6 && idKeyInput::IsDown(K_JOY5)))) {
+        common->Printf("vita: L + R - console %s\n", keyCatching ? "closed" : "opened");
+        consoleKey = true;
+    }
+    if (keyCatching && !forceAccept && event->evType == SE_KEY && event->evValue2 == 1 && !consoleKey) {
+        switch (event->evValue) {
+        case K_JOY1: // Cross: Enter
+            KeyDownEvent(K_ENTER);
+            return true;
+        case K_JOY3: // Square: the keyboard, starting from what is typed
+            if (!vitaConsoleTyping && Sys_TextInputStart(idLocalization::GetString("#str_vita_console_title"), consoleField.GetBuffer())) {
+                vitaConsoleTyping = true;
+            }
+            return true;
+        case K_JOY_DPAD_UP:
+            KeyDownEvent(K_UPARROW);
+            return true;
+        case K_JOY_DPAD_DOWN:
+            KeyDownEvent(K_DOWNARROW);
+            return true;
+        case K_JOY_STICK2_UP:
+            PageUp();
+            return true;
+        case K_JOY_STICK2_DOWN:
+            PageDown();
+            return true;
+        default:
+            break;
+        }
+    }
+#endif
 
     // we always catch the console key event
     if (!forceAccept && consoleKey) {
@@ -1162,6 +1203,22 @@ ForceFullScreen is used by the editor
 void idConsoleLocal::Draw(bool forceFullScreen)
 {
     Resize();
+#if defined(__vita__)
+    // the on-screen keyboard's text becomes the command line (Cross runs it)
+    if (vitaConsoleTyping) {
+        idStr text;
+        bool accepted = false;
+        if (Sys_TextInputPoll(text, &accepted)) {
+            vitaConsoleTyping = false;
+            // what was confirmed replaces the line - empty too (it was all
+            // erased): only a cancel keeps the old line. (An empty result
+            // used to count as a cancel, so characters could not be deleted.)
+            if (accepted) {
+                consoleField.SetBuffer(text.c_str());
+            }
+        }
+    }
+#endif
 
     if (forceFullScreen) {
         // if we are forced full screen because of a disconnect,

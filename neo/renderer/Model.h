@@ -136,7 +136,16 @@ enum dynamicModel_t {
 };
 
 enum jointHandle_t {
-    INVALID_JOINT = -1
+    INVALID_JOINT = -1,
+    // ARM EABI makes -fshort-enums the default, and with INVALID_JOINT as the
+    // only enumerator the compiler picks signed char for this. That is wrong in
+    // two ways: joint indices are cast into jointHandle_t and the renderer
+    // allows up to 136 joints, so anything past 127 silently truncates; and the
+    // savegame code writes joint handles with ReadBig/WriteBig( (int&)value ),
+    // which reads four bytes into what would be a one byte object. Pinning the
+    // underlying type to 32 bits fixes both without changing the save format,
+    // which has always stored these as four byte ints.
+    JOINT_HANDLE_FORCE_32BIT = 0x7fffffff
 };
 
 class idMD5Joint {

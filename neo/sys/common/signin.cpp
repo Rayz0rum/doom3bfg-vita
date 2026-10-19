@@ -32,6 +32,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "../../framework/PlayerProfile.h"
 #include "../sys_session_local.h"
 #include "signin.h"
+#include "../sys_net_friends.h"
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -108,8 +109,18 @@ void idSignInManagerWin::RegisterLocalUser(int inputDevice)
     }
 
     static char machineName[128];
-    // DG: support for ui_name
-    const char* nameSource = ui_name.GetString();
+    // The account's username (the one other players see: picked once online,
+    // or set by an owner account), then ui_name, the system's user name...
+    // (idNetFriends::LocalName). The machine name came first before, and on
+    // the Vita that is "localhost" - the lobby and the game browser showed
+    // "localhost [OWNER]".
+    static idStr accountName;
+    accountName = netFriends.LocalName();
+    const char* nameSource = accountName.c_str();
+    if (idStr::Length(nameSource) == 0 || idStr::Icmp(nameSource, "Player") == 0) {
+        // DG: support for ui_name
+        nameSource = ui_name.GetString();
+    }
 
     if (idStr::Length(nameSource) == 0) {
         // ui_name was empty => default to hostname
@@ -143,6 +154,29 @@ void idSignInManagerWin::RegisterLocalUser(int inputDevice)
     localUser.SetLocalUserHandle(GetUniqueLocalUserHandle(localUser.GetGamerTag()));
 
     session->OnLocalUserSignin(&localUser);
+}
+
+/*
+========================
+Sys_SetLocalUserNames
+
+The account's username was just picked (or imported): the signed-in users'
+names follow, so the party, the lobby and the game browser show it at once.
+========================
+*/
+void Sys_SetLocalUserNames(const char* name)
+{
+    if (session == NULL || name == NULL || name[0] == 0) {
+        return;
+    }
+    idSignInManagerBase& mgr = session->GetSignInManager();
+    for (int i = 0; i < mgr.GetNumLocalUsers(); i++) {
+        idLocalUserWin* user = static_cast<idLocalUserWin*>(mgr.GetLocalUserByIndex(i));
+        if (user != NULL && idStr::Cmp(user->GetGamerTag(), name) != 0) {
+            idLib::Printf("net: local user '%s' is now '%s' (the account's username)\n", user->GetGamerTag(), name);
+            user->SetGamerTag(name);
+        }
+    }
 }
 
 /*

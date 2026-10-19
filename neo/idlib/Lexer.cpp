@@ -926,6 +926,11 @@ int idLexer::ReadToken(idToken* token)
         *token = idLexer::token;
         return 1;
     }
+    // a streamed file: keep the window ahead of the token (before any pointer
+    // into the buffer is taken below)
+    if (streamFile != NULL && (end_p - script_p) < streamWindow / 4) {
+        StreamRefill();
+    }
     // save script pointer
     lastScript_p = script_p;
     // save line counter
@@ -1782,12 +1787,37 @@ int idLexer::LoadFile(const char* filename, bool OSPath)
         return false;
     }
     length = fp->Length();
-    buf = (char*)Mem_Alloc(length + 1, TAG_IDLIB_LEXER);
-    buf[length] = '\0';
-    fp->Read(buf, length);
+    // A big file (the game's .map files: up to 8 MB of text) needed one
+    // contiguous buffer of its size, and once memory was fragmented none was
+    // left: on the Vita, a save loaded in RoE's erebus3 found no 8.3 MB block
+    // in any pool with 144 MB free, and wrote through the NULL. With
+    // LEXFL_STREAMLARGEFILES (idMapFile) a file over 1 MB is read through a
+    // 1 MB window instead, refilled ahead of the tokens (StreamRefill).
+    const int window = 1024 * 1024;
+    const bool stream = (idLexer::flags & LEXFL_STREAMLARGEFILES) != 0 && length > window;
+    const int bufSize = stream ? window : length;
+    buf = (char*)Mem_Alloc(bufSize + 1, TAG_IDLIB_LEXER);
+    if (buf == NULL) {
+        idLib::common->Warning("idLexer::LoadFile: no memory for '%s' (%d KB in one block)", pathname.c_str(), bufSize / 1024);
+        idLib::fileSystem->CloseFile(fp);
+        return false;
+    }
+    const int first = stream ? window : length;
+    fp->Read(buf, first);
+    buf[first] = '\0';
     idLexer::fileTime = fp->Timestamp();
     idLexer::filename = fp->GetFullPath();
-    idLib::fileSystem->CloseFile(fp);
+    if (stream) {
+        idLexer::streamFile = fp;
+        idLexer::streamLeft = length - first;
+        idLexer::streamWindow = window;
+    } else {
+        idLib::fileSystem->CloseFile(fp);
+        idLexer::streamFile = NULL;
+        idLexer::streamLeft = 0;
+        idLexer::streamWindow = 0;
+    }
+    length = first; // the buffer's (the window's) length
 
     idLexer::buffer = buf;
     idLexer::length = length;
@@ -1833,9 +1863,54 @@ int idLexer::LoadMemory(const char* ptr, int length, const char* name, int start
     idLexer::line = startLine;
     idLexer::lastline = startLine;
     idLexer::allocated = false;
+    idLexer::streamFile = NULL;
+    idLexer::streamLeft = 0;
+    idLexer::streamWindow = 0;
     idLexer::loaded = true;
 
     return true;
+}
+
+/*
+================
+idLexer::StreamRefill
+
+LEXFL_STREAMLARGEFILES: called at the start of ReadToken when less than a
+quarter of the window is left ahead. What is ahead moves to the front of the
+window and the rest of it is read from the file. Only between tokens, so
+every pointer into the buffer is re-taken right after (lastScript_p, the
+white space pointers); the rewinds (ReadTokenOnLine and the like) go back to
+lastScript_p, set after the refill. A token, a line read whole, or a comment
+longer than a quarter of the window (256 KB) would be cut - none is, in a map.
+GetFileOffset counts from the window's start in this mode.
+================
+*/
+void idLexer::StreamRefill()
+{
+    if (streamFile == NULL || streamLeft <= 0) {
+        return;
+    }
+    char* buf = const_cast<char*>(buffer);
+    const int keep = (int)(end_p - script_p);
+    memmove(buf, script_p, keep);
+    const int want = Min(streamWindow - keep, streamLeft);
+    const int got = streamFile->Read(buf + keep, want);
+    const int added = got > 0 ? got : 0;
+    streamLeft -= want;
+    if (got != want) {
+        streamLeft = 0; // a short read: what came is all there is
+    }
+    buf[keep + added] = '\0';
+    script_p = buf;
+    lastScript_p = buf;
+    whiteSpaceStart_p = buf;
+    whiteSpaceEnd_p = buf;
+    end_p = buf + keep + added;
+    length = keep + added;
+    if (streamLeft <= 0) {
+        idLib::fileSystem->CloseFile(streamFile);
+        streamFile = NULL;
+    }
 }
 
 /*
@@ -1860,6 +1935,11 @@ void idLexer::FreeSource()
         idLexer::buffer = NULL;
         idLexer::allocated = false;
     }
+    if (idLexer::streamFile != NULL) {
+        idLib::fileSystem->CloseFile(idLexer::streamFile);
+        idLexer::streamFile = NULL;
+        idLexer::streamLeft = 0;
+    }
     idLexer::tokenavailable = 0;
     idLexer::token = "";
     idLexer::loaded = false;
@@ -1877,6 +1957,9 @@ idLexer::idLexer()
     idLexer::flags = 0;
     idLexer::SetPunctuations(NULL);
     idLexer::allocated = false;
+    idLexer::streamFile = NULL;
+    idLexer::streamLeft = 0;
+    idLexer::streamWindow = 0;
     idLexer::fileTime = 0;
     idLexer::length = 0;
     idLexer::line = 0;
@@ -1899,6 +1982,9 @@ idLexer::idLexer(int flags)
     idLexer::flags = flags;
     idLexer::SetPunctuations(NULL);
     idLexer::allocated = false;
+    idLexer::streamFile = NULL;
+    idLexer::streamLeft = 0;
+    idLexer::streamWindow = 0;
     idLexer::fileTime = 0;
     idLexer::length = 0;
     idLexer::line = 0;
@@ -1920,6 +2006,9 @@ idLexer::idLexer(const char* filename, int flags, bool OSPath)
     idLexer::flags = flags;
     idLexer::SetPunctuations(NULL);
     idLexer::allocated = false;
+    idLexer::streamFile = NULL;
+    idLexer::streamLeft = 0;
+    idLexer::streamWindow = 0;
     idLexer::token = "";
     idLexer::next = NULL;
     idLexer::hadError = false;
@@ -1937,6 +2026,9 @@ idLexer::idLexer(const char* ptr, int length, const char* name, int flags)
     idLexer::flags = flags;
     idLexer::SetPunctuations(NULL);
     idLexer::allocated = false;
+    idLexer::streamFile = NULL;
+    idLexer::streamLeft = 0;
+    idLexer::streamWindow = 0;
     idLexer::token = "";
     idLexer::next = NULL;
     idLexer::hadError = false;

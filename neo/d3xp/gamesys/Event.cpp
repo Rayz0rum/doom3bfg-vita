@@ -1055,11 +1055,13 @@ void idEvent::RestoreTrace(idRestoreGame* savefile, trace_t& trace)
     savefile->ReadFloat(trace.fraction);
     savefile->ReadVec3(trace.endpos);
     savefile->ReadMat3(trace.endAxis);
-    savefile->ReadInt((int&)trace.c.type);
+    savefile->ReadEnum(trace.c.type);
     savefile->ReadVec3(trace.c.point);
     savefile->ReadVec3(trace.c.normal);
     savefile->ReadFloat(trace.c.dist);
     savefile->ReadInt(trace.c.contents);
+    // A pointer, not an enum: four bytes on this 32 bit target either way, so
+    // the int aliasing is size safe here.
     savefile->ReadInt((int&)trace.c.material);
     savefile->ReadInt(trace.c.contents);
     savefile->ReadInt(trace.c.modelFeature);

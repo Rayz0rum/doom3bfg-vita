@@ -125,6 +125,13 @@ Posix_InitSigs
 */
 void Posix_InitSigs()
 {
+#if defined(__vita__)
+    // newlib on the Vita exposes only the reduced sigaction form (no sa_sigaction,
+    // SA_SIGINFO or SA_NODEFER) and the kernel does not deliver these signals to
+    // homebrew anyway, so crash handlers are simply not installed.
+    fatalError[0] = 0;
+    return;
+#else
     struct sigaction action;
     int i;
 
@@ -153,6 +160,7 @@ void Posix_InitSigs()
     // then SIGTTIN or SIGTOU could be emitted, if not caught, turns into a SIGSTP
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTTOU, SIG_IGN);
+#endif // !__vita__
 }
 
 /*

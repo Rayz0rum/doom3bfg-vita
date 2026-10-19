@@ -881,3 +881,336 @@ void R_DrawViewBorder( void )
 
 
 
+
+
+#if defined(__vita__) || defined(ID_TEST_CLASSIC_MT)
+/*
+================================================================================
+
+Multithreaded drawing (Vita)
+
+Doom's renderer walks the BSP and draws as it goes, all on one core: on the
+Vita that one core sat at 100% while the other three idled. Almost all of the
+time is the pixel work - wall, sprite and sky columns, floor and ceiling
+spans - and that parallelises cleanly:
+
+- while a view renders, colfunc / fuzzcolfunc / transcolfunc / spanfunc only
+  record what they would draw (R_VitaDefer*), which is cheap;
+- at the end of R_RenderPlayerView every job thread plus the main thread
+  replays the whole list, each one drawing only the screen rows it owns
+  (y % parts == part). Every pixel belongs to exactly one thread and that
+  thread sees the commands in the original order, so overdraw (sprites over
+  walls, masked textures) comes out exactly as before.
+
+Commands point into zone-cached lumps; the zone allocator flushes the list
+before it purges anything (Z_Malloc), so no pointer can go stale. The fuzz
+(spectre) effect reads the rows next to its own, which other threads own:
+it is noise either way.
+================================================================================
+*/
+idCVar vita_classicThreads( "vita_classicThreads", "1", CVAR_ARCHIVE | CVAR_BOOL,
+							"Vita: draw DOOM / DOOM II's columns and spans on every core" );
+
+uint64 vitaClassicMtDrawUs = 0;		// summed into the classic timing line (common_frame.cpp)
+int vitaFuzzposAtBegin = 0;				// for the threads check
+int vitaFuzzCmds = 0;					// spectre columns recorded (the threads check reports them)
+
+enum { VCMD_COL, VCMD_FUZZ, VCMD_TRANS, VCMD_SPAN };
+
+struct vitaDrawCmd_t
+{
+	int				kind;
+	int				x, y0, y1;		// column x, rows y0..y1 / span: x1, row, x2
+	fixed_t			frac, step;		// texture position at y0 and per row / span u, du
+	fixed_t			frac2, step2;	// span v, dv
+	const lighttable_t*	colormap;
+	const byte*		source;
+	const byte*		translation;
+};
+
+struct vitaDrawJob_t
+{
+	int				part, parts, numCmds;
+	byte* const*	ylookup;
+	const int*		columnofs;
+	const lighttable_t*	colormaps;
+	const int*		fuzzoffset;
+	int				pad[ 8 ];		// keep jobs off each other's cache lines
+};
+
+static const int		VITA_MAX_DRAW_CMDS = 1 << 16;
+static vitaDrawCmd_t*	vitaCmds = NULL;
+static int				vitaNumCmds = 0;
+static bool				vitaDeferring = false;
+static idParallelJobList*	vitaDrawJobs = NULL;
+
+typedef void ( *vitaColFunc_t )( lighttable_t*, byte* );
+typedef void ( *vitaSpanFunc_t )( fixed_t, fixed_t, fixed_t, int, int, fixed_t, fixed_t, lighttable_t*, byte* );
+static vitaColFunc_t	vitaSavedCol, vitaSavedBaseCol, vitaSavedFuzz, vitaSavedTrans;
+static vitaSpanFunc_t	vitaSavedSpan;
+
+// Each thread owns interleaved blocks of 32 columns: a column and the rows
+// above and below it (which the spectre effect reads) belong to one thread,
+// and 32 bytes is one Cortex-A9 cache line, so threads never share a line.
+static const int VITA_BLOCK_SHIFT = 5;
+
+static void R_VitaExecDrawJob( vitaDrawJob_t* job )
+{
+	const int part = job->part;
+	const int parts = job->parts;
+
+	for( int i = 0; i < job->numCmds; i++ )
+	{
+		const vitaDrawCmd_t& c = vitaCmds[ i ];
+		if( c.kind == VCMD_SPAN )
+		{
+			// the pieces of the span inside this thread's blocks
+			const int b0 = c.x >> VITA_BLOCK_SHIFT;
+			const int b1 = c.y1 >> VITA_BLOCK_SHIFT;
+			for( int blk = b0 + ( ( part - ( b0 % parts ) + parts ) % parts ); blk <= b1; blk += parts )
+			{
+				const int sx0 = Max( c.x, blk << VITA_BLOCK_SHIFT );
+				const int sx1 = Min( c.y1, ( ( blk + 1 ) << VITA_BLOCK_SHIFT ) - 1 );
+				byte* dest = job->ylookup[ c.y0 ] + job->columnofs[ sx0 ];
+				int count = sx1 - sx0;
+				fixed_t xfrac = c.frac + ( sx0 - c.x ) * c.step;
+				fixed_t yfrac = c.frac2 + ( sx0 - c.x ) * c.step2;
+				const lighttable_t* cm = c.colormap;
+				const byte* src = c.source;
+				do
+				{
+					const int spot = ( ( yfrac >> ( 16 - 6 ) ) & ( 63 * 64 ) ) + ( ( xfrac >> 16 ) & 63 );
+					*dest++ = cm[ src[ spot ] ];
+					xfrac += c.step;
+					yfrac += c.step2;
+				}
+				while( count-- );
+			}
+			continue;
+		}
+
+		if( ( ( c.x >> VITA_BLOCK_SHIFT ) % parts ) != part )
+		{
+			continue;
+		}
+		// the column, exactly as the stock drawers do it
+		byte* dest = job->ylookup[ c.y0 ] + job->columnofs[ c.x ];
+		fixed_t frac = c.frac;
+		const fixed_t step = c.step;
+		int count = c.y1 - c.y0;
+		const lighttable_t* cm = c.colormap;
+		const byte* src = c.source;
+		if( c.kind == VCMD_COL )
+		{
+			do
+			{
+				*dest = cm[ src[ ( frac >> FRACBITS ) & 127 ] ];
+				dest += SCREENWIDTH;
+				frac += step;
+			}
+			while( count-- );
+		}
+		else if( c.kind == VCMD_TRANS )
+		{
+			const byte* tr = c.translation;
+			do
+			{
+				*dest = cm[ tr[ src[ frac >> FRACBITS ] ] ];
+				dest += SCREENWIDTH;
+				frac += step;
+			}
+			while( count-- );
+		}
+		else
+		{
+			// spectre: the fuzz table position this column started at in the
+			// stock one-thread order (recorded), so the noise is identical
+			const lighttable_t* shade = job->colormaps + 6 * 256;
+			int fuzzpos = c.frac2;
+			do
+			{
+				*dest = shade[ dest[ job->fuzzoffset[ fuzzpos ] ] ];
+				if( ++fuzzpos == FUZZTABLE )
+				{
+					fuzzpos = 0;
+				}
+				dest += SCREENWIDTH;
+			}
+			while( count-- );
+		}
+	}
+}
+
+static void R_VitaDeferFlush()
+{
+	if( vitaNumCmds == 0 )
+	{
+		return;
+	}
+	const uint64 t0 = Sys_Microseconds();
+	int parts = cvarSystem->GetCVarInteger( "jobs_numThreads" ) + 1;	// the job threads and this one
+	parts = idMath::ClampInt( 1, 4, parts );
+	static vitaDrawJob_t jobs[ 4 ];
+	for( int t = 0; t < parts; t++ )
+	{
+		jobs[ t ].part = t;
+		jobs[ t ].parts = parts;
+		jobs[ t ].numCmds = vitaNumCmds;
+		jobs[ t ].ylookup = ::g->ylookup;
+		jobs[ t ].columnofs = ::g->columnofs;
+		jobs[ t ].colormaps = ::g->colormaps;
+		jobs[ t ].fuzzoffset = ::g->fuzzoffset;
+	}
+	if( parts == 1 )
+	{
+		R_VitaExecDrawJob( &jobs[ 0 ] );
+	}
+	else
+	{
+		if( vitaDrawJobs == NULL )
+		{
+			vitaDrawJobs = parallelJobManager->AllocJobList( JOBLIST_UTILITY, JOBLIST_PRIORITY_HIGH, 8, 0, NULL );
+		}
+		for( int t = 0; t < parts; t++ )
+		{
+			vitaDrawJobs->AddJob( ( jobRun_t )R_VitaExecDrawJob, &jobs[ t ] );
+		}
+		vitaDrawJobs->Submit();
+		vitaDrawJobs->Wait();		// the waiting thread takes jobs too
+	}
+	vitaNumCmds = 0;
+	vitaClassicMtDrawUs += Sys_Microseconds() - t0;
+}
+
+static inline vitaDrawCmd_t& R_VitaDeferNew()
+{
+	if( vitaNumCmds == VITA_MAX_DRAW_CMDS )
+	{
+		R_VitaDeferFlush();
+	}
+	return vitaCmds[ vitaNumCmds++ ];
+}
+
+static void R_VitaDeferColumnKind( int kind, lighttable_t* colormap, byte* source )
+{
+	if( ::g->dc_yh < ::g->dc_yl )
+	{
+		return;
+	}
+	vitaDrawCmd_t& c = R_VitaDeferNew();
+	c.kind = kind;
+	c.x = ::g->dc_x;
+	c.y0 = ::g->dc_yl;
+	c.y1 = ::g->dc_yh;
+	c.step = ::g->dc_iscale;
+	c.frac = ::g->dc_texturemid + ( ::g->dc_yl - ::g->centery ) * ::g->dc_iscale;
+	c.colormap = colormap;
+	c.source = source;
+	c.translation = ::g->dc_translation;
+}
+
+static void R_VitaDeferColumn( lighttable_t* colormap, byte* source )
+{
+	R_VitaDeferColumnKind( VCMD_COL, colormap, source );
+}
+
+static void R_VitaDeferTranslated( lighttable_t* colormap, byte* source )
+{
+	R_VitaDeferColumnKind( VCMD_TRANS, colormap, source );
+}
+
+static void R_VitaDeferFuzz( lighttable_t* colormap, byte* source )
+{
+	// the same border adjustments as R_DrawFuzzColumn
+	if( !::g->dc_yl )
+	{
+		::g->dc_yl = 1;
+	}
+	if( ::g->dc_yh == ::g->viewheight - 1 )
+	{
+		::g->dc_yh = ::g->viewheight - 2;
+	}
+	vitaFuzzCmds++;
+	if( ::g->dc_yh < ::g->dc_yl )
+	{
+		return;
+	}
+	const int fuzzStart = ::g->fuzzpos;
+	R_VitaDeferColumnKind( VCMD_FUZZ, colormap, source );
+	vitaCmds[ vitaNumCmds - 1 ].frac2 = fuzzStart;
+	// advance the shared position as the stock drawer would (one per pixel)
+	::g->fuzzpos = ( fuzzStart + ( ::g->dc_yh - ::g->dc_yl + 1 ) ) % FUZZTABLE;
+}
+
+static void R_VitaDeferSpan( fixed_t xfrac, fixed_t yfrac, fixed_t y, int x1, int x2, fixed_t xstep, fixed_t ystep,
+							 lighttable_t* colormap, byte* source )
+{
+	if( x2 < x1 )
+	{
+		return;
+	}
+	vitaDrawCmd_t& c = R_VitaDeferNew();
+	c.kind = VCMD_SPAN;
+	c.x = x1;
+	c.y0 = y;
+	c.y1 = x2;
+	c.frac = xfrac;
+	c.step = xstep;
+	c.frac2 = yfrac;
+	c.step2 = ystep;
+	c.colormap = colormap;
+	c.source = source;
+	c.translation = NULL;
+}
+
+void R_VitaDeferBegin()
+{
+	if( vitaDeferring || !vita_classicThreads.GetBool() || ::g->detailshift )
+	{
+		return;
+	}
+	if( vitaCmds == NULL )
+	{
+		vitaCmds = ( vitaDrawCmd_t* )malloc( sizeof( vitaDrawCmd_t ) * VITA_MAX_DRAW_CMDS );
+		if( vitaCmds == NULL )
+		{
+			return;
+		}
+	}
+	vitaSavedCol = colfunc;
+	vitaSavedBaseCol = basecolfunc;
+	vitaSavedFuzz = fuzzcolfunc;
+	vitaSavedTrans = transcolfunc;
+	vitaSavedSpan = spanfunc;
+	colfunc = basecolfunc = R_VitaDeferColumn;
+	fuzzcolfunc = R_VitaDeferFuzz;
+	transcolfunc = R_VitaDeferTranslated;
+	spanfunc = R_VitaDeferSpan;
+	vitaNumCmds = 0;
+	vitaFuzzposAtBegin = ::g->fuzzpos;
+	vitaDeferring = true;
+}
+
+void R_VitaDeferEnd()
+{
+	if( !vitaDeferring )
+	{
+		return;
+	}
+	R_VitaDeferFlush();
+	colfunc = vitaSavedCol;
+	basecolfunc = vitaSavedBaseCol;
+	fuzzcolfunc = vitaSavedFuzz;
+	transcolfunc = vitaSavedTrans;
+	spanfunc = vitaSavedSpan;
+	vitaDeferring = false;
+}
+
+void R_VitaDeferFlushIfActive()
+{
+	if( vitaDeferring )
+	{
+		R_VitaDeferFlush();
+	}
+}
+#endif

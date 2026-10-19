@@ -27,6 +27,9 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "StaticShadowVolume_local.h"
+#include "../../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
+
+bool R_ForceZFailStencilShadows(); // tr_backend_draw.cpp: the verification's z-fail check (r_forceZFailStencilShadows)
 
 /*
 ===================
@@ -43,6 +46,9 @@ void StaticShadowVolumeJob(const staticShadowVolumeParms_t* parms)
     float shadowZMin = parms->lightZMin;
     float shadowZMax = parms->lightZMax;
     if (parms->useShadowDepthBounds) {
+        // counted, not timed: ~1 us since the Vita fast path (RenderMatrix.cpp),
+        // less than the two clock reads that timed it
+        VITA_ZONE_COUNT("static shadow job: depth bounds");
         idRenderMatrix::DepthBoundsForShadowBounds(shadowZMin, shadowZMax, parms->triangleMVP, parms->triangleBounds, parms->localLightOrigin, true);
         shadowZMin = Max(shadowZMin, parms->lightZMin);
         shadowZMax = Min(shadowZMax, parms->lightZMax);
@@ -59,6 +65,7 @@ void StaticShadowVolumeJob(const staticShadowVolumeParms_t* parms)
         if (R_ViewPotentiallyInsideInfiniteShadowVolume(parms->triangleBounds, parms->localLightOrigin, parms->localViewOrigin, parms->zNear * INSIDE_SHADOW_VOLUME_EXTRA_STRETCH)) {
             // Optionally perform a more precise test to see whether or not the view is inside the shadow volume.
             if (parms->useShadowPreciseInsideTest && parms->verts != NULL && parms->indexes != NULL) {
+                VITA_ZONE("static shadow job: precise view-inside test");
                 renderZFail = R_ViewInsideShadowVolume(parms->tempCullBits, parms->verts, parms->numVerts, parms->indexes, parms->numIndexes,
                     parms->localLightOrigin, parms->localViewOrigin, parms->zNear * INSIDE_SHADOW_VOLUME_EXTRA_STRETCH);
             } else {
@@ -66,6 +73,9 @@ void StaticShadowVolumeJob(const staticShadowVolumeParms_t* parms)
             }
         }
 
+        if (R_ForceZFailStencilShadows()) {
+            renderZFail = true; // the z-fail check: Z-fail and caps for every volume
+        }
         // Check if we can avoid rendering the shadow volume caps.
         numShadowIndices = (parms->forceShadowCaps || renderZFail) ? parms->numShadowIndicesWithCaps : parms->numShadowIndicesNoCaps;
     }

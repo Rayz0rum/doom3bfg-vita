@@ -27,9 +27,20 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "precompiled.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 #pragma hdrstop
 
 #include "Game_local.h"
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_ikDistance("vita_ikDistance", "384", CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: actors farther than this from the player skip the walk IK (feet fitted to the floor); 0 = never skip");
+// The player's own walk IK fits the feet of a body nobody sees in single
+// player: it is suppressed in the player's view and so is its shadow (not
+// multiplayer, g_showPlayerShadow 0), not third person, not in a cinematic.
+// Its foot traces cost 0.6-0.8 ms a frame (run 7, erebus2's fight: "player
+// move > physics: animation controllers (IK)"). 1 = always run it.
+idCVar vita_playerWalkIK("vita_playerWalkIK", "0", CVAR_GAME | CVAR_BOOL, "Vita: 0 = the player's walk IK is skipped while his body cannot be seen (single player, no player shadow, first person, no cinematic); 1 = always");
+#endif
 
 /***********************************************************************
 
@@ -442,6 +453,9 @@ idActor::idActor
 idActor::idActor()
 {
     viewAxis.Identity();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaWalkIKOff = false;
+#endif
 
     scriptThread = NULL; // initialized by ConstructScriptObject, which is called by idEntity::Spawn
 
@@ -1391,6 +1405,14 @@ void idActor::SetState(const char* statename)
 {
     const function_t* newState;
 
+    {
+        extern idCVar vita_logStory;
+        const idPlayer* p = gameLocal.GetLocalPlayer();
+        if (vita_logStory.GetBool() && p != NULL && this != p && team == p->team) {
+            common->Printf("story [%d ms]: character '%s' -> %s\n", gameLocal.time, name.c_str(), statename);
+        }
+    }
+
     newState = GetScriptFunction(statename);
     SetState(newState);
 }
@@ -1402,6 +1424,7 @@ idActor::UpdateScript
 */
 void idActor::UpdateScript()
 {
+    VITA_ZONE("actor UpdateScript (all actors)");
     int i;
 
     if (ai_debugScript.GetInteger() == entityNumber) {
@@ -1535,6 +1558,7 @@ idActor::CanSee
 */
 bool idActor::CanSee(idEntity* ent, bool useFov) const
 {
+    VITA_ZONE_COUNT("can-see checks");
     trace_t tr;
     idVec3 eye;
     idVec3 toPos;
@@ -1654,6 +1678,7 @@ idActor::LinkCombat
 */
 void idActor::LinkCombat()
 {
+    VITA_ZONE("actor link combat");
     idAFAttachment* headEnt;
 
     if (fl.hidden || use_combat_bbox) {
@@ -1772,6 +1797,32 @@ bool idActor::UpdateAnimationControllers()
     }
 
     if (walkIK.IsInitialized()) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // Vita (a fidelity cut): feet are not fitted to the floor beyond
+        // vita_ikDistance from the player - a few pixels at that range; the
+        // legs keep their animated pose (the IK's joint mods are cleared once)
+        const float ikDistance = vita_ikDistance.GetFloat();
+        const idPlayer* player = gameLocal.GetLocalPlayer();
+        if (player == this && !vita_playerWalkIK.GetBool() && !common->IsMultiplayer() && !g_showPlayerShadow.GetBool() && !pm_thirdPerson.GetBool()
+            && !gameLocal.inCinematic) {
+            if (!vitaWalkIKOff) {
+                walkIK.ClearJointMods();
+                vitaWalkIKOff = true;
+            }
+            VITA_ZONE_COUNT("player walk IK skipped (his body is not seen)");
+            return false;
+        }
+        if (ikDistance > 0.0f && player != NULL && player != this
+            && (GetPhysics()->GetOrigin() - player->GetPhysics()->GetOrigin()).LengthSqr() > Square(ikDistance)) {
+            if (!vitaWalkIKOff) {
+                walkIK.ClearJointMods();
+                vitaWalkIKOff = true;
+            }
+            VITA_ZONE_COUNT("actor walk IK skipped (beyond vita_ikDistance)");
+            return false;
+        }
+        vitaWalkIKOff = false;
+#endif
         walkIK.Evaluate();
         return true;
     }
@@ -2119,6 +2170,7 @@ idActor::UpdateAnimState
 */
 void idActor::UpdateAnimState()
 {
+    VITA_ZONE("actor anim state");
     headAnim.UpdateState();
     torsoAnim.UpdateState();
     legsAnim.UpdateState();

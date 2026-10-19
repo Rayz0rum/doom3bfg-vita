@@ -63,6 +63,13 @@ void idRenderWorldLocal::FreeWorld()
     }
 
     if (portalAreas) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        for (int i = 0; i < numPortalAreas; i++) {
+            if (portalAreas[i].vitaRefs != NULL) {
+                Mem_Free(portalAreas[i].vitaRefs);
+            }
+        }
+#endif
         R_StaticFree(portalAreas);
         portalAreas = NULL;
         numPortalAreas = 0;
@@ -684,7 +691,7 @@ void idRenderWorldLocal::FreeDefs()
     generateAllInteractionsCalled = false;
 
     if (interactionTable) {
-        R_StaticFree(interactionTable);
+        FreeInteractionTable(interactionTable, interactionTableHeight);
         interactionTable = NULL;
     }
 
@@ -704,6 +711,17 @@ void idRenderWorldLocal::FreeDefs()
             FreeEntityDef(i);
             entityDefs[i] = NULL;
         }
+    }
+
+    // the lists back to what is left (nothing, at a map's start): they never
+    // shrank, and the interaction table sized from them (entities x lights)
+    // stayed as big as the biggest map's for every map after it - 7.6 MB from
+    // the fifteenth map of the Vita verification on (mars_city1: 2.8 MB)
+    while (lightDefs.Num() > 0 && lightDefs[lightDefs.Num() - 1] == NULL) {
+        lightDefs.SetNum(lightDefs.Num() - 1);
+    }
+    while (entityDefs.Num() > 0 && entityDefs[entityDefs.Num() - 1] == NULL) {
+        entityDefs.SetNum(entityDefs.Num() - 1);
     }
 
     // Reset decals and overlays
@@ -730,6 +748,13 @@ bool idRenderWorldLocal::InitFromMap(const char* name)
     idLexer* src;
     idToken token;
     idRenderModel* lastModel;
+
+    // From the first real map on, an image first used outside a level load
+    // belongs to play (an effect, a GUI, a video) rather than to the boot-time
+    // menus and fonts, and goes with its level (idImageManager::BeginLevelLoad).
+    if (name != NULL && name[0] != '\0') {
+        globalImages->firstLevelLoadStarted = true;
+    }
 
     // if this is an empty world, initialize manually
     if (!name || !name[0]) {

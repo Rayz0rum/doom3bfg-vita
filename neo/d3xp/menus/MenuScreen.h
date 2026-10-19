@@ -203,6 +203,10 @@ public:
     {
         menuGUI = gui;
     }
+#if defined(__vita__)
+    // drawn right after the menu SWF, while this screen is the active one
+    virtual void VitaDrawOverlay() {}
+#endif
 
 protected:
     idSWF* menuGUI;
@@ -990,7 +994,14 @@ public:
             GAME_FIELD_AUTO_RELOAD,
             GAME_FIELD_AIM_ASSIST,
             GAME_FIELD_ALWAYS_SPRINT,
+#if defined(__vita__)
+            GAME_FIELD_LANGUAGE, // shown in the slot Flashlight Shadows had (hidden, held on)
+            GAME_FIELD_ONLINE,   // online play on / off (net_online); a row's index is its field
             GAME_FIELD_FLASHLIGHT_SHADOWS,
+#else
+            GAME_FIELD_FLASHLIGHT_SHADOWS,
+            GAME_FIELD_ONLINE,
+#endif
             MAX_GAME_FIELDS
         };
 
@@ -1016,6 +1027,10 @@ public:
     private:
         idStaticList<idSWFScriptVar, MAX_GAME_FIELDS> fields;
         idStaticList<idSWFScriptVar, MAX_GAME_FIELDS> originalFields;
+#if defined(__vita__)
+        idStr vitaPickedLanguage; // Language row: what the next start will use
+        void SetVitaLanguageField();
+#endif
     };
 
     idMenuScreen_Shell_GameOptions()
@@ -1054,6 +1069,8 @@ public:
             MATCH_FIELD_MAP,
             MATCH_FIELD_TIME,
             MATCH_FIELD_SCORE,
+            MATCH_FIELD_BOTS,      // bots the host keeps in the game (bot_count, VitaBots.cpp)
+            MATCH_FIELD_BOT_SKILL, // their difficulty (bot_skill)
             MAX_MATCH_FIELDS
         };
 
@@ -1195,6 +1212,10 @@ public:
             GAMEPAD_FIELD_VERT_SENS,
             GAMEPAD_FIELD_ACCELERATION,
             GAMEPAD_FIELD_THRESHOLD,
+#if defined(__vita__)
+            GAMEPAD_FIELD_REAR_LEFT_DEADZONE,
+            GAMEPAD_FIELD_REAR_RIGHT_DEADZONE,
+#endif
             MAX_GAMEPAD_FIELDS
         };
 
@@ -1294,6 +1315,9 @@ public:
     virtual bool HandleAction(idWidgetAction& action, const idWidgetEvent& event, idMenuWidget* widget, bool forceHandled = false);
 
     void UpdateBindingInfo();
+#if defined(__vita__)
+    virtual void VitaDrawOverlay();
+#endif
 
 private:
     idMenuDataSource_LayoutSettings layoutData;

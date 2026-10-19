@@ -141,7 +141,14 @@ menuitem_t temp_MainMenu[5] =
 	{1, "M_SAVEG", M_SaveGame, 'm'},
 	// Another hickup with Special edition.
 	//{1,"M_RDTHIS",M_ReadThis,'r'},
+#if defined(__vita__)
+	// Vita: Change Game in place of Quit Game - straight to what the quit
+	// menu's Change Game does (back to DOOM 3: BFG Edition's game choice);
+	// the graphic is composed from the WAD's own menu letters (m_menu.cpp)
+	{1, "M_CHGAME", M_GameSelection, 'c'}
+#else
 	{1, "M_QUITG", M_QuitDOOM, 'q'}
+#endif
 };
 memcpy( &::g->MainMenu, temp_MainMenu, sizeof( temp_MainMenu ) );
 menu_t  temp_MainDef =
@@ -228,6 +235,20 @@ menu_t  temp_NewDef =
 	hurtme		// lastOn
 };
 memcpy( &::g->NewDef, &temp_NewDef, sizeof( temp_NewDef ) );
+#if defined(__vita__)
+// (order: options_e in structs.h)
+menuitem_t temp_OptionsMenu[8] =
+{
+	{2, "M_CSENS",	M_ChangeSensitivity, 'c'},	// "Camera Sensitivity", composed (m_menu.cpp)
+	{ -1, "", 0},
+	{1, "M_SVOL",	M_Sound, 's'},
+	{1, "M_MESSG",	M_ChangeMessages, 'm'},
+	{ -1, "", 0},
+	{ -1, "", 0},
+	{ -1, "", 0},
+	{ -1, "", 0}
+};
+#else
 menuitem_t temp_OptionsMenu[8] =
 {
 	{1, "M_GDHIGH",	M_FullScreen, 'f'},
@@ -240,6 +261,7 @@ menuitem_t temp_OptionsMenu[8] =
 	{ -1, "", 0},
 	{1, "M_SVOL",	M_Sound, 's'}
 };
+#endif
 memcpy( ::g->OptionsMenu, temp_OptionsMenu, sizeof( temp_OptionsMenu ) );
 menu_t  temp_OptionsDef =
 {

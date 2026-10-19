@@ -28,9 +28,14 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #include "AAS_local.h"
 #include "../Game_local.h" // for print and error
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_aasNearestGoalMaxTests("vita_aasNearestGoalMaxTests", "200", CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: a search for the nearest suitable spot (out of range, cover, attack position) tests at most this many areas, then settles for the best found or fails; 0 = no limit");
+#endif
 
 #define CACHETYPE_AREA 1
 #define CACHETYPE_PORTAL 2
@@ -1011,6 +1016,7 @@ idAASLocal::RouteToGoalArea
 */
 bool idAASLocal::RouteToGoalArea(int areaNum, const idVec3 origin, int goalAreaNum, int travelFlags, int& travelTime, idReachability** reach) const
 {
+    VITA_ZONE("aas routing");
     int clusterNum, goalClusterNum, portalNum, i, clusterAreaNum;
     unsigned short int t, bestTime;
     const aasPortal_t* portal;
@@ -1231,8 +1237,31 @@ bool idAASLocal::FindNearestGoal(aasGoal_t& goal, int areaNum, const idVec3 orig
     bestTravelTime = 0;
     bestAreaNum = 0;
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): a search that finds nothing suitable floods the whole
+    // map, a test (often a trace) for each area - a lost soul's
+    // moveOutOfRange took 139 ms, every frame for 1.4 s (enpro fight 3). At
+    // most vita_aasNearestGoalMaxTests tests: then the best found, or nothing.
+    const int vitaMaxTests = vita_aasNearestGoalMaxTests.GetInteger();
+    int vitaTests = 1; // the first area's, above
+    int vitaExpanded = 0;
+    bool vitaCapped = false;
+#endif
+
     // while there are updates in the list
     while (updateListStart) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        if (vitaMaxTests > 0 && vitaTests >= vitaMaxTests) {
+            // what is still queued leaves the list (its flags are reused by the next search)
+            for (idRoutingUpdate* u = updateListStart; u != NULL; u = u->next) {
+                u->isInList = false;
+            }
+            updateListStart = updateListEnd = NULL;
+            vitaCapped = true;
+            break;
+        }
+        vitaExpanded++;
+#endif
 
         curUpdate = updateListStart;
         if (curUpdate->next) {
@@ -1344,6 +1373,9 @@ bool idAASLocal::FindNearestGoal(aasGoal_t& goal, int areaNum, const idVec3 orig
                 t += AreaTravelTime(reach->toAreaNum, reach->end, nextArea->center);
 
                 if (!bestTravelTime || t < bestTravelTime) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                    vitaTests++;
+#endif
                     // if the area is not visible to the target
                     if (callback.TestArea(this, reach->toAreaNum)) {
                         bestTravelTime = t;
@@ -1354,6 +1386,18 @@ bool idAASLocal::FindNearestGoal(aasGoal_t& goal, int areaNum, const idVec3 orig
         }
     }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    VITA_ZONE_COUNT("aas nearest goal: searches");
+    VITA_ZONE_ADD("aas nearest goal: areas tested", vitaTests);
+    VITA_ZONE_ADD("aas nearest goal: areas expanded", vitaExpanded);
+    if (vitaCapped) {
+        if (bestAreaNum) {
+            VITA_ZONE_COUNT("aas nearest goal: searches stopped at vita_aasNearestGoalMaxTests (settled for the best found)");
+        } else {
+            VITA_ZONE_COUNT("aas nearest goal: searches stopped at vita_aasNearestGoalMaxTests (nothing found)");
+        }
+    }
+#endif
     if (bestAreaNum) {
         goal.areaNum = bestAreaNum;
         goal.origin = AreaCenter(bestAreaNum);

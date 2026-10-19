@@ -58,14 +58,24 @@ public:
 typedef enum {
     PDIST_RECT,     // ( sizeX sizeY sizeZ )
     PDIST_CYLINDER, // ( sizeX sizeY sizeZ )
-    PDIST_SPHERE    // ( sizeX sizeY sizeZ ringFraction )
+    PDIST_SPHERE,   // ( sizeX sizeY sizeZ ringFraction )
                     // a ringFraction of zero allows the entire sphere, 0.9 would only
                     // allow the outer 10% of the sphere
+    // Serialised to the binary particle decls that ship inside the .resources, which
+    // were written by the x86 tools with a 4 byte enum. ARM defaults to
+    // -fshort-enums, so without this the field is one byte on the Vita and
+    // every later read in the stream is off. See File.h.
+    PDIST_FORCE_32BIT = 0x7fffffff
 } prtDistribution_t;
 
 typedef enum {
     PDIR_CONE,   // parm0 is the solid cone angle
-    PDIR_OUTWARD // direction is relative to offset from origin, parm0 is an upward bias
+    PDIR_OUTWARD, // direction is relative to offset from origin, parm0 is an upward bias
+    // Serialised to the binary particle decls that ship inside the .resources, which
+    // were written by the x86 tools with a 4 byte enum. ARM defaults to
+    // -fshort-enums, so without this the field is one byte on the Vita and
+    // every later read in the stream is off. See File.h.
+    PDIR_FORCE_32BIT = 0x7fffffff
 } prtDirection_t;
 
 typedef enum {
@@ -73,7 +83,12 @@ typedef enum {
     PPATH_HELIX, // ( sizeX sizeY sizeZ radialSpeed climbSpeed )
     PPATH_FLIES,
     PPATH_ORBIT,
-    PPATH_DRIP
+    PPATH_DRIP,
+    // Serialised to the binary particle decls that ship inside the .resources, which
+    // were written by the x86 tools with a 4 byte enum. ARM defaults to
+    // -fshort-enums, so without this the field is one byte on the Vita and
+    // every later read in the stream is off. See File.h.
+    PPATH_FORCE_32BIT = 0x7fffffff
 } prtCustomPth_t;
 
 typedef enum {
@@ -81,7 +96,12 @@ typedef enum {
     POR_AIMED, // angle and aspect are disregarded
     POR_X,
     POR_Y,
-    POR_Z
+    POR_Z,
+    // Serialised to the binary particle decls that ship inside the .resources, which
+    // were written by the x86 tools with a 4 byte enum. ARM defaults to
+    // -fshort-enums, so without this the field is one byte on the Vita and
+    // every later read in the stream is off. See File.h.
+    POR_FORCE_32BIT = 0x7fffffff
 } prtOrientation_t;
 
 typedef struct renderEntity_s renderEntity_t;

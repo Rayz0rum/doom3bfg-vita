@@ -30,12 +30,37 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h" // GD_SCOPE / GD_PASS: the game/draw thread's tree of passes (VitaBench.cpp)
 
 extern idCVar r_useAreasConnectedForShadowCulling;
 extern idCVar r_useParallelAddShadows;
 extern idCVar r_forceShadowCaps;
 extern idCVar r_useShadowPreciseInsideTest;
+#if defined(__vita__)
+// A pre-light shadow always draws its caps, so the precise inside test only
+// picks the stencil mode: Z-fail is right whether or not the view is inside,
+// Z-pass only when it is not, and both draw the same triangles. The test
+// itself walks every vertex and triangle of the shadow (tens of thousands in
+// the big rooms): the benchmark caught 134 pre-light jobs over 3 ms in one
+// EnPro fight, for a result the GPU doesn't need. Off: Z-fail whenever the
+// view is near enough to the shadow to be inside it.
+idCVar vita_prelightInsideTest("vita_prelightInsideTest", "0", CVAR_RENDERER | CVAR_BOOL, "Vita: run the precise view-inside-shadow test for pre-light shadows too (it only chooses between Z-pass and Z-fail, which draw the same)");
+#endif
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// Vita: how far over budget the frames have been lately, whatever held them
+// back (0 = holding 30 fps; common_frame.cpp steps it, up to 6): the light
+// budget below tightens with it
+int vita_loadStep = 0;
+// Vita: the most lights with something to draw a view keeps (0 = no cap);
+// common_frame.cpp lowers it while the render back end runs over budget and
+// gives it back when the back end has time to spare
+int vita_viewLightCap = 0;
+int vita_viewLitLightsLast = 0; // lights with something to draw, last view
+idCVar vita_lightCapAuto("vita_lightCapAuto", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_ARCHIVE, "Vita: while the render back end runs over budget, the smallest lights on screen are dropped until it fits (the player's own lights, fog and blend lights stay)");
+idCVar vita_lightMinScreenAreaPerLoadStep("vita_lightMinScreenAreaPerLoadStep", "0.002", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: added to vita_lightMinScreenArea for each load step (frames over budget lately: 0-6), so more small lights drop while 30 fps is not held");
+idCVar vita_lightMinScreenArea("vita_lightMinScreenArea", "0.0025", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: lights covering less than this fraction of the view are dropped for the frame (the player's own lights always stay); 0 = keep all");
+#endif
 idCVar r_useAreasConnectedForShadowCulling("r_useAreasConnectedForShadowCulling", "2", CVAR_RENDERER | CVAR_INTEGER, "cull entities cut off by doors");
 idCVar r_useParallelAddLights("r_useParallelAddLights", "1", CVAR_RENDERER | CVAR_BOOL, "aadd all lights in parallel with jobs");
 
@@ -125,9 +150,13 @@ static void R_AddSingleLight(viewLight_t* vLight)
     }
 
     // evaluate the light shader registers
+    VITA_ZONE_BEGIN(lightSetup, "light job: shader registers + scissor");
     float* lightRegs = (float*)R_FrameAlloc(lightShader->GetNumRegisters() * sizeof(float), FRAME_ALLOC_SHADER_REGISTER);
-    lightShader->EvaluateRegisters(lightRegs, light->parms.shaderParms, viewDef->renderView.shaderParms,
-        tr.viewDef->renderView.time[0] * 0.001f, light->parms.referenceSound);
+    {
+        VITA_ZONE("light job: shader registers (EvaluateRegisters)");
+        lightShader->EvaluateRegisters(lightRegs, light->parms.shaderParms, viewDef->renderView.shaderParms,
+            tr.viewDef->renderView.time[0] * 0.001f, light->parms.referenceSound);
+    }
 
     // if this is a purely additive light and no stage in the light shader evaluates
     // to a positive light value, we can completely skip the light
@@ -163,6 +192,7 @@ static void R_AddSingleLight(viewLight_t* vLight)
             // remove the light from the viewLights list, and change its frame marker
             // so interaction generation doesn't think the light is visible and
             // create a shadow for it
+            VITA_ZONE_END(lightSetup);
             return;
         }
     }
@@ -207,11 +237,13 @@ static void R_AddSingleLight(viewLight_t* vLight)
         } else if (r_useLightScissors.GetInteger() == 2) {
             idRenderMatrix::ProjectedNearClippedBounds(projected, invProjectMVPMatrix, bounds_zeroOneCube);
         } else {
+            VITA_ZONE("light job: scissor bounds (fully clipped, r_useLightScissors 3)");
             idRenderMatrix::ProjectedFullyClippedBounds(projected, invProjectMVPMatrix, bounds_zeroOneCube);
         }
 
         if (projected[0][2] >= projected[1][2]) {
             // the light was culled to the view frustum
+            VITA_ZONE_END(lightSetup);
             return;
         }
 
@@ -228,10 +260,52 @@ static void R_AddSingleLight(viewLight_t* vLight)
         vLight->scissorRect.Intersect(lightScissorRect);
         vLight->scissorRect.zmin = projected[0][2];
         vLight->scissorRect.zmax = projected[1][2];
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // Vita (a cut): a light covering less than vita_lightMinScreenArea
+        // (a fraction of the view) is dropped this frame - its light job,
+        // its interactions and shadows, its GPU passes. Lights the player
+        // carries (flashlight, muzzle flashes: allowLightInViewID) stay.
+        // Under load (vita_loadStep) the bar rises by
+        // vita_lightMinScreenAreaPerLoadStep a step.
+        extern bool vita_fullQuality;
+        const float baseArea = vita_fullQuality ? 0.0f : vita_lightMinScreenArea.GetFloat();
+        const float minArea = (baseArea > 0.0f) ? baseArea + vita_loadStep * vita_lightMinScreenAreaPerLoadStep.GetFloat() : 0.0f;
+        // With hysteresis: a light on screen is only dropped once it is well
+        // under the bar (60% of it), one dropped comes back at the bar - a
+        // light at the bar no longer blinks on and off as the view moves.
+        bool vitaSmallKeep = true;
+        if (minArea > 0.0f && light->parms.allowLightInViewID == 0 && !lightShader->IsFogLight() && !lightShader->IsBlendLight()) {
+            const float area = (float)vLight->scissorRect.GetArea();
+            const float bar = (light->vitaSmallDropped ? 1.0f : 0.6f) * minArea * screenWidth * screenHeight;
+            vitaSmallKeep = area >= bar;
+            if (!viewDef->isSubview) {
+                const_cast<idRenderLightLocal*>(light)->vitaSmallDropped = !vitaSmallKeep;
+            }
+        }
+        if (!vitaSmallKeep) {
+            const float area = (float)vLight->scissorRect.GetArea();
+            {
+                if (area < baseArea * screenWidth * screenHeight) {
+                    VITA_ZONE_COUNT("lights dropped: too small on screen (vita_lightMinScreenArea)");
+                } else {
+                    VITA_ZONE_COUNT("lights dropped: small on screen while over budget (vita_loadStep x vita_lightMinScreenAreaPerLoadStep)");
+                }
+                VITA_ZONE_END(lightSetup);
+                return;
+            }
+        }
+#endif
     }
 
     // this one stays on the list
     vLight->removeFromList = false;
+    VITA_ZONE_END(lightSetup);
+    VITA_ZONE_BEGIN(lightEntities, "light job: entities in the light's areas (interactions, shadow-only entities)");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    int vitaRefsStaticEmptySlow = 0, vitaRefsWeaponLight = 0, vitaRefsNoShadowHidden = 0, vitaRefsNoSurfaces = 0;
+    int vitaEntityRefs = 0, vitaRefsSeen = 0, vitaRefsStaticEmpty = 0, vitaRefsCullTested = 0, vitaRefsVisible = 0, vitaRefsShadowTested = 0, vitaRefsShadowOnly = 0;
+#endif
 
     //--------------------------------------------
     // create interactions with all entities the light may touch, and add viewEntities
@@ -241,10 +315,15 @@ static void R_AddSingleLight(viewLight_t* vLight)
     const int renderViewID = viewDef->renderView.viewID;
 
     // this bool array will be set true whenever the entity will visibly interact with the light
-    vLight->entityInteractionState = (byte*)R_ClearedFrameAlloc(light->world->entityDefs.Num() * sizeof(vLight->entityInteractionState[0]), FRAME_ALLOC_INTERACTION_STATE);
+    {
+        // (Vita: timed and sized - one byte per entity slot of the map, cleared for every light)
+        VITA_ZONE("light job: entity state array cleared (one byte per entity slot)");
+        VITA_ZONE_ADD("light job: entity state bytes cleared", light->world->entityDefs.Num());
+        vLight->entityInteractionState = (byte*)R_ClearedFrameAlloc(light->world->entityDefs.Num() * sizeof(vLight->entityInteractionState[0]), FRAME_ALLOC_INTERACTION_STATE);
+    }
 
     const bool lightCastsShadows = light->LightCastsShadows();
-    idInteraction** const interactionTableRow = light->world->interactionTable + light->index * light->world->interactionTableWidth;
+    idInteraction** const interactionTableRow = light->world->interactionTable[light->index];
 
     for (areaReference_t* lref = light->references; lref != NULL; lref = lref->ownerNext) {
         portalArea_t* area = lref->area;
@@ -259,8 +338,47 @@ static void R_AddSingleLight(viewLight_t* vLight)
         }
 
         // check all the models in this area
+        VITA_ZONE_SAMPLED("light job: one area's entity references (sampled)", ((uintptr_t)area >> 4) + tr.frameCount + light->index, 3);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // Vita: the area's packed array (R_VitaPackAreaRefs, made before the
+        // light jobs) in list order, instead of the linked references - a
+        // walk of scattered nodes, ~1 us a reference (~3,800 a frame in a
+        // fight). The checks most references end at read only the packed
+        // entry: already checked through another area, a static model the
+        // light statically has no interaction with, a model with no lit or
+        // shadowing surfaces. The same tests on the same values, in the same
+        // order; the rest of the checks are unchanged.
+        const vitaAreaEntityRef_t* vitaPacked = area->vitaRefs;
+        const int vitaNumPacked = area->vitaNumRefs;
+        for (int vitaPackedNum = 0; vitaPackedNum < vitaNumPacked; vitaPackedNum++) {
+            const vitaAreaEntityRef_t& vr = vitaPacked[vitaPackedNum];
+            vitaEntityRefs++;
+            {
+                const int entityIndex = vr.index;
+                if (vLight->entityInteractionState[entityIndex] != viewLight_t::INTERACTION_UNCHECKED) {
+                    vitaRefsSeen++;
+                    continue;
+                }
+                if (vr.staticModel && interactionTableRow[entityIndex] == INTERACTION_EMPTY) {
+                    vLight->entityInteractionState[entityIndex] = viewLight_t::INTERACTION_NO;
+                    vitaRefsStaticEmpty++;
+                    continue;
+                }
+                // a model with neither lit nor shadow-casting surfaces ends at
+                // the "doesn't accept lighting or cast shadows" check below;
+                // every check before that one ends the same way (state NO,
+                // next reference), so deciding it first changes nothing
+                if (vr.noSurfaces) {
+                    vLight->entityInteractionState[entityIndex] = viewLight_t::INTERACTION_NO;
+                    vitaRefsNoSurfaces++;
+                    continue;
+                }
+            }
+            idRenderEntityLocal* edef = vr.edef;
+#else
         for (areaReference_t* eref = area->entityRefs.areaNext; eref != &area->entityRefs; eref = eref->areaNext) {
             idRenderEntityLocal* edef = eref->entity;
+#endif
 
             if (vLight->entityInteractionState[edef->index] != viewLight_t::INTERACTION_UNCHECKED) {
                 continue;
@@ -280,6 +398,9 @@ static void R_AddSingleLight(viewLight_t* vLight)
                 // the interaction was statically checked, and it didn't generate any surfaces,
                 // so there is no need to force the entity onto the view list if it isn't
                 // already there
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                vitaRefsStaticEmptySlow++;
+#endif
                 continue;
             }
 
@@ -290,17 +411,26 @@ static void R_AddSingleLight(viewLight_t* vLight)
             // HACK: the armor-mounted flashlight is a private spot light, which is probably
             // wrong -- you would expect to see them in multiplayer.
             if (light->parms.allowLightInViewID && light->parms.pointLight && !eParms.weaponDepthHack) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                vitaRefsWeaponLight++;
+#endif
                 continue;
             }
 
             // non-shadow casting entities don't need to be added if they aren't
             // directly visible
             if ((eParms.noShadow || (eModel && !eModel->ModelHasShadowCastingSurfaces())) && !edef->IsDirectlyVisible()) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                vitaRefsNoShadowHidden++;
+#endif
                 continue;
             }
 
             // if the model doesn't accept lighting or cast shadows, it doesn't need to be added
             if (eModel && !eModel->ModelHasInteractingSurfaces() && !eModel->ModelHasShadowCastingSurfaces()) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                vitaRefsNoSurfaces++;
+#endif
                 continue;
             }
 
@@ -315,6 +445,9 @@ static void R_AddSingleLight(viewLight_t* vLight)
 
                 // do a check of the entity reference bounds against the light frustum to see if they can't
                 // possibly interact, despite sharing one or more world areas
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                vitaRefsCullTested++;
+#endif
                 if (R_CullModelBoundsToLight(light, edef->localReferenceBounds, edef->modelRenderMatrix)) {
                     continue;
                 }
@@ -324,6 +457,9 @@ static void R_AddSingleLight(viewLight_t* vLight)
 
             if (edef->IsDirectlyVisible()) {
                 // entity is directly visible, so the interaction is definitely needed
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                vitaRefsVisible++;
+#endif
                 vLight->entityInteractionState[edef->index] = viewLight_t::INTERACTION_YES;
                 continue;
             }
@@ -345,6 +481,9 @@ static void R_AddSingleLight(viewLight_t* vLight)
             }
 
             // should we use the shadow bounds from pre-calculated interactions?
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            vitaRefsShadowTested++;
+#endif
             idBounds shadowBounds;
             R_ShadowBounds(edef->globalReferenceBounds, light->globalLightBounds, light->globalLightOrigin, shadowBounds);
 
@@ -367,12 +506,28 @@ static void R_AddSingleLight(viewLight_t* vLight)
             vLight->entityInteractionState[edef->index] = viewLight_t::INTERACTION_YES;
 
             // we will need to create a viewEntity_t for it in the serial code section
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            vitaRefsShadowOnly++;
+#endif
             shadowOnlyEntity_t* shadEnt = (shadowOnlyEntity_t*)R_FrameAlloc(sizeof(shadowOnlyEntity_t), FRAME_ALLOC_SHADOW_ONLY_ENTITY);
             shadEnt->next = vLight->shadowOnlyViewEntities;
             shadEnt->edef = edef;
             vLight->shadowOnlyViewEntities = shadEnt;
         }
     }
+
+    VITA_ZONE_END(lightEntities);
+    VITA_ZONE_ADD("light job: entity references walked", vitaEntityRefs);
+    VITA_ZONE_ADD("light job: references to an entity already checked (another area)", vitaRefsSeen);
+    VITA_ZONE_ADD("light job: references to a static model with no interaction (no entity read)", vitaRefsStaticEmpty);
+    VITA_ZONE_ADD("light job: references culled against the light (entity or light moved)", vitaRefsCullTested);
+    VITA_ZONE_ADD("light job: references to a directly visible entity (interaction kept)", vitaRefsVisible);
+    VITA_ZONE_ADD("light job: references given the shadow bounds test (entity not visible)", vitaRefsShadowTested);
+    VITA_ZONE_ADD("light job: shadow-only entities added", vitaRefsShadowOnly);
+    VITA_ZONE_ADD("light job: references to a static model with no interaction (after the entity read: callback models)", vitaRefsStaticEmptySlow);
+    VITA_ZONE_ADD("light job: references skipped for a weapon light", vitaRefsWeaponLight);
+    VITA_ZONE_ADD("light job: references to a hidden entity casting no shadow", vitaRefsNoShadowHidden);
+    VITA_ZONE_ADD("light job: references to a model with no lit or shadowing surfaces", vitaRefsNoSurfaces);
 
     //--------------------------------------------
     // add the prelight shadows for the static world geometry
@@ -420,7 +575,11 @@ static void R_AddSingleLight(viewLight_t* vLight)
             shadowParms->lightZMin = vLight->scissorRect.zmin;
             shadowParms->lightZMax = vLight->scissorRect.zmax;
             shadowParms->forceShadowCaps = r_forceShadowCaps.GetBool();
+#if defined(__vita__)
+            shadowParms->useShadowPreciseInsideTest = r_useShadowPreciseInsideTest.GetBool() && vita_prelightInsideTest.GetBool();
+#else
             shadowParms->useShadowPreciseInsideTest = r_useShadowPreciseInsideTest.GetBool();
+#endif
             shadowParms->useShadowDepthBounds = r_useShadowDepthBounds.GetBool();
             shadowParms->numShadowIndices = &shadowDrawSurf->numIndexes;
             shadowParms->renderZFail = &shadowDrawSurf->renderZFail;
@@ -452,14 +611,71 @@ REGISTER_PARALLEL_JOB(R_AddSingleLight, "R_AddSingleLight");
 R_AddLights
 =================
 */
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+===================
+R_VitaPackAreaRefs
+
+Before the light jobs (they read the arrays in parallel): every area a light
+of the view touches whose entity list changed since gets its packed array
+remade, in list order.
+===================
+*/
+static void R_VitaPackAreaRefs()
+{
+    VITA_ZONE("light jobs: pack the areas' entity references (changed areas)");
+    int packed = 0, entries = 0;
+    for (viewLight_t* vLight = tr.viewDef->viewLights; vLight != NULL; vLight = vLight->next) {
+        for (areaReference_t* lref = vLight->lightDef->references; lref != NULL; lref = lref->ownerNext) {
+            portalArea_t* area = lref->area;
+            if (!area->vitaRefsDirty && area->vitaRefs != NULL) {
+                continue;
+            }
+            int n = 0;
+            for (areaReference_t* eref = area->entityRefs.areaNext; eref != &area->entityRefs; eref = eref->areaNext) {
+                n++;
+            }
+            if (n > area->vitaRefsAlloced) {
+                if (area->vitaRefs != NULL) {
+                    Mem_Free(area->vitaRefs);
+                }
+                area->vitaRefsAlloced = n + 16;
+                area->vitaRefs = (vitaAreaEntityRef_t*)Mem_Alloc(area->vitaRefsAlloced * sizeof(vitaAreaEntityRef_t), TAG_RENDER);
+            } else if (area->vitaRefs == NULL) {
+                area->vitaRefsAlloced = 16;
+                area->vitaRefs = (vitaAreaEntityRef_t*)Mem_Alloc(area->vitaRefsAlloced * sizeof(vitaAreaEntityRef_t), TAG_RENDER);
+            }
+            int i = 0;
+            for (areaReference_t* eref = area->entityRefs.areaNext; eref != &area->entityRefs; eref = eref->areaNext, i++) {
+                vitaAreaEntityRef_t& e = area->vitaRefs[i];
+                e.edef = eref->entity;
+                e.index = eref->vitaEntityIndex;
+                e.staticModel = eref->vitaStaticModel;
+                e.noSurfaces = eref->vitaNoSurfaces;
+            }
+            area->vitaNumRefs = n;
+            area->vitaRefsDirty = false;
+            packed++;
+            entries += n;
+        }
+    }
+    VITA_ZONE_ADD("light jobs: areas packed (their entity list changed)", packed);
+    VITA_ZONE_ADD("light jobs: entity references packed", entries);
+}
+#endif
+
 void R_AddLights()
 {
     SCOPED_PROFILE_EVENT("R_AddLights");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    R_VitaPackAreaRefs();
+#endif
 
     //-------------------------------------------------
     // check each light individually, possibly in parallel
     //-------------------------------------------------
 
+    GD_PASS_BEGIN("light jobs (R_AddSingleLight per light)");
     if (r_useParallelAddLights.GetBool()) {
         for (viewLight_t* vLight = tr.viewDef->viewLights; vLight != NULL; vLight = vLight->next) {
             tr.frontEndJobList->AddJob((jobRun_t)R_AddSingleLight, vLight);
@@ -476,6 +692,7 @@ void R_AddLights()
     // cull lights from the list if they turned out to not be needed
     //-------------------------------------------------
 
+    GD_PASS("light list, shadow-only entities, pre-light shadow job queue");
     tr.pc.c_viewLights = 0;
     viewLight_t** ptr = &tr.viewDef->viewLights;
     while (*ptr != NULL) {
@@ -526,6 +743,7 @@ void R_AddLights()
         int end = Sys_Microseconds();
         backEnd.pc.shadowMicroSec += end - start;
     }
+    GD_PASS_END();
 }
 
 /*
@@ -603,10 +821,64 @@ void R_OptimizeViewLightsList()
 
     qsort(sortLights, numSortLightsFilled, sizeof(sortLights[0]), sortLight_t::sort);
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): the light cap (vita_viewLightCap, set from the back end's
+    // time in common_frame.cpp). The lights with something to draw beyond
+    // the cap - the smallest on screen first - are left out of the view:
+    // their interactions and shadows never reach the back end, whose time
+    // is draw calls (~20 us each; a light is ~30-40 of them in the fights).
+    // The player's own lights, fog and blend lights always stay.
+    int vitaLit = 0;
+    for (int i = 0; i < numSortLightsFilled; i++) {
+        const viewLight_t* vl = sortLights[i].vLight;
+        if (vl->localInteractions || vl->globalInteractions || vl->translucentInteractions) {
+            vitaLit++;
+        }
+    }
+    if (!tr.viewDef->isSubview) {
+        vita_viewLitLightsLast = vitaLit;
+    }
+    extern bool vita_fullQuality;
+    int vitaToDrop = (vita_viewLightCap > 0 && !tr.viewDef->isSubview && !vita_fullQuality) ? vitaLit - vita_viewLightCap : 0;
+    int vitaDropped = 0, vitaDrawsDropped = 0;
+#endif
+
     // rebuild the linked list in order
     tr.viewDef->viewLights = NULL;
     for (int i = 0; i < numSortLightsFilled; i++) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // (ascending area: the smallest come first)
+        if (vitaToDrop > 0) {
+            viewLight_t* vl = sortLights[i].vLight;
+            const bool lit = (vl->localInteractions || vl->globalInteractions || vl->translucentInteractions);
+            if (lit && vl->lightDef->parms.allowLightInViewID == 0 && !vl->lightShader->IsFogLight() && !vl->lightShader->IsBlendLight()) {
+                for (const drawSurf_t* s = vl->localInteractions; s != NULL; s = s->nextOnLight) {
+                    vitaDrawsDropped++;
+                }
+                for (const drawSurf_t* s = vl->globalInteractions; s != NULL; s = s->nextOnLight) {
+                    vitaDrawsDropped++;
+                }
+                for (const drawSurf_t* s = vl->translucentInteractions; s != NULL; s = s->nextOnLight) {
+                    vitaDrawsDropped++;
+                }
+                for (const drawSurf_t* s = vl->localShadows; s != NULL; s = s->nextOnLight) {
+                    vitaDrawsDropped++;
+                }
+                for (const drawSurf_t* s = vl->globalShadows; s != NULL; s = s->nextOnLight) {
+                    vitaDrawsDropped++;
+                }
+                vitaToDrop--;
+                vitaDropped++;
+                continue;
+            }
+        }
+#endif
         sortLights[i].vLight->next = tr.viewDef->viewLights;
         tr.viewDef->viewLights = sortLights[i].vLight;
     }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    VITA_ZONE_ADD("lights dropped: over the light cap (render back end over budget)", vitaDropped);
+    VITA_ZONE_ADD("light cap: draws (interactions + shadows) dropped with them", vitaDrawsDropped);
+    VITA_ZONE_ADD("light cap: lights with something to draw (main view)", tr.viewDef->isSubview ? 0 : vitaLit);
+#endif
 }

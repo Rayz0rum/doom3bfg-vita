@@ -32,6 +32,10 @@ If you have questions concerning this license or the applicable additional terms
 #include "Common_local.h"
 #include "../sys/sys_lobby_backend.h"
 
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#endif
+
 #define LAUNCH_TITLE_DOOM_EXECUTABLE "doom1.exe"
 #define LAUNCH_TITLE_DOOM2_EXECUTABLE "doom2.exe"
 
@@ -211,6 +215,11 @@ void idCommonLocal::UnloadMap()
     }
 
     mapSpawned = false;
+#if defined(__vita__)
+    // the menus run at 60 (vita_gameHz is for maps)
+    com_engineHz_denominator = 100LL * 60;
+    com_engineHz_latched = 60.0f;
+#endif
 }
 
 /*
@@ -344,6 +353,40 @@ player and multiplayer, but not for renderDemos, which don't create a game at al
 Exits with mapSpawned = true
 ===============
 */
+#if defined(__vita__)
+// One memory line per step of a map load, so a map that does not fit says which
+// step ran out (and the next one that fits says how close it came).
+#define VITA_LOAD_STEP(x) do { VITA_MARK("map load: " x); Vita_LogMemory("load: " x); } while (0)
+#elif defined(_WIN32) && defined(ID_SOUND_STREAM_TEST)
+// The PC test build used to size the Vita port: process memory at the same steps.
+#define PSAPI_VERSION 2
+#include <psapi.h>
+static void PC_LogLoadStep(const char* step)
+{
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    memset(&pmc, 0, sizeof(pmc));
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        common->Printf("pcmem %-48s private %7d KB\n", step, (int)(pmc.PrivateUsage / 1024));
+    }
+    if (strstr(step, "previous level freed") != NULL) {
+        idStr counts;
+        int total = 0;
+        for (int t = 0; t < declManager->GetNumDeclTypes(); t++) {
+            const int n = declManager->GetNumDecls((declType_t)t);
+            total += n;
+            if (n > 0) {
+                counts += va(" %d:%d", t, n);
+            }
+        }
+        common->Printf("pcmem decls %d (by type%s)\n", total, counts.c_str());
+    }
+}
+#define VITA_LOAD_STEP(x) PC_LogLoadStep("load: " x)
+#else
+#define VITA_LOAD_STEP(x) do { } while (0)
+#endif
+
 void idCommonLocal::ExecuteMapChange()
 {
     if (session->GetState() != idSession::LOADING) {
@@ -403,11 +446,18 @@ void idCommonLocal::ExecuteMapChange()
     fullMapName += currentMapName;
     fullMapName.SetFileExtension("map");
 
+#if defined(__vita__)
+    // no block buffer: it was the save buffer, which the level-start autosave
+    // writes into (and grows - a new block - while the file system kept the
+    // old one), and which the Vita no longer keeps between saves
+    fileSystem->BeginLevelLoad(currentMapName, NULL, 0);
+#else
     if (mapSpawnData.savegameFile) {
         fileSystem->BeginLevelLoad(currentMapName, NULL, 0);
     } else {
         fileSystem->BeginLevelLoad(currentMapName, saveFile.GetDataPtr(), saveFile.GetAllocated());
     }
+#endif
 
     // capture the current screen and start a wipe
     // immediately complete the wipe to fade out the level transition
@@ -415,6 +465,23 @@ void idCommonLocal::ExecuteMapChange()
     StartWipe("wipeMaterial", true);
     CompleteWipe();
 
+    VITA_LOAD_STEP("start");
+#if defined(__vita__)
+    extern void Vita_LoadingSwapInterval(); // common_frame.cpp
+    Vita_LoadingSwapInterval();
+    Vita_TagPlacementReset(); // where this load's allocations land, by tag (printed when the map is loaded)
+#endif
+#if defined(__vita__)
+    {
+        // a new map starts at the chosen 3D resolution and full texture
+        // quality; both come down again if this map needs it (common_frame.cpp,
+        // idImageManager::LoadLevelImages)
+        extern int vita_dynamicResolutionStep;
+        extern int vita_textureQualityDrop;
+        vita_dynamicResolutionStep = 0;
+        vita_textureQualityDrop = 0;
+    }
+#endif
     int sm = Sys_Milliseconds();
     // shut down the existing game if it is running
     UnloadMap();
@@ -430,6 +497,7 @@ void idCommonLocal::ExecuteMapChange()
     uiManager->BeginLevelLoad();
     ms = Sys_Milliseconds() - sm;
     common->Printf("%6d msec to free assets\n", ms);
+    VITA_LOAD_STEP("previous level freed");
 
     // Sys_DumpMemory( true );
 
@@ -449,8 +517,10 @@ void idCommonLocal::ExecuteMapChange()
         idPreloadManifest manifest;
         manifest.LoadManifest(manifestName);
         renderSystem->Preload(manifest, currentMapName);
+        VITA_LOAD_STEP("models/images preloaded");
         soundSystem->Preload(manifest);
         game->Preload(manifest);
+        VITA_LOAD_STEP("sounds/anims/collision preloaded");
     }
 
     if (common->IsMultiplayer()) {
@@ -461,8 +531,16 @@ void idCommonLocal::ExecuteMapChange()
         com_engineHz_latched = mpEngineHz;
     } else {
         // allow com_engineHz to be changed between map loads
+#if defined(__vita__)
+        extern idCVar vita_gameHz;
+        const int vitaHz = (vita_gameHz.GetInteger() >= 60) ? 60 : 30;
+        com_engineHz_denominator = 100LL * vitaHz;
+        com_engineHz_latched = (float)vitaHz;
+        common->Printf("vita: game logic at %d Hz in this map (vita_gameHz)\n", vitaHz);
+#else
         com_engineHz_denominator = 100LL * com_engineHz.GetFloat();
         com_engineHz_latched = com_engineHz.GetFloat();
+#endif
     }
 
     // note any warning prints that happen during the load process
@@ -476,6 +554,7 @@ void idCommonLocal::ExecuteMapChange()
     if (!renderWorld->InitFromMap(fullMapName)) {
         common->Error("couldn't load %s", fullMapName.c_str());
     }
+    VITA_LOAD_STEP("render world (.bproc) loaded");
 
     // for the synchronous networking we needed to roll the angles over from
     // level to level, but now we can just clear everything
@@ -498,6 +577,7 @@ void idCommonLocal::ExecuteMapChange()
         game->InitFromNewMap(fullMapName, renderWorld, soundWorld, matchParameters.gameMode, Sys_Milliseconds());
     }
 
+    VITA_LOAD_STEP("game spawned (map, collision, AAS, entities)");
     game->Shell_CreateMenu(true);
 
     // Reset some values important to multiplayer
@@ -530,11 +610,15 @@ void idCommonLocal::ExecuteMapChange()
         }
     }
 
+    VITA_LOAD_STEP("first game frame run");
     renderSystem->EndLevelLoad();
+    VITA_LOAD_STEP("models and images loaded");
     soundSystem->EndLevelLoad();
+    VITA_LOAD_STEP("sounds loaded");
     declManager->EndLevelLoad();
     uiManager->EndLevelLoad(currentMapName);
     fileSystem->EndLevelLoad();
+    VITA_LOAD_STEP("guis loaded");
 
     if (!mapSpawnData.savegameFile && !IsMultiplayer()) {
         common->Printf("----- Running initial game frames -----\n");
@@ -542,22 +626,47 @@ void idCommonLocal::ExecuteMapChange()
         // In single player, run a bunch of frames to make sure ragdolls are settled
         idUserCmdMgr emptyCommandManager;
         gameReturn_t emptyGameReturn;
+#if defined(__vita__)
+        // Time-boxed: once a jammed door/ragdoll made each of these frames take
+        // seconds and the load sat on the loading screen for minutes. Entities
+        // whose think takes 50 ms or more are named in the log meanwhile.
+        cvarSystem->SetCVarFloat("g_timeEntities", 50.0f);
+        const int vitaSettleStart = Sys_Milliseconds();
+        int vitaSettleFrames = 0;
+#endif
         for (int i = 0; i < 100; i++) {
             for (int playerIndex = 0; playerIndex < MAX_PLAYERS; ++playerIndex) {
                 emptyCommandManager.PutUserCmdForPlayer(playerIndex, usercmd_t());
             }
             game->RunFrame(emptyCommandManager, emptyGameReturn);
+#if defined(__vita__)
+            vitaSettleFrames++;
+            if (Sys_Milliseconds() - vitaSettleStart > 25000) {
+                common->Printf("vita: settling stopped after %d of 100 frames (%d ms) - the entities named above are very slow to simulate\n",
+                    vitaSettleFrames, Sys_Milliseconds() - vitaSettleStart);
+                break;
+            }
+#endif
         }
+#if defined(__vita__)
+        cvarSystem->SetCVarFloat("g_timeEntities", 0.0f);
+        common->Printf("vita: %d settling frames in %d ms\n", vitaSettleFrames, Sys_Milliseconds() - vitaSettleStart);
+#endif
 
         // kick off an auto-save of the game (so we can always continue in this map if we die before hitting an autosave)
         common->Printf("----- Saving Game -----\n");
         SaveGame("autosave");
     }
 
+    VITA_LOAD_STEP("initial frames run and autosaved");
     common->Printf("----- Generating Interactions -----\n");
 
     // let the renderSystem generate interactions now that everything is spawned
     renderWorld->GenerateAllInteractions();
+#if defined(__vita__)
+    Vita_LogMemoryAccuracy("after the level load"); // the exact figures walk the heaps: only here, under the loading screen
+    Vita_ScanThreads(); // OpenAL's, vitaGL's and the system's threads too, for the per-thread CPU lines
+#endif
 
     {
         int vertexMemUsedKB = vertexCache.staticData.vertexMemUsed.GetValue() / 1024;
@@ -607,6 +716,19 @@ void idCommonLocal::ExecuteMapChange()
     int msec = Sys_Milliseconds() - start;
     common->Printf("%6d msec to load %s\n", msec, currentMapName.c_str());
     // Sys_DumpMemory( false );
+
+#if defined(__vita__)
+    // Every memory checkpoint so far is taken before the map load starts, which
+    // made a stale "RAM 106 MB free" reading look like headroom when the pools
+    // were in fact being emptied. This is the one number that says how close a
+    // map came to not fitting, so log it where the map has actually finished.
+    Vita_LogMemory("map loaded");
+    Vita_TagPlacementReport(va("the load of %s", currentMapName.c_str()));
+    // Measure what actually reaches the screen: the first frames of the map,
+    // then one sample every 300 swaps (about ten seconds) for the rest of the
+    // session. See vita_selftest.cpp for what each number means.
+    Vita_ScreenSampleRequest(4, currentMapName.c_str(), 900); // every ~30 s: each sample is three memory card writes
+#endif
 
     // Issue a render at the very end of the load process to update soundTime before the first frame
     soundSystem->Render();
@@ -658,7 +780,13 @@ void idCommonLocal::UpdateLevelLoadPacifier()
         }
     } else {
         // On the PC just update at a constant rate for the Steam overlay
+#if defined(__vita__)
+        // Each update draws and presents the loading screen, which on the Vita
+        // is a real slice of the load at 20 per second; 5 keep it alive.
+        if (time - lastPacifierGuiTime >= 200) {
+#else
         if (time - lastPacifierGuiTime >= 50) {
+#endif
             lastPacifierGuiTime = time;
             UpdateScreen(false);
         }
@@ -776,6 +904,12 @@ bool idCommonLocal::SaveGame(const char* saveName)
     saveFile.Clear(false);
     stringsFile.MakeWritable();
     stringsFile.Clear(false);
+#if defined(__vita__)
+    // as big as the last save at once, rather than grown 16 KB at a time (a
+    // new block and a copy each time: 400 of them for a 7 MB save)
+    saveFile.PreAllocate(vitaLastSaveBytes > 0 ? vitaLastSaveBytes + 256 * 1024 : MIN_SAVEGAME_SIZE_BYTES);
+    stringsFile.PreAllocate(vitaLastStringsBytes > 0 ? vitaLastStringsBytes + 64 * 1024 : 256 * 1024);
+#endif
 
     // Setup the save pipeline
     pipelineFile = new (TAG_SAVEGAMES) idFile_SaveGamePipelined();
@@ -894,6 +1028,12 @@ bool idCommonLocal::LoadGame(const char* saveName)
     ScrubSaveGameFileName(slotName);
     saveFile.Clear(false);
     stringsFile.Clear(false);
+#if defined(__vita__)
+    // the save is read into them: as big as the last one at once (released
+    // again once the level is loaded, common_frame.cpp)
+    saveFile.PreAllocate(vitaLastSaveBytes > 0 ? vitaLastSaveBytes + 256 * 1024 : MIN_SAVEGAME_SIZE_BYTES);
+    stringsFile.PreAllocate(vitaLastStringsBytes > 0 ? vitaLastStringsBytes + 64 * 1024 : 256 * 1024);
+#endif
 
     saveGameHandle_t loadGameHandle = session->LoadGameSync(slotName, files);
     if (loadGameHandle != 0) {
@@ -964,6 +1104,31 @@ bool HandleCommonErrors(const idSaveLoadParms& parms)
     return false;
 }
 
+#if defined(__vita__)
+/*
+========================
+idCommonLocal::VitaReleaseSaveBuffers
+
+The save buffers (the game's state, 4-10 MB, and its string table) back to
+the heap once a game is saved or loaded. Stock BFG keeps them for good
+(Clear( false )), and on the Vita those megabytes stayed taken through every
+level load after the first save: the full verification's reload of a
+phobos3 save started 13 MB worse off than the map's own load, and ran out of
+memory loading its images (2026-10-18).
+========================
+*/
+void idCommonLocal::VitaReleaseSaveBuffers(const char* why)
+{
+    const size_t kb = (saveFile.GetAllocated() + stringsFile.GetAllocated()) / 1024;
+    if (kb == 0) {
+        return;
+    }
+    saveFile.Clear(true);
+    stringsFile.Clear(true);
+    common->Printf("vita: save buffers released (%u KB, %s)\n", (unsigned int)kb, why);
+}
+#endif
+
 /*
 ========================
 idCommonLocal::OnSaveCompleted
@@ -974,6 +1139,11 @@ void idCommonLocal::OnSaveCompleted(idSaveLoadParms& parms)
     assert(pipelineFile != NULL);
     delete pipelineFile;
     pipelineFile = NULL;
+#if defined(__vita__)
+    vitaLastSaveBytes = saveFile.Length();
+    vitaLastStringsBytes = stringsFile.Length();
+    VitaReleaseSaveBuffers("saved");
+#endif
 
     if (parms.GetError() == SAVEGAME_E_NONE) {
         game->Shell_UpdateSavedGames();

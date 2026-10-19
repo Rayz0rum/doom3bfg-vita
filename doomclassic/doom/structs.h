@@ -172,6 +172,19 @@ typedef enum
 	nightmare,
 	newg_end
 } newgame_e;
+#if defined(__vita__)
+// Vita: Camera Sensitivity (the right stick's turn speed) and Sound Volume
+// first, then Messages; Fullscreen (nothing to do on the Vita) and Gamepad
+// (always on) are gone
+typedef enum
+{
+	mousesens,
+	option_empty2,
+	soundvol,
+	messages,
+	opt_end
+} options_e;
+#else
 typedef enum
 {
 	endgame,
@@ -184,6 +197,7 @@ typedef enum
 	soundvol,
 	opt_end
 } options_e;
+#endif
 typedef enum
 {
 	rdthsempty1,

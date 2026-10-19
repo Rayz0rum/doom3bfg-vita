@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #include "../Game_local.h"
 
@@ -110,9 +111,9 @@ idMoveState::Restore
 */
 void idMoveState::Restore(idRestoreGame* savefile)
 {
-    savefile->ReadInt((int&)moveType);
-    savefile->ReadInt((int&)moveCommand);
-    savefile->ReadInt((int&)moveStatus);
+    savefile->ReadEnum(moveType);
+    savefile->ReadEnum(moveCommand);
+    savefile->ReadEnum(moveStatus);
     savefile->ReadVec3(moveDest);
     savefile->ReadVec3(moveDir);
     goalEntity.Restore(savefile);
@@ -1117,16 +1118,111 @@ idAI::Think
 =====================
 */
 idCVar ai_think("ai_think", "1", CVAR_BOOL, "for testing..");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_aiHalfRateThinkDistance("vita_aiHalfRateThinkDistance", "256", CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: living monsters farther than this from the player think every other tic, two tics at a time (script, movement, animation, physics; monsters take turns); 0 = every tic");
+extern idCVar vita_afHalfRate; // Entity.cpp
+idCVar vita_afMaxPerTic("vita_afMaxPerTic", "2", CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: at most this many dead monsters' ragdolls simulate in a tic; one over it waits one more tic (at most three between its steps); 0 = no budget");
+
+/*
+=====================
+idAI::VitaRagdollBudget
+
+Whether this ragdoll may simulate this tic: under the budget (counted per
+game tic), or it has already waited three tics. True counts it.
+=====================
+*/
+bool idAI::VitaRagdollBudget()
+{
+    static int budgetFrame = -1;
+    static int usedThisTic = 0;
+    if (budgetFrame != gameLocal.framenum) {
+        budgetFrame = gameLocal.framenum;
+        usedThisTic = 0;
+    }
+    const int maxPerTic = vita_afMaxPerTic.GetInteger();
+    const int tic = Max(1, gameLocal.time - gameLocal.previousTime);
+    const bool waitedThree = (vitaLastThinkTime <= 0) || (gameLocal.time - vitaLastThinkTime >= 3 * tic);
+    if (maxPerTic > 0 && usedThisTic >= maxPerTic && !waitedThree) {
+        return false;
+    }
+    usedThisTic++;
+    if (waitedThree && vitaLastThinkTime > 0) {
+        VITA_ZONE_COUNT("ragdoll steps covering three tics (budget)");
+    }
+    return true;
+}
+idCVar vita_aiMoveSearchRetryMs("vita_aiMoveSearchRetryMs", "1000", CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: a monster's failed search for a spot out of range or in cover is not repeated for the same target for this many ms; 0 = every time");
+idCVar vita_aiScriptHalfRateDistance("vita_aiScriptHalfRateDistance", "384", CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: monsters farther than this from the player run their script and enemy tracking every other tic (movement and animation stay every tic); 0 = every tic");
+idCVar vita_aiFarDistance("vita_aiFarDistance", "512", CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: monsters farther than this from their enemy check whether it is reachable every other tic; 0 = every tic");
+#endif
 void idAI::Think()
 {
     // if we are completely closed off from the player, don't do anything at all
+    // (Vita: counted, not timed - 150 checks a frame of ~1 us each, which the
+    // clock reads around them cost more than; the time is in idAI's own)
     if (CheckDormant()) {
+        VITA_ZONE_COUNT("ai thinks skipped (dormant: closed off from the player)");
         return;
     }
 
     if (!ai_think.GetBool()) {
         return;
     }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): a living monster farther than
+    // vita_aiHalfRateThinkDistance from the player (moving by its animation),
+    // and a ragdoll (vita_afHalfRate), think every other tic, two tics at a
+    // time (idEntity::VitaHalfRateTic)
+    vitaThinkSpan_t vitaSpan(&vitaLastThinkTime);
+    extern bool vita_fullQuality;
+    // characters on the player's side (Brooks, the scientists, marines) run
+    // the story: no cut ever touches them; nor anything during a cinematic
+    const bool vitaStory = vita_fullQuality || VitaIsStoryCharacter();
+    if ((thinkFlags & TH_THINK) && !num_cinematics && !vitaStory) {
+        bool vitaWanted = false;
+        const bool vitaDead = (move.moveType == MOVETYPE_DEAD);
+        if (vitaDead) {
+            vitaWanted = vita_afHalfRate.GetBool() && af.IsActive();
+        } else if (health > 0 && (move.moveType == MOVETYPE_ANIM || move.moveType == MOVETYPE_FLY) && vita_aiHalfRateThinkDistance.GetFloat() > 0.0f) {
+            const idPlayer* vitaPlayer = gameLocal.GetLocalPlayer();
+            vitaWanted = vitaPlayer != NULL && (vitaPlayer->GetPhysics()->GetOrigin() - physicsObj.GetOrigin()).LengthSqr() > Square(vita_aiHalfRateThinkDistance.GetFloat());
+            // only where the player can not see it move in 15 Hz steps: out
+            // of the potentially visible set, or outside the view (a 70
+            // degree half-angle cone: the view's ~45 plus margin for turning)
+            if (vitaWanted && gameLocal.InPlayerPVS(this)) {
+                idVec3 toMe = physicsObj.GetAbsBounds().GetCenter() - vitaPlayer->GetEyePosition();
+                toMe.Normalize();
+                if (toMe * vitaPlayer->firstPersonViewAxis[0] > 0.34f) {
+                    vitaWanted = false;
+                    VITA_ZONE_COUNT("half-rate think refused: far monster in view (it would move in 15 Hz steps)");
+                }
+            }
+        }
+        int vitaTic = VitaHalfRateTic(vitaWanted);
+        // ragdolls also share a budget: at most vita_afMaxPerTic of them
+        // simulate in a tic; one over it that thought two tics ago waits a
+        // third (it then covers three); never longer (VitaRagdollBudget)
+        if (vitaDead && vitaWanted && vitaTic != VITA_THINK_SKIP && !VitaRagdollBudget()) {
+            VITA_ZONE_COUNT("ragdolls waiting a third tic (vita_afMaxPerTic: budget spent this tic)");
+            vitaTic = VITA_THINK_SKIP;
+            vitaSpan.lastThink = &vitaSpanUnused;
+            return;
+        }
+        if (vitaTic == VITA_THINK_SKIP) {
+            if (vitaDead) {
+                VITA_ZONE_COUNT("half-rate think: ragdoll (dead monster) tics off (vita_afHalfRate)");
+            } else {
+                VITA_ZONE_COUNT("half-rate think: far monster tics off (vita_aiHalfRateThinkDistance)");
+            }
+            vitaSpan.lastThink = &vitaSpanUnused; // not a think that ran
+            return;
+        }
+        if (vitaTic == VITA_THINK_TWO_TICS) {
+            vitaSpan.Span();
+        }
+    }
+#endif
 
     if (thinkFlags & TH_THINK) {
         // clear out the enemy when he dies or is hidden
@@ -1155,11 +1251,13 @@ void idAI::Think()
             walkIK.ClearJointMods();
 
             switch (move.moveType) {
-            case MOVETYPE_DEAD:
+            case MOVETYPE_DEAD: {
                 // dead monsters
                 UpdateAIScript();
+                VITA_ZONE("ai dead move");
                 DeadMove();
                 break;
+            }
 
             case MOVETYPE_FLY:
                 // flying monsters
@@ -1179,14 +1277,36 @@ void idAI::Think()
                 CheckBlink();
                 break;
 
-            case MOVETYPE_ANIM:
+            case MOVETYPE_ANIM: {
                 // animation based movement
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                // Vita (a cut): a monster farther than
+                // vita_aiScriptHalfRateDistance from the player runs its
+                // script and enemy tracking on alternate tics (monsters take
+                // turns); its movement, animation and physics stay every tic
+                vitaScriptSkipped = false;
+                if (vita_aiScriptHalfRateDistance.GetFloat() > 0.0f && !vitaStory && ((gameLocal.framenum + entityNumber) & 1)) {
+                    const idPlayer* vitaPlayer = gameLocal.GetLocalPlayer();
+                    if (vitaPlayer != NULL && (vitaPlayer->GetPhysics()->GetOrigin() - physicsObj.GetOrigin()).LengthSqr() > Square(vita_aiScriptHalfRateDistance.GetFloat())) {
+                        vitaScriptSkipped = true;
+                    }
+                }
+                if (vitaScriptSkipped) {
+                    VITA_ZONE_COUNT("ai script + enemy tracking skipped this tic (beyond vita_aiScriptHalfRateDistance)");
+                } else {
+                    UpdateEnemyPosition();
+                    UpdateAIScript();
+                }
+#else
                 UpdateEnemyPosition();
                 UpdateAIScript();
+#endif
                 AnimMove();
+                VITA_ZONE("ai chatter + blink");
                 PlayChatter();
                 CheckBlink();
                 break;
+            }
 
             case MOVETYPE_SLIDE:
                 // velocity based movement
@@ -1200,14 +1320,26 @@ void idAI::Think()
         }
 
         // clear pain flag so that we recieve any damage between now and the next time we run the script
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // (not on a tic the script was skipped: it has not seen them yet)
+        if (!vitaScriptSkipped) {
+            AI_PAIN = false;
+            AI_SPECIAL_DAMAGE = 0;
+            AI_PUSHED = false;
+        }
+        vitaScriptSkipped = false;
+#else
         AI_PAIN = false;
         AI_SPECIAL_DAMAGE = 0;
         AI_PUSHED = false;
+#endif
     } else if (thinkFlags & TH_PHYSICS) {
+        VITA_ZONE("ai physics only (not thinking)");
         RunPhysics();
     }
 
     if (af_push_moveables) {
+        VITA_ZONE("ai push with AF");
         PushWithAF();
     }
 
@@ -1221,9 +1353,17 @@ void idAI::Think()
             }
     */
 
+    // (Vita: muzzle flash, particles and damage effects used to be zones of
+    // their own: ~1 us of work under ~1.5 us of clock reads each, 40 to 60
+    // times a frame; their time is in idAI's own now)
     UpdateMuzzleFlash();
     UpdateAnimation();
     UpdateParticles();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // a living monster may be skinned at 15 Hz when far and not looked at
+    // (vita_animLOD, tr_frontend_addmodels.cpp); never a corpse or a ragdoll
+    renderEntity.vitaHalfRateAnim = (health > 0 && !af.IsActive() && move.moveType != MOVETYPE_DEAD && !VitaIsStoryCharacter()) ? 1 : 0;
+#endif
     Present();
     UpdateDamageEffects();
     LinkCombat();
@@ -1274,6 +1414,7 @@ idAI::UpdateAIScript
 */
 void idAI::UpdateAIScript()
 {
+    VITA_ZONE("ai script");
     UpdateScript();
 
     // clear the hit enemy flag so we catch the next time we hit someone
@@ -1482,6 +1623,7 @@ idAI::PathToGoal
 */
 bool idAI::PathToGoal(aasPath_t& path, int areaNum, const idVec3& origin, int goalAreaNum, const idVec3& goalOrigin) const
 {
+    VITA_ZONE("ai path to goal");
     idVec3 org;
     idVec3 goal;
 
@@ -1885,6 +2027,18 @@ bool idAI::MoveOutOfRange(idEntity* ent, float range)
         return false;
     }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): a search that failed is not tried again for the same
+    // target and range for vita_aiMoveSearchRetryMs - a script asking every
+    // frame (a lost soul's combat_retreat) got the same failure each time
+    if (vitaOutOfRangeFailEnt == ent && vitaOutOfRangeFailRange == range && gameLocal.time - vitaOutOfRangeFailTime < vita_aiMoveSearchRetryMs.GetInteger()) {
+        VITA_ZONE_COUNT("ai moveOutOfRange: failed search not repeated yet (vita_aiMoveSearchRetryMs)");
+        StopMove(MOVE_STATUS_DEST_UNREACHABLE);
+        AI_DEST_UNREACHABLE = true;
+        return false;
+    }
+#endif
+
     const idVec3& org = physicsObj.GetOrigin();
     areaNum = PointReachableAreaNum(org);
 
@@ -1899,6 +2053,11 @@ bool idAI::MoveOutOfRange(idEntity* ent, float range)
 
     idAASFindAreaOutOfRange findGoal(pos, range);
     if (!aas->FindNearestGoal(goal, areaNum, org, pos, travelFlags, &obstacle, 1, findGoal)) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        vitaOutOfRangeFailEnt = ent;
+        vitaOutOfRangeFailRange = range;
+        vitaOutOfRangeFailTime = gameLocal.time;
+#endif
         StopMove(MOVE_STATUS_DEST_UNREACHABLE);
         AI_DEST_UNREACHABLE = true;
         return false;
@@ -2050,8 +2209,22 @@ bool idAI::MoveToCover(idEntity* entity, const idVec3& hideFromPos)
     // consider the entity the monster tries to hide from as an obstacle
     obstacle.absBounds = entity->GetPhysics()->GetAbsBounds();
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // (as in MoveOutOfRange: a failed search waits before it is tried again)
+    if (vitaCoverFailEnt == entity && vitaCoverFailPos == hideFromPos && gameLocal.time - vitaCoverFailTime < vita_aiMoveSearchRetryMs.GetInteger()) {
+        VITA_ZONE_COUNT("ai moveToCover: failed search not repeated yet (vita_aiMoveSearchRetryMs)");
+        StopMove(MOVE_STATUS_DEST_UNREACHABLE);
+        AI_DEST_UNREACHABLE = true;
+        return false;
+    }
+#endif
     idAASFindCover findCover(hideFromPos);
     if (!aas->FindNearestGoal(hideGoal, areaNum, org, hideFromPos, travelFlags, &obstacle, 1, findCover)) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        vitaCoverFailEnt = entity;
+        vitaCoverFailPos = hideFromPos;
+        vitaCoverFailTime = gameLocal.time;
+#endif
         StopMove(MOVE_STATUS_DEST_UNREACHABLE);
         AI_DEST_UNREACHABLE = true;
         return false;
@@ -2768,6 +2941,7 @@ idAI::AnimMove
 */
 void idAI::AnimMove()
 {
+    VITA_ZONE("ai anim move");
     idVec3 goalPos;
     idVec3 delta;
     idVec3 goalDelta;
@@ -2786,6 +2960,7 @@ void idAI::AnimMove()
     }
 
     move.obstacle = NULL;
+    VITA_ZONE_BEGIN(steer, "ai anim move: steering (move pos, obstacles, turn)");
     if ((move.moveCommand == MOVE_FACE_ENEMY) && enemy.GetEntity()) {
         TurnToward(lastVisibleEnemyPos);
         goalPos = oldorigin;
@@ -2794,6 +2969,7 @@ void idAI::AnimMove()
         goalPos = oldorigin;
     } else if (GetMovePos(goalPos)) {
         if (move.moveCommand != MOVE_WANDER) {
+            VITA_ZONE("ai anim move: obstacle avoidance");
             CheckObstacleAvoidance(goalPos, newDest);
             TurnToward(newDest);
         } else {
@@ -2802,6 +2978,7 @@ void idAI::AnimMove()
     }
 
     Turn();
+    VITA_ZONE_END(steer);
 
     if (move.moveCommand == MOVE_SLIDE_TO_POSITION) {
         if (gameLocal.time < move.startTime + move.duration) {
@@ -2814,6 +2991,7 @@ void idAI::AnimMove()
             StopMove(MOVE_STATUS_DONE);
         }
     } else if (allowMove) {
+        VITA_ZONE("ai anim move: animation delta");
         GetMoveDelta(oldaxis, viewAxis, delta);
     } else {
         delta.Zero();
@@ -2831,7 +3009,9 @@ void idAI::AnimMove()
     physicsObj.SetDelta(delta);
     physicsObj.ForceDeltaMove(disableGravity);
 
+    VITA_ZONE_BEGIN(physics, "ai anim move: physics");
     RunPhysics();
+    VITA_ZONE_END(physics);
 
     if (ai_debugMove.GetBool()) {
         gameRenderWorld->DebugLine(colorCyan, oldorigin, physicsObj.GetOrigin(), 5000);
@@ -2890,6 +3070,7 @@ idAI::SlideMove
 */
 void idAI::SlideMove()
 {
+    VITA_ZONE("ai slide move");
     idVec3 goalPos;
     idVec3 delta;
     idVec3 goalDelta;
@@ -3932,6 +4113,7 @@ idAI::UpdateEnemyPosition
 */
 void idAI::UpdateEnemyPosition()
 {
+    VITA_ZONE("ai enemy position");
     idActor* enemyEnt = enemy.GetEntity();
     int enemyAreaNum;
     int areaNum;
@@ -3963,11 +4145,22 @@ void idAI::UpdateEnemyPosition()
             enemyAreaNum = 0;
             lastReachableEnemyPos = enemyPos;
         } else {
-            enemyAreaNum = PointReachableAreaNum(enemyPos, 1.0f);
-            if (enemyAreaNum) {
-                areaNum = PointReachableAreaNum(org);
-                if (PathToGoal(path, areaNum, org, enemyAreaNum, enemyPos)) {
-                    lastReachableEnemyPos = enemyPos;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            // Vita (a fidelity cut): an enemy farther than vita_aiFarDistance
+            // has its reachability (a path search) checked every other tic,
+            // monsters taking turns; seeing and hearing it stay every tic
+            const float farDist = vita_aiFarDistance.GetFloat();
+            if (farDist > 0.0f && ((gameLocal.framenum + entityNumber) & 1) && (enemyPos - org).LengthSqr() > Square(farDist)) {
+                VITA_ZONE_COUNT("ai enemy reachability skipped this tic (beyond vita_aiFarDistance)");
+            } else
+#endif
+            {
+                enemyAreaNum = PointReachableAreaNum(enemyPos, 1.0f);
+                if (enemyAreaNum) {
+                    areaNum = PointReachableAreaNum(org);
+                    if (PathToGoal(path, areaNum, org, enemyAreaNum, enemyPos)) {
+                        lastReachableEnemyPos = enemyPos;
+                    }
                 }
             }
         }

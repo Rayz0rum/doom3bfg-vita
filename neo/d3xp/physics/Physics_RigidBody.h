@@ -200,6 +200,19 @@ private:
     bool testSolid;    // true if testing for solid when dropping to the floor
     bool noImpact;     // if true do not activate when another object collides
     bool noContact;    // if true do not determine contacts and no contact friction
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+public:
+    // Vita: sweep only the translation for collisions (the rotation is still
+    // integrated) - debris (vita_debrisTranslationSweep)
+    bool vitaTranslationSweepOnly = false;
+private:
+#endif
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK) // VITA_PHYSCHECK (VitaPhysCheck.h comes later)
+    int vpcSince;       // gameLocal.time it started moving, -1 at rest
+    idVec3 vpcFrom;     // where it started
+    float vpcTopSpeed;
+    bool vpcOutLogged;
+#endif
 
     // master
     bool hasMaster;

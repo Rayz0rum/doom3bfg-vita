@@ -32,6 +32,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#endif
+
 idRenderProgManager renderProgManager;
 
 /*
@@ -118,6 +122,8 @@ void idRenderProgManager::Init()
         //		{ BUILTIN_MOTION_BLUR, "motionBlur.vfp", false },
         { BUILTIN_SHADOW, "shadow.vfp", false },
         { BUILTIN_SHADOW_SKINNED, "shadow_skinned.vfp", true },
+        // postprocess's own source, never filtered (RenderProgs_GLSL.cpp)
+        { BUILTIN_POSTPROCESS_PLAIN, "postprocess_plain.vfp", false },
     };
     int numBuiltins = sizeof(builtins) / sizeof(builtins[0]);
     vertexShaders.SetNum(numBuiltins);
@@ -134,10 +140,42 @@ void idRenderProgManager::Init()
             continue;
         }
 
+#if defined(__vita__)
+        // Name each stage before touching it, so a crash inside vitaGL's
+        // translator or ShaccCg is attributable to a specific shader.
+        Vita_Checkpoint("shader %d/%d: %s vertex", i + 1, numBuiltins, builtins[i].name);
+#endif
         LoadVertexShader(i);
+#if defined(__vita__)
+        Vita_Checkpoint("shader %d/%d: %s pixel", i + 1, numBuiltins, builtins[i].name);
+#endif
         LoadFragmentShader(i);
+#if defined(__vita__)
+        Vita_Checkpoint("shader %d/%d: %s link", i + 1, numBuiltins, builtins[i].name);
+#endif
         LoadGLSLProgram(i, i, i);
     }
+#if defined(__vita__)
+    // Shader compilation goes through vitaGL's GLSL->Cg translator and ShaccCg;
+    // if any builtin fails this is the last line before the renderer misbehaves.
+    Vita_Checkpoint("RenderProgs: %d builtin shaders loaded", numBuiltins);
+
+    // ShaccCg allocates through vglMalloc (vitaGL's startShaderCompiler() hands
+    // it vglMalloc/vglFree), so Sony's Cg compiler is holding working memory in
+    // the same pool the renderer allocates textures and buffers from - measured
+    // at ~136 MB of RAM pool and ~70 MB of VRAM across these 31 programs, none
+    // of it returned. That is most of the budget, and it left a map load with
+    // 174 KB to work with.
+    //
+    // Every builtin is compiled by the loop above and nothing afterwards needs
+    // the compiler, so release it here. This is glReleaseShaderCompiler() doing
+    // exactly what it is specified to do, and it is safe rather than one-way:
+    // vitaGL's compile paths all test is_shark_online and call
+    // startShaderCompiler() again if something ever does need to compile.
+    Vita_LogMemory("before glReleaseShaderCompiler");
+    qglReleaseShaderCompiler();
+    Vita_LogMemory("after  glReleaseShaderCompiler");
+#endif
 
     // special case handling for fastZ shaders
     /*
@@ -364,6 +402,31 @@ void idRenderProgManager::BindShader(int progIndex, int vIndex, int fIndex, bool
 
         currentVertexShader = vIndex;
         currentFragmentShader = fIndex;
+
+        static idList<byte> deferredTried; // once per program: a failure must not recompile every draw
+        if (progIndex >= 0 && progIndex < glslPrograms.Num() && glslPrograms[progIndex].progId == INVALID_PROGID
+            && (progIndex >= deferredTried.Num() || deferredTried[progIndex] == 0)) {
+            while (deferredTried.Num() <= progIndex) {
+                deferredTried.Append(0);
+            }
+            deferredTried[progIndex] = 1;
+            // its material was parsed off the GL thread: compile and link now
+            extern bool r_deferredGLAllowed;
+            r_deferredGLAllowed = true;
+            if (vIndex >= 0) {
+                LoadVertexShader(vIndex);
+            }
+            if (fIndex >= 0) {
+                LoadFragmentShader(fIndex);
+            }
+            LoadGLSLProgram(progIndex, vIndex, fIndex);
+            r_deferredGLAllowed = false;
+            static int logged = 0;
+            if (logged++ < 8) {
+                common->Printf("program %d ('%s') compiled at its first use: %s\n", progIndex, glslPrograms[progIndex].name.c_str(),
+                    glslPrograms[progIndex].progId != INVALID_PROGID ? "ok" : "FAILED");
+            }
+        }
 
         if (progIndex >= 0 && progIndex < glslPrograms.Num()) {
             currentRenderProgram = progIndex;

@@ -30,6 +30,9 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "Common_local.h"
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#endif
 
 idCVar com_logFile("logFile", "0", CVAR_SYSTEM | CVAR_NOCHEAT, "1 = buffer log, 2 = flush after each print", 0, 2, idCmdSystem::ArgCompletion_Integer<0, 2>);
 idCVar com_logFileName("logFileName", "qconsole.log", CVAR_SYSTEM | CVAR_NOCHEAT, "name of log file, if empty, qconsole.log will be used");
@@ -162,8 +165,20 @@ void idCommonLocal::VPrintf(const char* fmt, va_list args)
 #endif
 
     if (!idLib::IsMainThread()) {
+#if defined(__vita__)
+        // stdout goes nowhere on the Vita: without this, everything the
+        // game/draw thread printed - errors included - vanished
+        static int offThreadLines = 0;
+        if (offThreadLines < 20000) {
+            offThreadLines++;
+            idStr::RemoveColors(msg);
+            Vita_Log(msg);
+            if (offThreadLines == 20000) {
+                Vita_Log("(further game/draw thread output is not logged)\n");
+            }
+        }
+#elif defined(_WIN32)
         // RB: printf should be thread-safe on Linux
-#if defined(_WIN32)
         OutputDebugString(msg);
 #else
         printf("%s", msg);
@@ -322,6 +337,19 @@ void idCommonLocal::Warning(const char* fmt, ...)
     char msg[MAX_PRINT_MSG_SIZE];
 
     if (!idLib::IsMainThread()) {
+#if defined(__vita__)
+        // the warning list is not thread safe, but the card log is
+        static int offThreadWarnings = 0;
+        if (offThreadWarnings < 100) {
+            offThreadWarnings++;
+            va_start(argptr, fmt);
+            idStr::vsnPrintf(msg, sizeof(msg), fmt, argptr);
+            va_end(argptr);
+            msg[sizeof(msg) - 1] = 0;
+            idStr::RemoveColors(msg);
+            Vita_Checkpoint("WARNING (game/draw thread): %s", msg);
+        }
+#endif
         return; // not thread safe!
     }
 
@@ -331,6 +359,9 @@ void idCommonLocal::Warning(const char* fmt, ...)
     msg[sizeof(msg) - 1] = 0;
 
     Printf(S_COLOR_YELLOW "WARNING: " S_COLOR_RED "%s\n", msg);
+
+    extern void VitaVerify_NoteWarning(const char* msg);
+    VitaVerify_NoteWarning(msg);
 
     if (warningList.Num() < MAX_WARNING_LIST) {
         warningList.AddUnique(msg);
@@ -488,12 +519,29 @@ void idCommonLocal::Error(const char* fmt, ...)
     va_end(argptr);
     errorMessage[sizeof(errorMessage) - 1] = '\0';
 
+    extern void VitaVerify_NoteError(const char* msg);
+    VitaVerify_NoteError(errorMessage);
+
+#if defined(__vita__)
+    // first, before anything below can hang or crash: the card log
+    Vita_Checkpoint("ERROR (%s thread, code %d): %s", idLib::IsMainThread() ? "main" : "game/draw", (int)code, errorMessage);
+#endif
+
     // copy the error message to the clip board
     Sys_SetClipboardData(errorMessage);
 
     // add the message to the error list
     errorList.AddUnique(errorMessage);
 
+#if defined(__vita__)
+    // Stop() tears the map and menus down and is only safe on the main
+    // thread; an error from the game/draw thread is raised again there
+    // (idSysThread::ThreadProc -> idCommonLocal::Frame), which stops then.
+    if (!idLib::IsMainThread()) {
+        com_errorEntered = ERP_NONE;
+        throw idException(errorMessage);
+    }
+#endif
     Stop();
 
     if (code == ERP_DISCONNECT) {
@@ -507,9 +555,14 @@ void idCommonLocal::Error(const char* fmt, ...)
         Printf("********************\nERROR: %s\n********************\n", errorMessage);
     }
 
+#if !defined(__vita__)
+    // Dropping out of fullscreen exists so a desktop error dialog is visible.
+    // The Vita has no windowed mode and no dialog, and tearing the GL context
+    // down inside the error path risks losing the message that got us here.
     if (cvarSystem->GetCVarBool("r_fullscreen")) {
         cmdSystem->BufferCommandText(CMD_EXEC_NOW, "vid_restart partial windowed\n");
     }
+#endif
 
     Sys_Error("%s", errorMessage);
 }
@@ -554,10 +607,21 @@ void idCommonLocal::FatalError(const char* fmt, ...)
     idStr::vsnPrintf(errorMessage, sizeof(errorMessage), fmt, argptr);
     va_end(argptr);
     errorMessage[sizeof(errorMessage) - 1] = '\0';
+#if defined(__vita__)
+    Vita_Checkpoint("FATAL ERROR (%s thread): %s", idLib::IsMainThread() ? "main" : "game/draw", errorMessage);
+#else
+    // into the log as well (automated PC runs show no error window)
+    Printf("FATAL ERROR: %s\n", errorMessage);
+#endif
 
+#if !defined(__vita__)
+    // Dropping out of fullscreen exists so a desktop error dialog is visible.
+    // The Vita has no windowed mode and no dialog, and tearing the GL context
+    // down inside the error path risks losing the message that got us here.
     if (cvarSystem->GetCVarBool("r_fullscreen")) {
         cmdSystem->BufferCommandText(CMD_EXEC_NOW, "vid_restart partial windowed\n");
     }
+#endif
 
     Sys_SetFatalError(errorMessage);
 

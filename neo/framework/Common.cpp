@@ -28,6 +28,14 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "precompiled.h"
+
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#include "../sys/vita/vita_ui.h"
+#define VITA_PHASE(x) do { VITA_MARK("init: " x); Vita_Checkpoint("init: " x); Vita_LogMemory(x); } while (0)
+#else
+#define VITA_PHASE(x)
+#endif
 #pragma hdrstop
 
 #include "Common_local.h"
@@ -61,6 +69,17 @@ struct version_s {
     char string[256];
 } version;
 
+/*
+Vita full quality (vita_cinematicFullQuality): while a cinematic plays every
+fidelity cut is off - animation at 15 Hz (vita_animLOD), half-rate AI,
+particle thinning, the animated-model light limit, small-light drops and the
+light cap, world screens and HUD at a lower rate, the screen copy reuse.
+Cutscenes showed them: a man's suitcase moving at 15 Hz, parts of characters
+going dark as their lights were cut and brought back. Set by the game every
+frame (idGameLocal::RunFrame).
+*/
+bool vita_fullQuality = false;
+
 idCVar com_version("si_version", version.string, CVAR_SYSTEM | CVAR_ROM | CVAR_SERVERINFO, "engine version");
 idCVar com_forceGenericSIMD("com_forceGenericSIMD", "0", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "force generic platform independent SIMD");
 
@@ -82,7 +101,29 @@ idCVar com_productionMode("com_productionMode", "0", CVAR_SYSTEM | CVAR_BOOL, "0
 
 idCVar com_japaneseCensorship("com_japaneseCensorship", "0", CVAR_NOCHEAT, "Enable Japanese censorship");
 
+#if defined(__vita__)
+// The preload walks _common.preload and resident-loads 362 images and every
+// common sound up front. On a console this small that is the difference
+// between reaching the menu and running the GPU pools dry: the shell's own 30
+// images already take vitaGL from 13.8 MB of free VRAM down to 0.3 MB, and the
+// preload then fails allocating a 1.2 MB sound sample. Nothing needs it - every
+// asset still loads on demand the first time it is referenced - so the cost is
+// hitching, not correctness, and it also saves ~18 s of boot.
+idCVar preload_CommonAssets("preload_CommonAssets", "0", CVAR_SYSTEM | CVAR_BOOL, "preload common assets");
+#else
 idCVar preload_CommonAssets("preload_CommonAssets", "1", CVAR_SYSTEM | CVAR_BOOL, "preload common assets");
+#endif
+
+#if defined(__vita__)
+// Set in autoexec.cfg to boot straight into a map, e.g. "game/mp/d3xpdm2".
+// Consumed by AddStartupCommands(), which is where the engine defers
+// command-line startup commands to - see the note there for why a bare devmap
+// in autoexec.cfg cannot work.
+// Not CVAR_INIT: despite the wording of the rejection message, that flag means
+// command line only, and an autoexec.cfg exec does not qualify - the cvar stayed
+// empty and no map was ever queued.
+idCVar vita_startupMap("vita_startupMap", "", CVAR_SYSTEM, "Vita: devmap this map once startup completes");
+#endif
 
 idCVar net_inviteOnly("net_inviteOnly", "1", CVAR_BOOL | CVAR_ARCHIVE, "whether or not the private server you create allows friends to join or invite only");
 
@@ -93,6 +134,17 @@ idCVar com_pause("com_pause", "0", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "set 
 extern idCVar g_demoMode;
 
 idCVar com_engineHz("com_engineHz", "60", CVAR_FLOAT | CVAR_ARCHIVE, "Frames per second the engine runs at", 10.0f, 1024.0f);
+#if defined(__vita__)
+// DOOM 3's game logic rate in maps on the Vita (com_engineHz is not used
+// there): 30 is one game tic per 30 fps frame - half the AI, script, physics
+// and animation work of id's 60, which a fight could not fit in a frame. The
+// title screen and menus keep 60 (their animation follows the game tics).
+// The game is built for any rate (BFG's GAME_FPS for the scripts, physics
+// and animation in milliseconds); VitaPhysCheck.h measures that it plays the
+// same. Applied at the next map load.
+idCVar vita_gameHz("vita_gameHz", "30", CVAR_ARCHIVE | CVAR_INTEGER, "Vita: DOOM 3's game tics per second in maps (30 or 60; menus are always 60)", 30, 60);
+idCVar vita_tuningVersion("vita_tuningVersion", "0", CVAR_ARCHIVE | CVAR_INTEGER, "Vita: the performance settings version the config was saved with (older ones are reset at startup)");
+#endif
 float com_engineHz_latched = 60.0f; // Latched version of cvar, updated between map loads
 int64 com_engineHz_numerator = 100LL * 1000LL;
 int64 com_engineHz_denominator = 100LL * 60LL;
@@ -178,6 +230,10 @@ idCommonLocal::idCommonLocal()
     insideExecuteMapChange = false;
 
     mapSpawnData.savegameFile = NULL;
+#if defined(__vita__)
+    vitaLastSaveBytes = 0;
+    vitaLastStringsBytes = 0;
+#endif
 
     currentMapName.Clear();
     aviDemoShortName.Clear();
@@ -348,6 +404,21 @@ void idCommonLocal::AddStartupCommands()
         // directly as tokenized so nothing gets screwed
         cmdSystem->BufferCommandArgs(CMD_EXEC_APPEND, com_consoleLines[i]);
     }
+
+#if defined(__vita__)
+    // There is no command line to pass "+devmap x" on, and putting devmap in
+    // autoexec.cfg does not work: that file is exec'd from within Init() long
+    // before R_InitOpenGL, so the map load starts with no renderer and takes
+    // the process down before the first log line after "execing autoexec.cfg".
+    //
+    // This is the point the engine itself defers startup commands to, so set
+    // vita_startupMap in autoexec.cfg instead and the devmap is queued here,
+    // exactly as a command-line "+devmap" would have been.
+    if (vita_startupMap.GetString()[0] != '\0') {
+        Printf("vita_startupMap: queueing devmap %s\n", vita_startupMap.GetString());
+        cmdSystem->BufferCommandText(CMD_EXEC_APPEND, va("devmap %s\n", vita_startupMap.GetString()));
+    }
+#endif
 }
 
 /*
@@ -457,6 +528,14 @@ idCmdSystemLocal::PrintMemInfo_f
 This prints out memory debugging data
 ============
 */
+#if defined(ID_TEST_CLASSIC_MT)
+// PC test builds: start DOOM straight from the console (the threaded classic renderer test)
+CONSOLE_COMMAND(testClassic, "starts classic DOOM (test builds)", NULL)
+{
+    common->SwitchToGame(DOOM_CLASSIC);
+}
+#endif
+
 CONSOLE_COMMAND(printMemInfo, "prints memory debugging data", NULL)
 {
     MemInfo_t mi;
@@ -769,6 +848,10 @@ void idCommonLocal::InitLanguageDict()
     }
 
     fileSystem->FreeFileList(langFiles);
+
+    // the port's own text, in the same language (framework/VitaStrings.cpp)
+    extern void Vita_AddPortStrings(const char* lang);
+    Vita_AddPortStrings(sys_lang.GetString());
 }
 
 /*
@@ -833,8 +916,132 @@ void idCommonLocal::RenderSplash()
     renderSystem->SetColor4(1, 1, 1, 1);
     renderSystem->DrawStretchPic(barWidth, barHeight, renderSystem->GetVirtualWidth() - barWidth * 2.0f, renderSystem->GetVirtualHeight() - barHeight * 2.0f, 0, 0, 1, 1, splashScreen);
 
+    // This build plays no Bink video (the Vita decodes H.264 in hardware), so
+    // the legal screen goes without the Bink Video logo and the "Uses Bink
+    // Video ... RAD Game Tools, Inc." sentence: the screen is redrawn from
+    // pieces of its own image - the logo row up to the Bink logo, then every
+    // remaining word, reflowed into a justified block (equal edges, even word
+    // spacing, the last line at least half full). The rectangles, in the
+    // 1280x720 image's pixels ({ src x0, y0, x1, y1, dst x, y }), come from
+    // tools/vita/legal_reflow.py, which measured the words of the three
+    // images (english, french, figs) and laid them out.
+    if (splashScreen != NULL) {
+    // english: 91 rects
+    static const short legal_english[][6] = {
+        { 73, 292, 640, 392, 73, 292 }, { 78, 409, 175, 436, 78, 409 }, { 178, 409, 201, 436, 183, 409 }, { 205, 409, 259, 436, 214, 409 },
+        { 263, 409, 368, 436, 276, 409 }, { 374, 409, 396, 436, 389, 409 }, { 400, 409, 516, 436, 419, 409 }, { 521, 409, 541, 436, 544, 409 },
+        { 546, 409, 643, 436, 572, 409 }, { 648, 409, 699, 436, 677, 409 }, { 704, 409, 720, 436, 736, 409 }, { 724, 409, 819, 436, 760, 409 },
+        { 824, 409, 891, 436, 863, 409 }, { 895, 409, 1001, 436, 938, 409 }, { 1007, 409, 1115, 436, 78, 438 }, { 79, 438, 182, 465, 197, 438 },
+        { 187, 438, 300, 465, 312, 438 }, { 304, 438, 400, 465, 436, 438 }, { 404, 438, 445, 465, 544, 438 }, { 451, 438, 526, 465, 596, 438 },
+        { 531, 438, 590, 465, 683, 438 }, { 595, 438, 632, 465, 753, 438 }, { 636, 438, 744, 465, 802, 438 }, { 749, 438, 872, 465, 921, 438 },
+        { 876, 438, 1026, 465, 78, 467 }, { 1030, 438, 1152, 465, 234, 467 }, { 79, 467, 146, 492, 362, 467 }, { 151, 467, 190, 492, 435, 467 },
+        { 196, 467, 216, 492, 480, 467 }, { 220, 467, 257, 492, 506, 467 }, { 262, 467, 309, 492, 548, 467 }, { 314, 467, 386, 492, 601, 467 },
+        { 389, 467, 447, 492, 679, 467 }, { 450, 467, 556, 492, 743, 467 }, { 562, 467, 644, 492, 855, 467 }, { 650, 467, 725, 492, 943, 467 },
+        { 732, 467, 752, 492, 1024, 467 }, { 758, 467, 833, 492, 78, 496 }, { 839, 467, 860, 492, 160, 496 }, { 866, 467, 1003, 492, 187, 496 },
+        { 1008, 467, 1032, 492, 331, 496 }, { 1035, 467, 1081, 492, 362, 496 }, { 79, 496, 155, 523, 414, 496 }, { 160, 496, 175, 523, 497, 496 },
+        { 180, 496, 231, 523, 519, 496 }, { 236, 496, 317, 523, 576, 496 }, { 323, 496, 349, 523, 664, 496 }, { 355, 496, 375, 523, 697, 496 },
+        { 380, 496, 482, 523, 723, 496 }, { 488, 496, 508, 523, 832, 496 }, { 513, 496, 568, 523, 859, 496 }, { 573, 496, 615, 523, 920, 496 },
+        { 620, 496, 695, 523, 969, 496 }, { 700, 496, 760, 523, 78, 525 }, { 764, 496, 801, 523, 143, 525 }, { 806, 496, 914, 523, 185, 525 },
+        { 918, 496, 1041, 523, 298, 525 }, { 1045, 496, 1070, 523, 426, 525 }, { 78, 524, 201, 551, 456, 524 }, { 205, 524, 229, 551, 584, 524 },
+        { 232, 524, 252, 551, 613, 524 }, { 257, 524, 354, 551, 638, 524 }, { 359, 524, 405, 551, 740, 524 }, { 410, 524, 430, 551, 791, 524 },
+        { 434, 524, 470, 551, 816, 524 }, { 475, 524, 522, 551, 857, 524 }, { 528, 524, 599, 551, 909, 524 }, { 602, 524, 661, 551, 985, 524 },
+        { 664, 524, 769, 551, 78, 553 }, { 782, 524, 838, 551, 191, 553 }, { 843, 524, 863, 551, 254, 553 }, { 867, 524, 947, 551, 282, 553 },
+        { 959, 524, 1090, 551, 370, 553 }, { 80, 553, 195, 580, 508, 554 }, { 200, 553, 220, 580, 631, 554 }, { 225, 553, 322, 580, 659, 554 },
+        { 327, 553, 378, 580, 764, 554 }, { 77, 582, 107, 609, 822, 554 }, { 111, 582, 295, 609, 860, 554 }, { 299, 582, 324, 609, 78, 583 },
+        { 327, 582, 385, 609, 108, 583 }, { 390, 582, 463, 609, 171, 583 }, { 468, 582, 505, 609, 249, 583 }, { 508, 582, 545, 609, 291, 583 },
+        { 550, 582, 640, 609, 333, 583 }, { 644, 582, 721, 609, 428, 583 }, { 724, 582, 836, 609, 510, 583 }, { 840, 582, 925, 609, 627, 583 },
+        { 930, 582, 959, 609, 717, 583 }, { 965, 582, 1034, 609, 751, 583 }, { 1039, 582, 1149, 609, 825, 583 },
+    };
+    // french: 105 rects
+    static const short legal_french[][6] = {
+        { 73, 292, 640, 392, 73, 292 }, { 81, 414, 178, 439, 78, 414 }, { 181, 414, 204, 439, 184, 414 }, { 208, 414, 262, 439, 216, 414 },
+        { 266, 414, 371, 439, 280, 414 }, { 377, 414, 399, 439, 394, 414 }, { 403, 414, 519, 439, 425, 414 }, { 524, 414, 544, 439, 550, 414 },
+        { 549, 414, 646, 439, 580, 414 }, { 651, 414, 696, 439, 686, 414 }, { 701, 414, 743, 439, 740, 414 }, { 747, 414, 826, 439, 791, 414 },
+        { 830, 414, 925, 439, 880, 414 }, { 930, 414, 1002, 439, 984, 414 }, { 1015, 414, 1124, 439, 1065, 414 }, { 82, 443, 185, 470, 78, 443 },
+        { 189, 443, 303, 470, 187, 443 }, { 307, 443, 403, 470, 306, 443 }, { 407, 443, 430, 470, 408, 443 }, { 434, 443, 466, 470, 436, 443 },
+        { 471, 443, 531, 470, 474, 443 }, { 535, 443, 631, 470, 540, 443 }, { 635, 443, 683, 470, 641, 443 }, { 687, 443, 728, 470, 695, 443 },
+        { 733, 443, 828, 470, 742, 443 }, { 832, 443, 983, 470, 842, 443 }, { 987, 443, 1015, 470, 999, 443 }, { 1020, 443, 1061, 470, 1032, 443 },
+        { 1066, 443, 1161, 470, 1079, 443 }, { 81, 468, 188, 499, 78, 468 }, { 192, 468, 221, 499, 190, 468 }, { 225, 468, 320, 499, 224, 468 },
+        { 325, 468, 392, 499, 324, 468 }, { 397, 468, 436, 499, 396, 468 }, { 441, 468, 483, 499, 440, 468 }, { 488, 468, 600, 499, 487, 468 },
+        { 604, 468, 659, 499, 604, 468 }, { 664, 468, 719, 499, 664, 468 }, { 723, 468, 810, 499, 724, 468 }, { 815, 468, 873, 499, 816, 468 },
+        { 886, 468, 968, 499, 879, 468 }, { 974, 468, 1049, 499, 966, 468 }, { 1055, 468, 1076, 499, 1046, 468 }, { 1082, 468, 1157, 499, 1072, 468 },
+        { 1162, 468, 1184, 499, 1152, 468 }, { 82, 501, 219, 527, 78, 501 }, { 224, 501, 248, 527, 223, 501 }, { 251, 501, 297, 527, 255, 501 },
+        { 303, 501, 379, 527, 310, 501 }, { 384, 501, 400, 527, 394, 501 }, { 405, 501, 455, 527, 418, 501 }, { 461, 501, 541, 527, 476, 501 },
+        { 547, 501, 573, 527, 565, 501 }, { 579, 501, 599, 527, 599, 501 }, { 604, 501, 707, 527, 627, 501 }, { 713, 501, 733, 527, 738, 501 },
+        { 737, 501, 793, 527, 767, 501 }, { 797, 501, 821, 527, 831, 501 }, { 825, 501, 857, 527, 863, 501 }, { 862, 501, 921, 527, 903, 501 },
+        { 925, 501, 1021, 527, 971, 501 }, { 1025, 501, 1074, 527, 1075, 501 }, { 1077, 501, 1119, 527, 1132, 501 }, { 82, 526, 177, 556, 78, 527 },
+        { 181, 526, 332, 556, 182, 527 }, { 336, 526, 364, 556, 343, 527 }, { 369, 526, 410, 556, 380, 527 }, { 415, 526, 511, 556, 430, 527 },
+        { 515, 526, 621, 556, 536, 527 }, { 625, 526, 655, 556, 651, 527 }, { 659, 526, 679, 556, 690, 527 }, { 684, 526, 781, 556, 719, 527 },
+        { 786, 526, 832, 556, 826, 527 }, { 836, 526, 878, 556, 881, 527 }, { 882, 526, 995, 556, 932, 527 }, { 999, 526, 1054, 556, 1055, 527 },
+        { 1059, 526, 1114, 556, 1119, 527 }, { 81, 558, 168, 585, 78, 559 }, { 173, 558, 231, 585, 170, 559 }, { 244, 558, 311, 585, 233, 559 },
+        { 316, 558, 336, 585, 305, 559 }, { 340, 558, 415, 585, 330, 559 }, { 418, 558, 471, 585, 410, 559 }, { 476, 558, 576, 585, 468, 559 },
+        { 579, 558, 601, 585, 573, 559 }, { 606, 558, 721, 585, 600, 559 }, { 725, 558, 755, 585, 721, 559 }, { 759, 558, 779, 585, 756, 559 },
+        { 784, 558, 881, 585, 781, 559 }, { 886, 558, 938, 585, 883, 559 }, { 675, 587, 731, 614, 940, 559 }, { 736, 587, 768, 614, 1001, 559 },
+        { 772, 587, 842, 614, 1038, 559 }, { 846, 587, 907, 614, 1113, 559 }, { 911, 587, 1001, 614, 78, 588 }, { 1004, 587, 1027, 614, 173, 588 },
+        { 1031, 587, 1126, 614, 201, 588 }, { 81, 616, 231, 643, 301, 588 }, { 235, 616, 250, 643, 456, 588 }, { 255, 616, 309, 643, 476, 588 },
+        { 314, 616, 449, 643, 535, 588 }, { 454, 616, 564, 643, 675, 588 }, { 576, 616, 632, 643, 790, 588 }, { 636, 616, 697, 643, 851, 588 },
+        { 702, 616, 802, 643, 917, 588 },
+    };
+    // figs: 89 rects
+    static const short legal_figs[][6] = {
+        { 73, 292, 640, 392, 73, 292 }, { 78, 413, 201, 440, 78, 413 }, { 205, 413, 259, 440, 207, 413 }, { 262, 413, 368, 440, 268, 413 },
+        { 373, 413, 395, 440, 380, 413 }, { 400, 413, 515, 440, 408, 413 }, { 520, 413, 540, 440, 530, 413 }, { 545, 413, 642, 440, 556, 413 },
+        { 647, 413, 699, 440, 660, 413 }, { 704, 413, 719, 440, 718, 413 }, { 723, 413, 819, 440, 739, 413 }, { 823, 413, 890, 440, 842, 413 },
+        { 895, 413, 1000, 440, 915, 413 }, { 1006, 413, 1115, 440, 78, 442 }, { 78, 442, 181, 469, 192, 442 }, { 186, 442, 299, 469, 300, 442 },
+        { 304, 442, 400, 469, 418, 442 }, { 403, 442, 445, 469, 519, 442 }, { 450, 442, 525, 469, 566, 442 }, { 530, 442, 590, 469, 647, 442 },
+        { 594, 442, 631, 469, 712, 442 }, { 636, 442, 744, 469, 754, 442 }, { 748, 442, 871, 469, 867, 442 }, { 875, 442, 900, 469, 995, 442 },
+        { 903, 442, 1026, 469, 78, 471 }, { 1030, 442, 1054, 469, 207, 471 }, { 77, 471, 173, 496, 237, 471 }, { 177, 471, 244, 496, 339, 471 },
+        { 250, 471, 289, 496, 412, 471 }, { 294, 471, 314, 496, 457, 471 }, { 319, 471, 355, 496, 483, 471 }, { 360, 471, 407, 496, 524, 471 },
+        { 412, 471, 484, 496, 577, 471 }, { 487, 471, 545, 496, 655, 471 }, { 549, 471, 654, 496, 719, 471 }, { 660, 471, 742, 496, 830, 471 },
+        { 748, 471, 824, 496, 918, 471 }, { 830, 471, 850, 496, 1000, 471 }, { 856, 471, 932, 496, 78, 500 }, { 937, 471, 958, 496, 159, 500 },
+        { 964, 471, 1040, 496, 185, 500 }, { 1045, 471, 1060, 496, 267, 500 }, { 1065, 471, 1116, 496, 287, 500 }, { 1122, 471, 1202, 496, 343, 500 },
+        { 78, 500, 104, 527, 428, 500 }, { 110, 500, 130, 527, 459, 500 }, { 135, 500, 238, 527, 485, 500 }, { 244, 500, 264, 527, 593, 500 },
+        { 268, 500, 324, 527, 618, 500 }, { 328, 500, 370, 527, 679, 500 }, { 376, 500, 450, 527, 726, 500 }, { 456, 500, 515, 527, 806, 500 },
+        { 519, 500, 556, 527, 870, 500 }, { 561, 500, 669, 527, 912, 500 }, { 673, 500, 796, 527, 78, 529 }, { 801, 500, 951, 527, 208, 529 },
+        { 955, 500, 980, 527, 365, 529 }, { 983, 500, 1003, 527, 398, 529 }, { 1008, 500, 1105, 527, 425, 529 }, { 1110, 500, 1155, 527, 529, 529 },
+        { 78, 528, 98, 555, 581, 528 }, { 102, 528, 139, 555, 608, 528 }, { 144, 528, 191, 555, 652, 528 }, { 196, 528, 268, 555, 706, 528 },
+        { 271, 528, 329, 555, 786, 528 }, { 332, 528, 438, 555, 851, 528 }, { 451, 528, 507, 555, 964, 528 }, { 512, 528, 532, 555, 78, 557 },
+        { 536, 528, 616, 555, 103, 557 }, { 628, 528, 758, 555, 188, 557 }, { 763, 528, 878, 555, 324, 557 }, { 883, 528, 903, 555, 444, 557 },
+        { 908, 528, 1005, 555, 469, 557 }, { 1010, 528, 1062, 555, 571, 557 }, { 807, 557, 836, 584, 628, 558 }, { 841, 557, 899, 584, 662, 558 },
+        { 902, 557, 1025, 584, 725, 558 }, { 1029, 557, 1054, 584, 854, 558 }, { 1057, 557, 1114, 584, 884, 558 }, { 78, 586, 152, 613, 946, 558 },
+        { 156, 586, 194, 613, 78, 587 }, { 197, 586, 233, 613, 121, 587 }, { 238, 586, 329, 613, 162, 587 }, { 332, 586, 409, 613, 258, 587 },
+        { 413, 586, 524, 613, 340, 587 }, { 528, 586, 614, 613, 456, 587 }, { 618, 586, 648, 613, 547, 587 }, { 653, 586, 723, 613, 582, 587 },
+        { 728, 586, 838, 613, 657, 587 },
+    };
+
+        const char* name = splashScreen->GetName();
+        const short(*rects)[6] = legal_english;
+        int numRects = sizeof(legal_english) / sizeof(legal_english[0]);
+        if (idStr::FindText(name, "legal_french", false) >= 0) {
+            rects = legal_french;
+            numRects = sizeof(legal_french) / sizeof(legal_french[0]);
+        } else if (idStr::FindText(name, "legal_figs", false) >= 0) {
+            rects = legal_figs;
+            numRects = sizeof(legal_figs) / sizeof(legal_figs[0]);
+        } else if (idStr::FindText(name, "legal_english", false) < 0) {
+            numRects = 0; // not a legal screen we know: as it is
+        }
+        if (numRects > 0) {
+            const float sx = barWidth, sy = barHeight;
+            const float sw = renderSystem->GetVirtualWidth() - barWidth * 2.0f;
+            const float sh = renderSystem->GetVirtualHeight() - barHeight * 2.0f;
+            renderSystem->SetColor(colorBlack);
+            renderSystem->DrawStretchPic(sx, sy, sw, sh, 0, 0, 1, 1, whiteMaterial);
+            renderSystem->SetColor4(1, 1, 1, 1);
+            for (int i = 0; i < numRects; i++) {
+                const short* r = rects[i];
+                renderSystem->DrawStretchPic(sx + r[4] / 1280.0f * sw, sy + r[5] / 720.0f * sh, (r[2] - r[0]) / 1280.0f * sw, (r[3] - r[1]) / 720.0f * sh,
+                    r[0] / 1280.0f, r[1] / 720.0f, r[2] / 1280.0f, r[3] / 720.0f, splashScreen);
+            }
+        }
+        renderSystem->SetColor4(1, 1, 1, 1);
+    }
+
+    VITA_MARK("splash: swap");
     const emptyCommand_t* cmd = renderSystem->SwapCommandBuffers(&time_frontend, &time_backend, &time_shadows, &time_gpu);
+    VITA_MARK("splash: render");
     renderSystem->RenderCommandBuffers(cmd);
+    VITA_MARK("splash: done");
 }
 
 /*
@@ -1073,6 +1280,120 @@ bool idCommonLocal::IsInitialized() const
 
 //======================================================================================
 
+#if defined(__vita__)
+/*
+=================
+Vita_ApplyTuning
+
+The performance settings are saved in the config, so a build that changes
+their defaults would never see them: when the config's tuning version is
+older than this build's, the listed settings are reset to this build's
+values once (and the version saved). Run twice: after the config (the
+engine's settings), and again after the game code is loaded - the game's
+settings (vita_afMaxMoveTime...) only exist from then on, and a value set
+before took the saved one back when they were registered (run 34 played
+with vita_afMaxMoveTime 4 although the reset had set 1.25).
+=================
+*/
+/*
+=================
+Vita_ApplyFixedSettings
+
+The settings the Vita menus do not show (System: render resolution, dynamic
+resolution, frame rate cap, shadows; Game Options: flashlight shadows) are
+held at these values at every start, whatever an older config saved. Run
+after the config (engine settings) and after the game code loaded
+(g_weaponShadows is the game's). The console can still change them for a
+session.
+=================
+*/
+static void Vita_ApplyFixedSettings(bool game)
+{
+    static const char* engineFixed[][2] = {
+        { "vita_renderResolution", "720x408" }, // top of the 3D view's range (display 960x544)
+        { "vita_dynamicResolution", "1" },      // ... down to 544x312
+        { "vita_maxFPS", "30" },
+        { "r_skipShadows", "0" },
+        { NULL, NULL }
+    };
+    static const char* gameFixed[][2] = {
+        { "g_weaponShadows", "1" }, // "Flashlight Shadows": the flashlight / muzzle light casts shadows
+        { NULL, NULL }
+    };
+    const char* (*fixed)[2] = game ? gameFixed : engineFixed;
+    for (int i = 0; fixed[i][0] != NULL; i++) {
+        const char* was = cvarSystem->GetCVarString(fixed[i][0]);
+        if (idStr::Cmp(was, fixed[i][1]) != 0) {
+            common->Printf("vita: fixed setting %s = %s (the config had %s)\n", fixed[i][0], fixed[i][1], was);
+            cvarSystem->SetCVarString(fixed[i][0], fixed[i][1]);
+        }
+    }
+}
+
+// Game Options -> Language: the language picked in the menu, applied at the
+// next start (sys_lang only changes before anything localized is loaded -
+// voice-overs, strings and the savegame language would mix otherwise)
+idCVar vita_language("vita_language", "", CVAR_SYSTEM | CVAR_ARCHIVE, "Vita: the language to start in next time (english, french, italian, german, spanish, japanese; empty keeps sys_lang)");
+
+static void Vita_ApplyLanguage()
+{
+    extern idCVar sys_lang;
+    const char* want = vita_language.GetString();
+    if (want[0] == '\0') {
+        common->Printf("vita: language %s\n", sys_lang.GetString());
+        return;
+    }
+    for (int i = 0; i < Sys_NumLangs(); i++) {
+        if (idStr::Icmp(want, Sys_Lang(i)) == 0) {
+            if (idStr::Icmp(sys_lang.GetString(), Sys_Lang(i)) != 0) {
+                common->Printf("vita: language %s (picked in Game Options; sys_lang was %s)\n", Sys_Lang(i), sys_lang.GetString());
+                sys_lang.SetString(Sys_Lang(i));
+            } else {
+                common->Printf("vita: language %s\n", sys_lang.GetString());
+            }
+            return;
+        }
+    }
+    common->Warning("vita: vita_language '%s' is not a language this game knows - keeping %s", want, sys_lang.GetString());
+}
+
+static const int VITA_TUNING_VERSION = 6;
+static int vitaTuningSavedVersion = -1;
+static void Vita_ApplyTuning(bool final)
+{
+    static const char* tuning[][2] = {
+        { "vita_animNearDistance", "192" },   // 15 Hz monster animation from 192 units (was 384)
+        { "vita_animFocusAngle", "0" },
+        { "vita_guiNearDistance", "96" },     // world screens at 15 Hz beyond 96 units (was 192)
+        { "vita_guiFocusAngle", "8" },        // ... unless within 8 degrees of the view center (was 20)
+        { "vita_aiFarDistance", "512" },      // reachability every other tic beyond 512 (was 1024)
+        { "vita_ikDistance", "384" },         // walk IK skipped beyond 384 (was 640)
+        { "vita_afMaxMoveTime", "0.9" },      // ragdolls put to rest after 0.9 s of motion (was 4, 2, 1.25)
+        { "vita_maxTicsPerFrame", "1" },
+        { "vita_animLOD", "1" },
+        { "vita_animatedShadowLights", "1" },
+        { NULL, NULL }
+    };
+    if (vitaTuningSavedVersion < 0) {
+        vitaTuningSavedVersion = cvarSystem->GetCVarInteger("vita_tuningVersion");
+    }
+    if (vitaTuningSavedVersion >= VITA_TUNING_VERSION) {
+        return;
+    }
+    for (int i = 0; tuning[i][0] != NULL; i++) {
+        cvarSystem->SetCVarString(tuning[i][0], tuning[i][1]);
+    }
+    if (final) {
+        cvarSystem->SetCVarInteger("vita_tuningVersion", VITA_TUNING_VERSION);
+        for (int i = 0; tuning[i][0] != NULL; i++) {
+            common->Printf("vita: tuning: %s = %s (now %s)\n", tuning[i][0], tuning[i][1], cvarSystem->GetCVarString(tuning[i][0]));
+        }
+    }
+    common->Printf("vita: performance settings reset to this build's (tuning version %d, the config had %d)%s\n", VITA_TUNING_VERSION, vitaTuningSavedVersion,
+        final ? " - after the game code loaded" : " - engine settings");
+}
+#endif
+
 /*
 =================
 idCommonLocal::Init
@@ -1154,12 +1475,18 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
         // Pre-allocate our 20 MB save buffer here on time, instead of on-demand for each save....
 
         saveFile.SetNameAndType(SAVEGAME_CHECKPOINT_FILENAME, SAVEGAMEFILE_BINARY);
-        saveFile.PreAllocate(MIN_SAVEGAME_SIZE_BYTES);
-
         stringsFile.SetNameAndType(SAVEGAME_STRINGS_FILENAME, SAVEGAMEFILE_BINARY);
+#if defined(__vita__)
+        // The Vita: the save buffers exist only while a game is saved or
+        // loaded (Common_load.cpp), and the file system gets no block buffer
+        // of theirs - see idCommonLocal::VitaReleaseSaveBuffers
+        fileSystem->BeginLevelLoad("_startup", NULL, 0);
+#else
+        saveFile.PreAllocate(MIN_SAVEGAME_SIZE_BYTES);
         stringsFile.PreAllocate(MAX_SAVEGAME_STRING_TABLE_SIZE);
 
         fileSystem->BeginLevelLoad("_startup", saveFile.GetDataPtr(), saveFile.GetAllocated());
+#endif
 
         // initialize the declaration manager
         declManager->Init();
@@ -1185,6 +1512,18 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
         // run cfg execution
         cmdSystem->ExecuteCommandBuffer();
 
+#if defined(__vita__)
+        // the saved config carries key binds too; the Vita's pad scheme is
+        // fixed, so it goes on top of whatever the config files bound
+        Vita_ApplyControlScheme();
+
+        // performance settings reset to this build's (engine settings; the
+        // game's follow after LoadGameDLL)
+        Vita_ApplyTuning(false);
+        Vita_ApplyFixedSettings(false);
+        Vita_ApplyLanguage();
+#endif
+
         // re-override anything from the config files with command line args
         StartupVariable(NULL);
 
@@ -1195,8 +1534,13 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
         renderSystem->InitOpenGL();
 
         // Support up to 2 digits after the decimal point
+#if defined(__vita__)
+        com_engineHz_denominator = 100LL * 60;       // the title screen and menus: 60 (vita_gameHz is for maps)
+        com_engineHz_latched = 60.0f;
+#else
         com_engineHz_denominator = 100LL * com_engineHz.GetFloat();
         com_engineHz_latched = com_engineHz.GetFloat();
+#endif
 
         // start the sound system, but don't do any hardware operations yet
         soundSystem->Init();
@@ -1220,7 +1564,11 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
         const int legalMinTime = 4000;
         const bool showVideo = (!com_skipIntroVideos.GetBool() && fileSystem->UsingResourceFiles());
         if (showVideo) {
-            RenderBink("video\\loadvideo.bik");
+            // Forward slashes: idCinematic::InitFromFile() takes this path apart to
+            // build the .roq name it tries first, and the Vita filesystem does not
+            // want backslashes. The .bik spelling here is still correct - the
+            // extension is stripped and .roq is attempted before any Bink fallback.
+            RenderBink("video/loadvideo.bik");
             RenderSplash();
             RenderSplash();
         } else {
@@ -1256,7 +1604,12 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
         // DebuggerServerInit();
 
         // load the game dll
+        VITA_PHASE("LoadGameDLL");
         LoadGameDLL();
+#if defined(__vita__)
+        Vita_ApplyTuning(true); // the game's settings exist now
+        Vita_ApplyFixedSettings(true);
+#endif
 
         // On the PC touch them all so they get included in the resource build
         if (!fileSystem->UsingResourceFiles()) {
@@ -1271,11 +1624,13 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
             }
         }
 
+        VITA_PHASE("UnloadResourceContainer");
         fileSystem->UnloadResourceContainer("_ordered");
 
         // the same idRenderWorld will be used for all games
         // and demos, insuring that level specific models
         // will be freed
+        VITA_PHASE("AllocRenderWorld");
         renderWorld = renderSystem->AllocRenderWorld();
         soundWorld = soundSystem->AllocSoundWorld(renderWorld);
 
@@ -1283,9 +1638,11 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
         menuSoundWorld->PlaceListener(vec3_origin, mat3_identity, 0);
 
         // init the session
+        VITA_PHASE("session->Initialize");
         session->Initialize();
         session->InitializeSoundRelatedSystems();
 
+        VITA_PHASE("InitializeMPMapsModes");
         InitializeMPMapsModes();
 
         // leaderboards need to be initialized after InitializeMPMapsModes, which populates the MP Map list.
@@ -1293,15 +1650,19 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
             game->Leaderboards_Init();
         }
 
+        VITA_PHASE("CreateMainMenu");
         CreateMainMenu();
 
+        VITA_PHASE("commonDialog.Init");
         commonDialog.Init();
 
         // load the console history file
         consoleHistory.LoadHistoryFile();
 
+        VITA_PHASE("AddStartupCommands");
         AddStartupCommands();
 
+        VITA_PHASE("StartMenu");
         StartMenu(true);
 
         while (Sys_Milliseconds() - legalStartTime < legalMinTime) {
@@ -1311,6 +1672,7 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
         };
 
         // print all warnings queued during initialization
+        VITA_PHASE("PrintWarnings");
         PrintWarnings();
 
         // remove any prints from the notify lines
@@ -1327,6 +1689,11 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
 
         fileSystem->EndLevelLoad();
 
+#if defined(__vita__)
+        // The menus first draw the Vita button glyphs on the game/draw thread,
+        // where an unparsed material is an error: parse it here, on the main one.
+        Vita_UI_Material();
+#endif
         // RB begin
 #if defined(USE_DOOMCLASSIC)
         // Initialize support for Doom classic.
@@ -1336,8 +1703,15 @@ void idCommonLocal::Init(int argc, const char* const* argv, const char* cmdline)
             idImageOpts opts;
             opts.format = FMT_RGBA8;
             opts.colorFormat = CFM_DEFAULT;
+#if defined(__vita__)
+            // the 320x200 frame is blown up 3x into this with nearest filtering
+            // on the GPU, then drawn with linear filtering: sharp, even pixels
+            opts.width = DOOMCLASSIC_RENDERWIDTH * DOOMCLASSIC_UPSCALE;
+            opts.height = DOOMCLASSIC_RENDERHEIGHT * DOOMCLASSIC_UPSCALE;
+#else
             opts.width = DOOMCLASSIC_RENDERWIDTH;
             opts.height = DOOMCLASSIC_RENDERHEIGHT;
+#endif
             opts.numLevels = 1;
             image->AllocImage(opts, TF_LINEAR, TR_REPEAT);
         }
@@ -1523,15 +1897,23 @@ void idCommonLocal::CreateMainMenu()
 
         // create main inside an "empty" game level load - so assets get
         // purged automagically when we transition to a "real" map
+        VITA_PHASE("Shell_CreateMenu");
         game->Shell_CreateMenu(false);
+        VITA_PHASE("Shell_Show");
         game->Shell_Show(true);
+        VITA_PHASE("Shell_SyncWithSession");
         game->Shell_SyncWithSession();
 
         // load
+        VITA_PHASE("renderSystem->EndLevelLoad");
         renderSystem->EndLevelLoad();
+        VITA_PHASE("soundSystem->EndLevelLoad");
         soundSystem->EndLevelLoad();
+        VITA_PHASE("declManager->EndLevelLoad");
         declManager->EndLevelLoad();
+        VITA_PHASE("uiManager->EndLevelLoad");
         uiManager->EndLevelLoad("");
+        VITA_PHASE("CreateMainMenu done");
     }
 }
 
@@ -1686,6 +2068,14 @@ bool idCommonLocal::ProcessEvent(const sysEvent_t* event)
                 classicEvent.type = ev_keyup;
             }
 
+#if defined(__vita__)
+            // Every key goes to the classic game, so command bindings never run:
+            // the rear-touch 180 degree turn is one (it turns the DOOM 3 view,
+            // which the classic tic builder follows).
+            if (event->evValue2 == 1 && idStr::Icmp(idKeyInput::GetBinding(event->GetKey()), "vita_quickTurn") == 0) {
+                cmdSystem->BufferCommandText(CMD_EXEC_NOW, "vita_quickTurn\n");
+            }
+#endif
             DoomLib::SetPlayer(0);
 
             extern Globals* g;
@@ -1792,8 +2182,13 @@ void idCommonLocal::PerformGameSwitch()
 
     } else if (idealCurrentGame == DOOM3_BFG) {
         DoomLib::Interface.Shutdown();
+#if defined(__vita__)
+        com_engineHz_denominator = 100LL * 60; // back to the menus
+        com_engineHz_latched = 60.0f;
+#else
         com_engineHz_denominator = 100LL * com_engineHz.GetFloat();
         com_engineHz_latched = com_engineHz.GetFloat();
+#endif
 
         // Don't MoveToPressStart if we have an invite, we need to go
         // directly to the lobby.

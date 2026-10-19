@@ -58,13 +58,24 @@ Note that other POSIX systems may need some small changes, e.g. in Sys_InitNetwo
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/param.h>
+#if !defined(__vita__)
 #include <sys/ioctl.h>
+#endif
+#if !defined(__vita__)
 #include <sys/uio.h>
+#endif
 #include <errno.h>
 #include <sys/select.h>
+#if !defined(__vita__)
 #include <net/if.h>
+#endif
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <ifaddrs.h>
+#endif
+#if defined(__vita__)
+#include <psp2/sysmodule.h>
+#include <psp2/net/net.h>
+#include <psp2/net/netctl.h>
 #endif
 
 #endif // _WIN32
@@ -928,6 +939,47 @@ void Sys_InitNetworking()
         num_interfaces++;
     }
     free(ifap);
+#elif defined(__vita__)
+    // The Vita's network stack (SceNet) has to be started by hand before any
+    // socket works, and has no SIOCGIFCONF: the Wi-Fi address and netmask
+    // come from SceNetCtl. Without Wi-Fi only the loopback entry is added
+    // below (multiplayer then finds nothing; the game itself is unaffected).
+    num_interfaces = 0;
+    {
+        static bool netStarted = false;
+        static void* netMemory = NULL;
+        if (!netStarted) {
+            const int modErr = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+            const int netPoolSize = 256 * 1024;
+            netMemory = malloc(netPoolSize);
+            SceNetInitParam initParam;
+            initParam.memory = netMemory;
+            initParam.size = netPoolSize;
+            initParam.flags = 0;
+            const int netErr = sceNetInit(&initParam);
+            const int ctlErr = sceNetCtlInit();
+            netStarted = (netErr >= 0 || (unsigned int)netErr == 0x80410201 /* already */);
+            idLib::Printf("net: SceNet started (module 0x%08X, sceNetInit 0x%08X, sceNetCtlInit 0x%08X, %d KB pool)\n",
+                (unsigned int)modErr, (unsigned int)netErr, (unsigned int)ctlErr, netPoolSize / 1024);
+        }
+        int state = 0;
+        sceNetCtlInetGetState(&state);
+        SceNetCtlInfo ipInfo, maskInfo;
+        memset(&ipInfo, 0, sizeof(ipInfo));
+        memset(&maskInfo, 0, sizeof(maskInfo));
+        if (state == SCE_NETCTL_STATE_CONNECTED && sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &ipInfo) >= 0) {
+            if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_NETMASK, &maskInfo) < 0) {
+                idStr::Copynz(maskInfo.netmask, "255.255.255.0", sizeof(maskInfo.netmask));
+            }
+            netint[0].ip = ntohl(inet_addr(ipInfo.ip_address));
+            netint[0].mask = ntohl(inet_addr(maskInfo.netmask));
+            idStr::Copynz(netint[0].addr, ipInfo.ip_address, sizeof(netint[0].addr));
+            num_interfaces = 1;
+            idLib::Printf("net: Wi-Fi %s/%s\n", ipInfo.ip_address, maskInfo.netmask);
+        } else {
+            idLib::Printf("net: no Wi-Fi connection (netctl state %d) - multiplayer needs one\n", state);
+        }
+    }
 #else  // not _WIN32, OSX or FreeBSD
     int s;
     char buf[MAX_INTERFACES * sizeof(ifreq)];
@@ -1163,6 +1215,37 @@ const char* Sys_GetLocalIP(int i)
         return NULL;
     }
     return netint[i].addr;
+}
+
+/*
+========================
+Sys_GetLocalIPMask
+
+The netmask of local address i (host order).
+========================
+*/
+bool Sys_GetLocalIPMask(int i, unsigned int& mask)
+{
+    if ((i < 0) || (i >= num_interfaces)) {
+        return false;
+    }
+    mask = netint[i].mask;
+    return true;
+}
+
+/*
+========================
+Sys_RefreshNetworking
+
+Vita: Wi-Fi may have come up (or changed network) since the start; the
+game browser asks again before each search.
+========================
+*/
+void Sys_RefreshNetworking()
+{
+#if defined(__vita__)
+    Sys_InitNetworking();
+#endif
 }
 
 /*

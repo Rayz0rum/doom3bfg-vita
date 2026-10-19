@@ -30,6 +30,11 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT: the gui recording counts in the perf log
+
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#endif
 
 const float idGuiModel::STEREO_DEPTH_NEAR = 0.0f;
 const float idGuiModel::STEREO_DEPTH_MID = 0.5f;
@@ -46,6 +51,9 @@ idGuiModel::idGuiModel()
     for (int i = 0; i < MAX_ENTITY_SHADER_PARMS; i++) {
         shaderParms[i] = 1.0f;
     }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaCapture = NULL;
+#endif
 }
 
 /*
@@ -57,6 +65,11 @@ Begins collecting draw commands into surfaces
 */
 void idGuiModel::Clear()
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (vitaCapture != NULL) {
+        VitaInterruptCapture();
+    }
+#endif
     surfaces.SetNum(0);
     AdvanceSurf();
 }
@@ -202,6 +215,11 @@ EmitToCurrentView
 void idGuiModel::EmitToCurrentView(float modelMatrix[16], bool depthHack)
 {
     float modelViewMatrix[16];
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (vitaCapture != NULL) {
+        VitaInterruptCapture();
+    }
+#endif
 
     R_MatrixMultiply(modelMatrix, tr.viewDef->worldSpace.modelViewMatrix, modelViewMatrix);
 
@@ -223,6 +241,11 @@ Creates a view that covers the screen and emit the surfaces
 */
 void idGuiModel::EmitFullScreen()
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (vitaCapture != NULL) {
+        VitaInterruptCapture();
+    }
+#endif
 
     if (surfaces[0].numIndexes == 0) {
         return;
@@ -347,6 +370,26 @@ idDrawVert* idGuiModel::AllocTris(int vertCount, const triIndex_t* tempIndexes, 
     if (material == NULL) {
         return NULL;
     }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (vitaCapture != NULL) {
+        // recorded, written into the frame's buffers when played back
+        vitaGuiCapture_t* cap = vitaCapture;
+        vitaGuiCall_t& call = cap->calls.Alloc();
+        call.firstVert = cap->verts.Num();
+        call.numVerts = vertCount;
+        call.firstIndex = cap->indexes.Num();
+        call.numIndexes = indexCount;
+        call.material = material;
+        call.glState = glState;
+        call.stereoType = stereoType;
+        cap->verts.SetNum(call.firstVert + vertCount);
+        cap->indexes.SetNum(call.firstIndex + indexCount);
+        if (indexCount > 0) {
+            memcpy(cap->indexes.Ptr() + call.firstIndex, tempIndexes, indexCount * sizeof(triIndex_t));
+        }
+        return cap->verts.Ptr() + call.firstVert;
+    }
+#endif
     if (numIndexes + indexCount > MAX_INDEXES) {
         static int warningFrame = 0;
         if (warningFrame != tr.frameCount) {
@@ -397,3 +440,153 @@ idDrawVert* idGuiModel::AllocTris(int vertCount, const triIndex_t* tempIndexes, 
 
     return vertexPointer + startVert;
 }
+
+#if !defined(__vita__) && defined(ID_VITA_PHYSCHECK)
+idCVar vita_guiLODMeasure("vita_guiLODMeasure", "0", CVAR_RENDERER | CVAR_BOOL, "PC test build: compare each 15 Hz GUI recording with the one before (what an interpolation could use)");
+#endif
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+=============
+idGuiModel::VitaBeginCapture / VitaEndCapture / VitaReplay
+
+See vitaGuiCapture_t (GuiModel.h). The playback goes through AllocTris with
+the recorded arguments in the recorded order, so the surfaces split where they
+did and the vertices and indexes land as they did.
+=============
+*/
+void idGuiModel::VitaBeginCapture(vitaGuiCapture_t* cap)
+{
+    if (vitaCapture != NULL) {
+        VitaInterruptCapture();
+    }
+    if (cap->verts.GetGranularity() < 1024) {
+        cap->verts.SetGranularity(1024);
+        cap->indexes.SetGranularity(1024);
+        cap->calls.SetGranularity(256);
+    }
+#if !defined(__vita__)
+    if (vita_guiLODMeasure.GetBool() && cap->valid) {
+        cap->prevVerts = cap->verts;
+        cap->prevIndexes = cap->indexes;
+        cap->prevCalls = cap->calls;
+        cap->prevValid = true;
+    } else if (!cap->valid) {
+        cap->prevValid = false;
+    }
+#endif
+    cap->verts.SetNum(0);
+    cap->indexes.SetNum(0);
+    cap->calls.SetNum(0);
+    cap->valid = false;
+    vitaCapture = cap;
+}
+
+#if !defined(__vita__)
+/*
+=============
+Vita_GuiMeasure (PC test build, vita_guiLODMeasure 1)
+
+What interpolating a 15 Hz GUI between its recordings could use: a new
+recording against the one before it - the same (replay is already right),
+the same layout with vertices that moved, faded or scrolled (a blend of the
+two would be possible), or a different layout (nothing to blend).
+=============
+*/
+static void Vita_GuiMeasure(const vitaGuiCapture_t* cap)
+{
+    if (!cap->prevValid) {
+        return;
+    }
+    bool sameLayout = cap->calls.Num() == cap->prevCalls.Num() && cap->verts.Num() == cap->prevVerts.Num() && cap->indexes.Num() == cap->prevIndexes.Num();
+    for (int i = 0; sameLayout && i < cap->calls.Num(); i++) {
+        const vitaGuiCall_t& a = cap->calls[i];
+        const vitaGuiCall_t& b = cap->prevCalls[i];
+        sameLayout = a.numVerts == b.numVerts && a.numIndexes == b.numIndexes && a.material == b.material && a.glState == b.glState;
+    }
+    if (sameLayout && cap->indexes.Num() > 0) {
+        sameLayout = memcmp(cap->indexes.Ptr(), cap->prevIndexes.Ptr(), cap->indexes.Num() * sizeof(triIndex_t)) == 0;
+    }
+    if (!sameLayout) {
+        if (cap->kind == 1) {
+            VITA_ZONE_COUNT("gui measure: HUD - different layout (nothing to blend)");
+        } else {
+            VITA_ZONE_COUNT("gui measure: world screen - different layout (nothing to blend)");
+        }
+        return;
+    }
+    int moved = 0, recolored = 0, retextured = 0;
+    for (int i = 0; i < cap->verts.Num(); i++) {
+        const idDrawVert& a = cap->verts[i];
+        const idDrawVert& b = cap->prevVerts[i];
+        if (memcmp(&a.xyz, &b.xyz, sizeof(a.xyz)) != 0) {
+            moved++;
+        }
+        if (memcmp(a.color, b.color, sizeof(a.color)) != 0) {
+            recolored++;
+        }
+        if (a.GetTexCoordNativeS() != b.GetTexCoordNativeS() || a.GetTexCoordNativeT() != b.GetTexCoordNativeT()) {
+            retextured++;
+        }
+    }
+    if (cap->kind == 1) {
+        if (moved + recolored + retextured == 0) {
+            VITA_ZONE_COUNT("gui measure: HUD - identical (replay exact)");
+        } else {
+            VITA_ZONE_COUNT("gui measure: HUD - same layout, vertices changed (blendable)");
+        }
+        VITA_ZONE_ADD("gui measure: HUD - vertices recorded", cap->verts.Num());
+        VITA_ZONE_ADD("gui measure: HUD - vertices moved", moved);
+        VITA_ZONE_ADD("gui measure: HUD - vertices recolored (fades)", recolored);
+        VITA_ZONE_ADD("gui measure: HUD - vertices with new texture coordinates", retextured);
+    } else {
+        if (moved + recolored + retextured == 0) {
+            VITA_ZONE_COUNT("gui measure: world screen - identical (replay exact)");
+        } else {
+            VITA_ZONE_COUNT("gui measure: world screen - same layout, vertices changed (blendable)");
+        }
+        VITA_ZONE_ADD("gui measure: world screen - vertices recorded", cap->verts.Num());
+        VITA_ZONE_ADD("gui measure: world screen - vertices moved", moved);
+        VITA_ZONE_ADD("gui measure: world screen - vertices recolored (fades)", recolored);
+        VITA_ZONE_ADD("gui measure: world screen - vertices with new texture coordinates", retextured);
+    }
+}
+#endif
+
+void idGuiModel::VitaEndCapture()
+{
+    vitaGuiCapture_t* cap = vitaCapture;
+    if (cap == NULL) {
+        return; // interrupted: already played back, left invalid
+    }
+    vitaCapture = NULL;
+    VitaReplay(cap);
+    VITA_ZONE_COUNT("gui recordings completed");
+#if !defined(__vita__)
+    if (vita_guiLODMeasure.GetBool()) {
+        Vita_GuiMeasure(cap);
+    }
+#endif
+    cap->valid = true;
+    cap->frame = tr.frameCount;
+}
+
+void idGuiModel::VitaInterruptCapture()
+{
+    VITA_ZONE_COUNT("gui recording interrupted (model emptied or emitted mid-draw)");
+    vitaGuiCapture_t* cap = vitaCapture;
+    vitaCapture = NULL;
+    VitaReplay(cap);
+    cap->valid = false;
+}
+
+void idGuiModel::VitaReplay(const vitaGuiCapture_t* cap)
+{
+    for (int i = 0; i < cap->calls.Num(); i++) {
+        const vitaGuiCall_t& call = cap->calls[i];
+        idDrawVert* dst = AllocTris(call.numVerts, cap->indexes.Ptr() + call.firstIndex, call.numIndexes, call.material, call.glState, call.stereoType);
+        if (dst != NULL && call.numVerts > 0) {
+            memcpy(dst, cap->verts.Ptr() + call.firstVert, call.numVerts * sizeof(idDrawVert));
+        }
+    }
+}
+#endif

@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "../snd_local.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 #include "../../../doomclassic/doom/i_sound.h"
 
 idCVar s_showLevelMeter("s_showLevelMeter", "0", CVAR_BOOL | CVAR_ARCHIVE, "Show VU meter");
@@ -242,7 +243,38 @@ void idSoundHardware_OpenAL::Init()
     for (int i = 0; i < voices.Num(); i++) {
         freeVoices[i] = &voices[i];
     }
+#if defined(ID_SOUND_STREAM)
+    SoundWorker_Start();
+#endif
 }
+
+#if defined(ID_SOUND_STREAM)
+/*
+========================
+idSoundHardware_OpenAL::ServiceStreamVoices
+
+The sound worker thread's round. A voice whose lock the game/draw thread holds
+right now (starting, stopping or pausing it) waits for the next round.
+========================
+*/
+void idSoundHardware_OpenAL::ServiceStreamVoices(bool all)
+{
+    for (int i = 0; i < voices.Num(); i++) {
+        idSoundVoice_OpenAL& v = voices[i];
+        const bool waiting = v.streamStartPending || v.streamStopPending;
+        if (!(waiting || (all && v.streamActive))) {
+            continue;
+        }
+        if (!v.streamLock.Lock(false)) {
+            continue;
+        }
+        if (v.streamActive || v.streamStopPending) {
+            v.StreamService();
+        }
+        v.streamLock.Unlock();
+    }
+}
+#endif
 
 /*
 ========================
@@ -251,6 +283,9 @@ idSoundHardware_OpenAL::Shutdown
 */
 void idSoundHardware_OpenAL::Shutdown()
 {
+#if defined(ID_SOUND_STREAM)
+    SoundWorker_Stop();
+#endif
     for (int i = 0; i < voices.Num(); i++) {
         voices[i].DestroyInternal();
     }
@@ -305,6 +340,20 @@ idSoundVoice* idSoundHardware_OpenAL::AllocateVoice(const idSoundSample* leadinS
     // Try to find a free voice that matches the format
     // But fallback to the last free voice if none match the format
     idSoundVoice* voice = NULL;
+#if defined(ID_SOUND_STREAM)
+    // The same choice without asking OpenAL about every free voice (two or
+    // three calls each, through its locks, and the never-used voices sit at
+    // the front of the list): a free voice is never playing - it got here
+    // from the zombie list only once it had stopped, and nothing plays a free
+    // voice - and CompatibleFormat is "has a source", which openalSource
+    // tells (0 until created, 0 again once destroyed).
+    for (int i = 0; i < freeVoices.Num(); i++) {
+        voice = (idSoundVoice*)freeVoices[i];
+        if (freeVoices[i]->openalSource != 0) {
+            break;
+        }
+    }
+#else
     for (int i = 0; i < freeVoices.Num(); i++) {
         if (freeVoices[i]->IsPlaying()) {
             continue;
@@ -314,6 +363,7 @@ idSoundVoice* idSoundHardware_OpenAL::AllocateVoice(const idSoundSample* leadinS
             break;
         }
     }
+#endif
     if (voice != NULL) {
         voice->Create(leadinSample, loopingSample);
         freeVoices.Remove(voice);
@@ -362,6 +412,7 @@ void idSoundHardware_OpenAL::Update()
     // IXAudio2SourceVoice::Stop() has been called for every sound on the
     // zombie list, but it is documented as asyncronous, so we have to wait
     // until it actually reports that it is no longer playing.
+    VITA_ZONE_COUNT("sound: zombie voice checks");
     for (int i = 0; i < zombieVoices.Num(); i++) {
         zombieVoices[i]->FlushSourceBuffers();
         if (!zombieVoices[i]->IsPlaying()) {

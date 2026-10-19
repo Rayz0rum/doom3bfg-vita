@@ -399,6 +399,13 @@ bool idBinaryImage::LoadFromGeneratedFile(idFile* bFile, ID_TIME_T sourceFileTim
     }
 
     images.SetNum(numImages);
+#if defined(__vita__)
+    vitaSkipped = 0;
+    if (vitaImageName != NULL && vitaSkipRequest > 0) {
+        vitaSkipped = R_VitaSkipLevels(vitaImageName, vitaUsage, (textureType_t)fileData.textureType,
+            fileData.width, fileData.height, fileData.numLevels, vitaSkipRequest);
+    }
+#endif
 
     for (int i = 0; i < numImages; i++) {
         idBinaryImageData& img = images[i];
@@ -418,6 +425,14 @@ bool idBinaryImage::LoadFromGeneratedFile(idFile* bFile, ID_TIME_T sourceFileTim
         // sizes are still retained, so the stored data size may be larger than
         // just the multiplication of dimensions
         assert(img.dataSize >= img.width * img.height * BitsForFormat((textureFormat_t)fileData.format) / 8);
+#if defined(__vita__)
+        if (img.level < vitaSkipped) {
+            if (bFile->Seek(img.dataSize, FS_SEEK_CUR) != 0) {
+                return false;
+            }
+            continue;
+        }
+#endif
         img.Alloc(img.dataSize);
         if (img.data == NULL) {
             return false;

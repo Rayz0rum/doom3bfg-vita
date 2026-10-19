@@ -32,6 +32,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#endif
+
 // RB begin
 #if defined(_WIN32)
 
@@ -51,21 +55,41 @@ idCVar r_debugContext("r_debugContext", "0", CVAR_RENDERER, "Enable various leve
 idCVar r_glDriver("r_glDriver", "", CVAR_RENDERER, "\"opengl32\", etc.");
 idCVar r_skipIntelWorkarounds("r_skipIntelWorkarounds", "1", CVAR_RENDERER | CVAR_BOOL, "skip workarounds for Intel driver bugs");
 idCVar r_multiSamples("r_multiSamples", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "number of antialiasing samples");
+#if defined(__vita__)
+// The Vita's MSAA (the user's choice, 2026-10-19: 2x with FXAA on the stretch;
+// 4x rejected - video memory and the depth/stencil load/store at every mid-frame
+// scene break). vitaGL sets it once, when it starts (SDL's VITA_GLES_LoadLibrary:
+// 2 -> SCE_GXM_MULTISAMPLE_2X). Not archived and not r_multiSamples, which
+// configs saved as 0 would override: 'vita_msaa 0' in autoexec.cfg turns it off.
+idCVar vita_msaa("vita_msaa", "2", CVAR_RENDERER | CVAR_INTEGER, "Vita: MSAA samples (0 off, 2 = 2x); applied when the game starts", 0, 2);
+#endif
 idCVar r_vidMode("r_vidMode", "0", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_INTEGER, "fullscreen video mode number");
 idCVar r_displayRefresh("r_displayRefresh", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NOCHEAT, "optional display refresh rate option for vid mode", 0.0f, 240.0f);
-#ifdef WIN32
-idCVar r_fullscreen("r_fullscreen", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "0 = windowed, 1 = full screen on monitor 1, 2 = full screen on monitor 2, etc");
+// The Vita SDL video driver reports exactly one display mode, 960x544, and there
+// is no desktop to be windowed on. The other SDL targets default r_fullscreen to
+// 0, which here would build a 1280x720 window on a 960x544 screen.
+#if defined(__vita__)
+#define D3_DEFAULT_FULLSCREEN "1"
+#define D3_DEFAULT_WIDTH "960"
+#define D3_DEFAULT_HEIGHT "544"
+#elif defined(WIN32)
+#define D3_DEFAULT_FULLSCREEN "1"
+#define D3_DEFAULT_WIDTH "1280"
+#define D3_DEFAULT_HEIGHT "720"
 #else
-// DG: add mode -2 for SDL, also defaulting to windowed mode, as that causes less trouble on linux
-idCVar r_fullscreen("r_fullscreen", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "-2 = use current monitor, -1 = (reserved), 0 = windowed, 1 = full screen on monitor 1, 2 = full screen on monitor 2, etc");
-// DG end
+// DG: also defaulting to windowed mode, as that causes less trouble on linux
+#define D3_DEFAULT_FULLSCREEN "0"
+#define D3_DEFAULT_WIDTH "1280"
+#define D3_DEFAULT_HEIGHT "720"
 #endif
-idCVar r_customWidth("r_customWidth", "1280", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "custom screen width. set r_vidMode to -1 to activate");
-idCVar r_customHeight("r_customHeight", "720", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "custom screen height. set r_vidMode to -1 to activate");
+
+idCVar r_fullscreen("r_fullscreen", D3_DEFAULT_FULLSCREEN, CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "-2 = use current monitor, -1 = (reserved), 0 = windowed, 1 = full screen on monitor 1, 2 = full screen on monitor 2, etc");
+idCVar r_customWidth("r_customWidth", D3_DEFAULT_WIDTH, CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "custom screen width. set r_vidMode to -1 to activate");
+idCVar r_customHeight("r_customHeight", D3_DEFAULT_HEIGHT, CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "custom screen height. set r_vidMode to -1 to activate");
 idCVar r_windowX("r_windowX", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "Non-fullscreen parameter");
 idCVar r_windowY("r_windowY", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "Non-fullscreen parameter");
-idCVar r_windowWidth("r_windowWidth", "1280", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "Non-fullscreen parameter");
-idCVar r_windowHeight("r_windowHeight", "720", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "Non-fullscreen parameter");
+idCVar r_windowWidth("r_windowWidth", D3_DEFAULT_WIDTH, CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "Non-fullscreen parameter");
+idCVar r_windowHeight("r_windowHeight", D3_DEFAULT_HEIGHT, CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "Non-fullscreen parameter");
 
 idCVar r_useViewBypass("r_useViewBypass", "1", CVAR_RENDERER | CVAR_INTEGER, "bypass a frame of latency to the view");
 idCVar r_useLightPortalFlow("r_useLightPortalFlow", "1", CVAR_RENDERER | CVAR_BOOL, "use a more precise area reference determination");
@@ -209,6 +233,8 @@ idCVar stereoRender_deGhost("stereoRender_deGhost", "0.05", CVAR_FLOAT | CVAR_AR
 idCVar r_useVirtualScreenResolution("r_useVirtualScreenResolution", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_ARCHIVE, "do 2D rendering at 640x480 and stretch to the current resolution");
 
 // GL_ARB_multitexture
+#if !defined(__vita__)
+// Vita: vitaGL is linked statically; qgl_vita.h maps these directly.
 PFNGLACTIVETEXTUREPROC qglActiveTextureARB;
 // RB: deprecated
 // PFNGLCLIENTACTIVETEXTUREPROC			qglClientActiveTextureARB;
@@ -316,17 +342,20 @@ PFNGLDEBUGMESSAGECALLBACKARBPROC qglDebugMessageCallbackARB;
 PFNGLGETDEBUGMESSAGELOGARBPROC qglGetDebugMessageLogARB;
 
 PFNGLGETSTRINGIPROC qglGetStringi;
+#endif // !__vita__
 
 /*
 ========================
 glBindMultiTextureEXT
 ========================
 */
+#if !defined(__vita__)
 void APIENTRY glBindMultiTextureEXT(GLenum texunit, GLenum target, GLuint texture)
 {
     qglActiveTextureARB(texunit);
     qglBindTexture(target, texture);
 }
+#endif // !__vita__
 
 /*
 =================
@@ -386,8 +415,74 @@ static void CALLBACK DebugCallback(unsigned int source, unsigned int type,
 R_CheckPortableExtensions
 ==================
 */
+/*
+==================
+R_CheckRequiredExtension
+
+DOOM 3 BFG shipped on hardware where all of these were guaranteed. On anything
+else - a GLES2 driver, an old mobile GPU, a console wrapper such as vitaGL -
+any single missing entry used to abort startup. Warn and carry on instead, and
+leave the corresponding glConfig flag false so the renderer takes whichever
+degraded path it has for that feature.
+==================
+*/
+static void R_CheckRequiredExtension(bool available, const char* name, const char* consequence)
+{
+    if (available) {
+        return;
+    }
+    idLib::Warning("%s not available - %s", name, consequence);
+}
+
 static void R_CheckPortableExtensions()
 {
+#if defined(__vita__)
+    // vitaGL resolves every entry point at link time, so there is nothing to
+    // probe for. Publish the capability set it actually implements instead.
+    glConfig.glVersion = 2.0f;
+    glConfig.driverType = GLDRV_OPENGL_ES2;
+
+    glConfig.multitextureAvailable = true;
+    glConfig.directStateAccess = false;
+    glConfig.textureCompressionAvailable = true;
+    glConfig.anisotropicFilterAvailable = false;
+    glConfig.maxTextureAnisotropy = 1.0f;
+    glConfig.textureLODBiasAvailable = false;
+    glConfig.seamlessCubeMapAvailable = false;
+    glConfig.sRGBFramebufferAvailable = false;
+
+    glConfig.vertexBufferObjectAvailable = true;
+    glConfig.mapBufferRangeAvailable = true;
+    glConfig.vertexArrayObjectAvailable = true;
+    glConfig.drawElementsBaseVertexAvailable = true;
+    glConfig.uniformBufferAvailable = true;
+    glConfig.uniformBufferOffsetAlignment = 256;
+
+    glConfig.fragmentProgramAvailable = false;   // ARB assembly programs
+    glConfig.glslAvailable = true;
+    // GPU skinning needs "uniform matrices_ubo { vec4 matrices[408]; }" in the
+    // vertex shader, and GLSL ES 1.00 has no uniform blocks at all. Leaving this
+    // false makes RenderProgs.cpp skip the nine *_skinned builtins and makes
+    // StripDeadCode() drop USE_GPU_SKINNING, so no shader ever declares a block.
+    // idMD5Mesh falls back to TransformVertsAndTangents() on the CPU, which is
+    // the same path upstream takes for GLES2.
+    glConfig.gpuSkinningAvailable = false;
+    glConfig.twoSidedStencilAvailable = true;    // glStencilOpSeparate is present
+
+    // No GXM equivalent / not exposed by vitaGL.
+    glConfig.depthBoundsTestAvailable = false;
+    glConfig.syncAvailable = false;
+    glConfig.timerQueryAvailable = false;
+    glConfig.occlusionQueryAvailable = false;
+    glConfig.debugOutputAvailable = false;
+
+    qglGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, (GLint*)&glConfig.maxTextureImageUnits);
+    qglGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, (GLint*)&glConfig.maxTextureCoords);
+
+    qglGenVertexArrays(1, &glConfig.global_vao);
+    qglBindVertexArray(glConfig.global_vao);
+    return;
+#else
     const char* badVideoCard = idLocalization::GetString("#str_06780");
     if (glConfig.glVersion < 2.0f) {
         idLib::FatalError("%s", badVideoCard);
@@ -643,50 +738,42 @@ static void R_CheckPortableExtensions()
         }
     }
 
-    // GL_ARB_multitexture
-    if (!glConfig.multitextureAvailable) {
-        idLib::Error("GL_ARB_multitexture not available");
-    }
-    // GL_ARB_texture_compression + GL_EXT_texture_compression_s3tc
-    if (!glConfig.textureCompressionAvailable) {
-        idLib::Error("GL_ARB_texture_compression or GL_EXT_texture_compression_s3tc not available");
-    }
-    // GL_ARB_vertex_buffer_object
-    if (!glConfig.vertexBufferObjectAvailable) {
-        idLib::Error("GL_ARB_vertex_buffer_object not available");
-    }
-    // GL_ARB_map_buffer_range
-    if (!glConfig.mapBufferRangeAvailable) {
-        idLib::Error("GL_ARB_map_buffer_range not available");
-    }
-    // GL_ARB_vertex_array_object
-    if (!glConfig.vertexArrayObjectAvailable) {
-        idLib::Error("GL_ARB_vertex_array_object not available");
-    }
-    // GL_ARB_draw_elements_base_vertex
-    if (!glConfig.drawElementsBaseVertexAvailable) {
-        idLib::Error("GL_ARB_draw_elements_base_vertex not available");
-    }
-    // GL_ARB_vertex_program / GL_ARB_fragment_program
-    if (!glConfig.fragmentProgramAvailable) {
-        idLib::Error("GL_ARB_fragment_program not available");
-    }
-    // GLSL
-    if (!glConfig.glslAvailable) {
-        idLib::Error("GLSL not available");
-    }
-    // GL_ARB_uniform_buffer_object
+    // Every one of these was originally a hard idLib::Error(), which on a console
+    // means the process dies before anything reaches the screen and the only
+    // artifact is a crash dump. Report and degrade instead: a game that renders
+    // wrongly can be diagnosed, one that never starts cannot.
+    R_CheckRequiredExtension(glConfig.multitextureAvailable,
+        "GL_ARB_multitexture", "only the first texture unit will be used");
+    R_CheckRequiredExtension(glConfig.textureCompressionAvailable,
+        "GL_ARB_texture_compression / GL_EXT_texture_compression_s3tc", "textures will be uploaded uncompressed");
+    R_CheckRequiredExtension(glConfig.vertexBufferObjectAvailable,
+        "GL_ARB_vertex_buffer_object", "geometry submission will fail");
+    R_CheckRequiredExtension(glConfig.mapBufferRangeAvailable,
+        "GL_ARB_map_buffer_range", "vertex cache updates will fail");
+    R_CheckRequiredExtension(glConfig.vertexArrayObjectAvailable,
+        "GL_ARB_vertex_array_object", "vertex attribute state will be re-sent per draw");
+    R_CheckRequiredExtension(glConfig.drawElementsBaseVertexAvailable,
+        "GL_ARB_draw_elements_base_vertex", "indexed draws will use the wrong base vertex");
+    R_CheckRequiredExtension(glConfig.fragmentProgramAvailable,
+        "GL_ARB_fragment_program", "unused: this build renders through GLSL");
+    R_CheckRequiredExtension(glConfig.glslAvailable,
+        "GLSL", "nothing can be shaded");
+    R_CheckRequiredExtension(glConfig.uniformBufferAvailable,
+        "GL_ARB_uniform_buffer_object", "GPU skinning will be disabled");
+    // Two-sided stencil. RB_StencilShadowPass() falls back to two culled passes
+    // when this is missing, so stencil shadows still render, just at double the
+    // draw calls. See RB_ShadowStencilOp() in tr_backend_draw.cpp.
+    R_CheckRequiredExtension(glConfig.twoSidedStencilAvailable,
+        "GL_ATI_separate_stencil / OpenGL 2.0 separate stencil", "stencil shadows will use the slower two-pass path");
+
     if (!glConfig.uniformBufferAvailable) {
-        idLib::Error("GL_ARB_uniform_buffer_object not available");
-    }
-    // GL_EXT_stencil_two_side
-    if (!glConfig.twoSidedStencilAvailable) {
-        idLib::Error("GL_ATI_separate_stencil not available");
+        glConfig.gpuSkinningAvailable = false;
     }
 
     // generate one global Vertex Array Object (VAO)
     qglGenVertexArrays(1, &glConfig.global_vao);
     qglBindVertexArray(glConfig.global_vao);
+#endif // !__vita__
 }
 
 static bool r_initialized = false;
@@ -775,7 +862,17 @@ void R_SetNewMode(const bool fullInit)
             }
         }
 
+#if defined(__vita__)
+        // one size only: the one vitaGL is brought up at (vita_resolution)
+        Vita_GetRenderResolution(&parms.width, &parms.height);
+#endif
+
+#if defined(__vita__)
+        parms.multiSamples = (vita_msaa.GetInteger() >= 2) ? 2 : 0;
+        Vita_Checkpoint("R_SetNewMode: MSAA %s (vita_msaa %d)", parms.multiSamples ? "2x" : "off", vita_msaa.GetInteger());
+#else
         parms.multiSamples = r_multiSamples.GetInteger();
+#endif
         if (i == 0) {
             parms.stereo = (stereoRender_enable.GetInteger() == STEREO3D_QUAD_BUFFER);
         } else {
@@ -819,6 +916,30 @@ idStr extensions_string;
 
 /*
 ==================
+R_IsGLThread
+
+GL (and on the Vita, vitaGL in particular) only works on the thread that made
+the context. The render back end runs there; the game/draw thread does not.
+==================
+*/
+uintptr_t r_glThreadId = 0;
+idCVar r_debugDeferGL("r_debugDeferGL", "0", CVAR_RENDERER | CVAR_BOOL, "debug: treat image and shader requests as if they came from off the GL thread, so the deferred paths run everywhere");
+bool r_deferredGLAllowed = false; // set while the back end finishes deferred work
+
+bool R_IsGLThread()
+{
+    if (r_debugDeferGL.GetBool() && !r_deferredGLAllowed) {
+        return false;
+    }
+#if defined(__vita__)
+    return Vita_IsGLThread();
+#else
+    return r_glThreadId == 0 || Sys_GetCurrentThreadID() == r_glThreadId;
+#endif
+}
+
+/*
+==================
 R_InitOpenGL
 
 This function is responsible for initializing a valid OpenGL subsystem
@@ -833,6 +954,11 @@ all renderSystem functions will still operate properly, notably the material
 and model information functions.
 ==================
 */
+#if defined(__vita__)
+idCVar vita_selfTest("vita_selfTest", "1", CVAR_RENDERER | CVAR_BOOL,
+    "Vita: run the GPU format/shader self-test at boot and log the results");
+#endif
+
 void R_InitOpenGL()
 {
 
@@ -842,12 +968,27 @@ void R_InitOpenGL()
         common->FatalError("R_InitOpenGL called while active");
     }
 
+#if defined(__vita__)
+    Vita_Checkpoint("R_InitOpenGL: GLimp_PreInit");
+#endif
     // DG: make sure SDL has setup video so getting supported modes in R_SetNewMode() works
     GLimp_PreInit();
     // DG end
 
+#if defined(__vita__)
+    // R_SetNewMode() is where SDL creates the window and its VITA_VGL driver
+    // calls vglInitExtended(), so this is the line to check if the log stops.
+    Vita_Checkpoint("R_InitOpenGL: R_SetNewMode (vitaGL comes up here)");
+#endif
     R_SetNewMode(true);
 
+#if defined(__vita__)
+    Vita_Checkpoint("R_InitOpenGL: GL context up, initialising input");
+    Vita_SetGLThread();
+    Vita_LogMemoryBudget("after GL");
+#else
+    r_glThreadId = Sys_GetCurrentThreadID();
+#endif
     // input and sound systems need to be tied to the new window
     Sys_InitInput();
 
@@ -858,6 +999,14 @@ void R_InitOpenGL()
     glConfig.shading_language_string = R_GetStringOrEmpty(GL_SHADING_LANGUAGE_VERSION);
     glConfig.extensions_string = (const char*)qglGetString(GL_EXTENSIONS);
 
+#if defined(__vita__)
+    if (glConfig.extensions_string == NULL) {
+        // GLES2 has no indexed glGetStringi; glGetString( GL_EXTENSIONS ) is the
+        // only query there is, so a NULL here just means "no extensions".
+        extensions_string.Clear();
+        glConfig.extensions_string = extensions_string.c_str();
+    }
+#else
     if (glConfig.extensions_string == NULL) {
         // As of OpenGL 3.2, glGetStringi is required to obtain the available extensions
         qglGetStringi = (PFNGLGETSTRINGIPROC)GLimp_ExtensionPointer("glGetStringi");
@@ -881,6 +1030,7 @@ void R_InitOpenGL()
         }
         glConfig.extensions_string = extensions_string.c_str();
     }
+#endif // !__vita__
 
     glConfig.glVersion = 0;
 
@@ -935,15 +1085,37 @@ void R_InitOpenGL()
     // recheck all the extensions (FIXME: this might be dangerous)
     R_CheckPortableExtensions();
 
+#if defined(__vita__)
+    // Before any engine shader exists: the YCoCg result decides how the
+    // interaction shaders are emitted (RenderProgs_GLSL.cpp), and the rest of
+    // it measures the texture formats the port depends on. See
+    // vita_selftest.cpp. Set vita_selfTest 0 in autoexec.cfg to skip it.
+    if (vita_selfTest.GetBool()) {
+        Vita_RunSelfTest();
+    } else {
+        Vita_Checkpoint("selftest: skipped (vita_selfTest 0)");
+    }
+#endif
+
     renderProgManager.Init();
 
     r_initialized = true;
 
     // allocate the vertex array range or vertex objects
     vertexCache.Init();
+#if defined(__vita__)
+    // These two are the largest allocations in the whole renderer and both come
+    // out of the vitaGL pools. Log them separately so a map that still runs out
+    // of memory says which one to cut, instead of leaving a single unexplained
+    // drop across the whole of Init() to guess at.
+    Vita_LogMemory("after vertexCache.Init");
+#endif
 
     // allocate the frame data, which may be more if smp is enabled
     R_InitFrameData();
+#if defined(__vita__)
+    Vita_LogMemory("after R_InitFrameData");
+#endif
 
     // Reset our gamma
     R_SetColorMappings();
@@ -2536,6 +2708,11 @@ void idRenderSystemLocal::InitOpenGL()
     // if OpenGL isn't started, start it now
     if (!R_IsInitialized()) {
         R_InitOpenGL();
+#if defined(__vita__)
+        // the decoder's frame buffers: claimed now, before any map's textures
+        // can take that memory (vita_avplayer.cpp)
+        VitaVideo_ReserveArena();
+#endif
 
         // Reloading images here causes the rendertargets to get deleted. Figure out how to handle this properly on 360
         globalImages->ReloadImages(true);

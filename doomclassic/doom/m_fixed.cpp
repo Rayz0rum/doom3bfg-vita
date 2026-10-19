@@ -43,6 +43,7 @@ If you have questions concerning this license or the applicable additional terms
 
 // Fixme. __USE_C_FIXED__ or something.
 
+#if !defined(__vita__) // inline in m_fixed.h there
 fixed_t
 FixedMul
 ( fixed_t	a,
@@ -70,6 +71,8 @@ FixedDiv
 }
 
 
+
+#endif
 
 fixed_t
 FixedDiv2

@@ -285,6 +285,11 @@ void idMenuHandler::Update()
 
     if (gui != NULL && gui->IsActive()) {
         gui->Render(renderSystem, Sys_Milliseconds());
+#if defined(__vita__)
+        if (activeScreen >= 0 && activeScreen < MAX_SCREEN_AREAS && menuScreens[activeScreen] != NULL) {
+            menuScreens[activeScreen]->VitaDrawOverlay();
+        }
+#endif
     }
 }
 

@@ -42,6 +42,30 @@ extern idCVar in_useJoystick;
 
 #define ALPHA_EPSILON 0.001f
 
+#if defined(__vita__)
+#include "../sys/vita/vita_ui.h"
+
+// The SWFs are authored for a TV: everything that matters sits inside the
+// 360's 90% title-safe area. A handheld has no overscan, so scaling by ~1.1
+// about the centre brings that area out to the screen edges - noticeably
+// more readable on the 5" screen without anything leaving it. Sprites the
+// SWF anchors to an edge (_bottomLeft, _topRight, ... - most of the HUD)
+// stay anchored, they just get bigger.
+idCVar vita_uiScale("vita_uiScale", "1.1", CVAR_ARCHIVE | CVAR_FLOAT,
+    "Vita: size of the menus, pause menu, PDA and dialogs (1 = stock layout)", 0.8f, 1.25f);
+// (new names whenever a default changes: archived values from older builds
+// would otherwise keep the old size)
+idCVar vita_hudScale("vita_hudSize", "1.15", CVAR_ARCHIVE | CVAR_FLOAT,
+    "Vita: size of the in-game HUD (1 = stock layout)", 0.8f, 1.3f);
+// the map loading screen: its title, description and tip were small on the
+// 5" screen; the SWF keeps them inside the 360's title-safe area, so ~1.1
+// brings them to the edges (the backdrop just spills further off-screen)
+idCVar vita_loadScreenScale("vita_loadScreenScale", "1.12", CVAR_ARCHIVE | CVAR_FLOAT,
+    "Vita: size of the map loading screen (1 = stock layout)", 0.8f, 1.25f);
+idCVar vita_promptScale("vita_promptScale", "1.15", CVAR_ARCHIVE | CVAR_FLOAT,
+    "Vita: extra size of the menus' button prompts (the bottom-left SELECT / BACK bar), grown from the bottom-left corner", 0.8f, 1.5f);
+#endif
+
 #define STENCIL_DECR -1
 #define STENCIL_INCR -2
 
@@ -129,9 +153,34 @@ void idSWF::Render(idRenderSystem* gui, int time, bool isSplitscreen)
 
     renderBorder = renderState.matrix.tx / scale;
 
+#if defined(__vita__)
+    {
+        const float vitaScale = VitaUiScale();
+        if (vitaScale != 1.0f) {
+            renderState.matrix.xx = scale * vitaScale;
+            renderState.matrix.yy = scale * vitaScale;
+            renderState.matrix.tx = 0.5f * (sysWidth - (frameWidth * scale * vitaScale));
+            renderState.matrix.ty = 0.5f * (sysHeight - (frameHeight * scale * vitaScale));
+        }
+        vitaFrameToScreen = renderState.matrix;
+        vitaCapturing = 0;
+        vitaCaptureAny = false;
+        vitaCaptureAlpha = 0.0f;
+    }
+#endif
+
     scaleToVirtual.Set((float)renderSystem->GetVirtualWidth() / sysWidth, (float)renderSystem->GetVirtualHeight() / sysHeight);
 
     RenderSprite(gui, mainspriteInstance, renderState, time, isSplitscreen);
+
+#if defined(__vita__)
+    vitaCaptureValid = vitaCaptureAny;
+    if (vitaCaptureAny) {
+        vitaCapturedMins = vitaCaptureMins;
+        vitaCapturedMaxs = vitaCaptureMaxs;
+        vitaCapturedAlpha = vitaCaptureAlpha;
+    }
+#endif
 
     if (blackbars) {
         float barWidth = renderState.matrix.tx + 0.5f;
@@ -215,13 +264,19 @@ void idSWF::RenderSprite(idRenderSystem* gui, idSWFSpriteInstance* spriteInstanc
         for (int j = 0; j < activeMasks.Num(); j++) {
             const swfDisplayEntry_t* mask = activeMasks[j];
             if (display.depth > mask->clipDepth) {
-                RenderMask(gui, mask, renderState, STENCIL_DECR);
+#if defined(__vita__)
+                if (vitaCapturing == 0)
+#endif
+                    RenderMask(gui, mask, renderState, STENCIL_DECR);
                 activeMasks.RemoveIndexFast(j);
             }
         }
         if (display.clipDepth > 0) {
             activeMasks.Append(&display);
-            RenderMask(gui, &display, renderState, STENCIL_INCR);
+#if defined(__vita__)
+            if (vitaCapturing == 0)
+#endif
+                RenderMask(gui, &display, renderState, STENCIL_INCR);
             continue;
         }
         idSWFDictionaryEntry* entry = FindDictionaryEntry(display.characterID);
@@ -364,7 +419,37 @@ void idSWF::RenderSprite(idRenderSystem* gui, idSWFSpriteInstance* spriteInstanc
                 }
             }
 
+#if defined(__vita__)
+            const bool vitaCaptureThis = (display.spriteInstance == vitaCaptureSprite && vitaCaptureSprite != NULL);
+            vitaCapturing += vitaCaptureThis ? 1 : 0;
+            // the menus' command bar ("prompts": SELECT / BACK ...) a little
+            // bigger, grown away from the screen's bottom-left corner so it
+            // stays where it is and cannot be pushed off the edge
+            if (display.spriteInstance->name.Icmp("prompts") == 0 && vita_promptScale.GetFloat() != 1.0f
+                && VitaUiScale() == vita_uiScale.GetFloat()) {
+                const float s = vita_promptScale.GetFloat();
+                const float cornerX = 0.0f;
+                const float cornerY = (float)renderSystem->GetHeight();
+                renderState2.matrix.xx *= s;
+                renderState2.matrix.xy *= s;
+                renderState2.matrix.yx *= s;
+                renderState2.matrix.yy *= s;
+                renderState2.matrix.tx = s * renderState2.matrix.tx + (1.0f - s) * cornerX;
+                renderState2.matrix.ty = s * renderState2.matrix.ty + (1.0f - s) * cornerY;
+            }
             RenderSprite(gui, display.spriteInstance, renderState2, time, isSplitscreen);
+            vitaCapturing -= vitaCaptureThis ? 1 : 0;
+        } else if (vitaCapturing > 0) {
+            // inside the capture sprite: record where it would draw, draw nothing
+            vitaCaptureAlpha = Max(vitaCaptureAlpha, idMath::ClampFloat(0.0f, 1.0f, renderState2.cxf.mul.w + renderState2.cxf.add.w));
+            if ((entry->type == SWF_DICT_SHAPE || entry->type == SWF_DICT_MORPH) && entry->shape != NULL) {
+                VitaCaptureRect(entry->shape->startBounds, renderState2.matrix);
+            } else if (entry->type == SWF_DICT_EDITTEXT && display.textInstance != NULL && display.textInstance->editText != NULL) {
+                VitaCaptureRect(display.textInstance->editText->bounds, renderState2.matrix);
+            }
+#else
+            RenderSprite(gui, display.spriteInstance, renderState2, time, isSplitscreen);
+#endif
         } else if (entry->type == SWF_DICT_SHAPE) {
             RenderShape(gui, entry->shape, renderState2);
         } else if (entry->type == SWF_DICT_MORPH) {
@@ -377,9 +462,73 @@ void idSWF::RenderSprite(idRenderSystem* gui, idSWFSpriteInstance* spriteInstanc
     }
     for (int j = 0; j < activeMasks.Num(); j++) {
         const swfDisplayEntry_t* mask = activeMasks[j];
-        RenderMask(gui, mask, renderState, STENCIL_DECR);
+#if defined(__vita__)
+        if (vitaCapturing == 0)
+#endif
+            RenderMask(gui, mask, renderState, STENCIL_DECR);
     }
 }
+
+#if defined(__vita__)
+/*
+========================
+idSWF::VitaCaptureRect / VitaGetCaptureBounds / VitaDrawQuad / VitaUiScale
+========================
+*/
+void idSWF::VitaCaptureRect(const swfRect_t& rect, const swfMatrix_t& matrix)
+{
+    const idVec2 corners[4] = {
+        matrix.Transform(rect.tl), matrix.Transform(idVec2(rect.br.x, rect.tl.y)),
+        matrix.Transform(rect.br), matrix.Transform(idVec2(rect.tl.x, rect.br.y))
+    };
+    for (int i = 0; i < 4; i++) {
+        if (!vitaCaptureAny) {
+            vitaCaptureMins = vitaCaptureMaxs = corners[i];
+            vitaCaptureAny = true;
+            continue;
+        }
+        vitaCaptureMins.x = Min(vitaCaptureMins.x, corners[i].x);
+        vitaCaptureMins.y = Min(vitaCaptureMins.y, corners[i].y);
+        vitaCaptureMaxs.x = Max(vitaCaptureMaxs.x, corners[i].x);
+        vitaCaptureMaxs.y = Max(vitaCaptureMaxs.y, corners[i].y);
+    }
+}
+
+bool idSWF::VitaGetCaptureBounds(idVec2& mins, idVec2& maxs, float* alpha) const
+{
+    if (!vitaCaptureValid) {
+        return false;
+    }
+    mins = vitaCapturedMins;
+    maxs = vitaCapturedMaxs;
+    if (alpha != NULL) {
+        *alpha = vitaCapturedAlpha;
+    }
+    return true;
+}
+
+void idSWF::VitaDrawQuad(const idVec2& tl, const idVec2& tr, const idVec2& br, const idVec2& bl,
+    float s1, float t1, float s2, float t2, const idMaterial* material)
+{
+    DrawStretchPic(idVec4(tl.x, tl.y, s1, t1), idVec4(tr.x, tr.y, s2, t1), idVec4(br.x, br.y, s2, t2), idVec4(bl.x, bl.y, s1, t2), material);
+}
+
+float idSWF::VitaUiScale() const
+{
+    if (filename.Icmp("swf/hud.swf") == 0) {
+        return vita_hudScale.GetFloat();
+    }
+    if (filename.Icmp("swf/shell.swf") == 0 || filename.Icmp("swf/pause.swf") == 0
+        || filename.Icmp("swf/pda.swf") == 0 || filename.Icmp("swf/dialog.swf") == 0) {
+        return vita_uiScale.GetFloat();
+    }
+    if (filename.Icmpn("swf/loading/", 12) == 0) {
+        return vita_loadScreenScale.GetFloat();
+    }
+    // intros and the save spinner keep the stock layout
+    return 1.0f;
+}
+#endif
 
 /*
 ========================
@@ -559,6 +708,19 @@ void idSWF::RenderShape(idRenderSystem* gui, const idSWFShape* shape, const swfR
             // de-normalize color channels after DXT decompression
             color.mul = entry->channelScale;
             useAtlas = true;
+#if defined(__vita__)
+            // a stock Xbox 360 / PS3 prompt: draw the Vita button instead,
+            // same size and place, from the Vita UI atlas (uncompressed RGBA,
+            // so no channel scale)
+            if (entry->vitaGlyph >= 0 && Vita_UI_Material() != NULL) {
+                float s1, t1, s2, t2;
+                Vita_UI_GlyphST(entry->vitaGlyph, s1, t1, s2, t2);
+                material = Vita_UI_Material();
+                atlasScale.Set(s2 - s1, t2 - t1);
+                atlasBias.Set(s1, t1);
+                color.mul.Set(1.0f, 1.0f, 1.0f, 1.0f);
+            }
+#endif
 
             const swfMatrix_t& styleMatrix = fill.style.startMatrix;
             invMatrix = styleMatrix.Inverse();
@@ -1359,10 +1521,10 @@ void idSWF::RenderEditText(idRenderSystem* gui, idSWFTextInstance* textInstance,
                 idVec2 br = matrix.Transform(idVec2(imageX + imageW, imageY + imageH));
                 idVec2 bl = matrix.Transform(idVec2(imageX, imageY + imageH));
 
-                float s1 = 0.0f;
-                float t1 = 0.0f;
-                float s2 = 1.0f;
-                float t2 = 1.0f;
+                float s1 = icon.s1;
+                float t1 = icon.t1;
+                float s2 = icon.s2;
+                float t2 = icon.t2;
 
                 // uint32 color = gui->GetColor();
                 idVec4 imgColor = colorWhite;
@@ -1517,7 +1679,21 @@ void idSWF::FindTooltipIcons(idStr* text)
             icon.startIndex = index;
             icon.endIndex = index + idStr::Length(tooltipButtonImage[count].key);
 
+#if defined(__vita__)
+            // "<JOY1>" -> the Vita glyph for that key, from the Vita UI atlas
+            idStr keyName = tooltipButtonImage[count].key;
+            keyName.StripLeadingOnce("<");
+            keyName.StripTrailingOnce(">");
+            const int glyph = Vita_UI_GlyphForKeyName(keyName.c_str());
+            if (glyph >= 0 && Vita_UI_Material() != NULL) {
+                icon.material = Vita_UI_Material();
+                Vita_UI_GlyphST(glyph, icon.s1, icon.t1, icon.s2, icon.t2);
+            } else {
+                icon.material = (tooltipButtonImage[count].xbImage[0] != '\0') ? declManager->FindMaterial(tooltipButtonImage[count].xbImage) : NULL;
+            }
+#else
             icon.material = declManager->FindMaterial(tooltipButtonImage[count].xbImage);
+#endif
 
             if (icon.material) {
                 icon.imageWidth = tooltipButtonImage[count].width;

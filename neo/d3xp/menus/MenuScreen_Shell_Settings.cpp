@@ -67,7 +67,11 @@ void idMenuScreen_Shell_Settings::Initialize(idMenuHandler* data)
     menuOptions.Append(option);
     option.Clear();
 
+#if !defined(__vita__) // no 3D Options on the Vita
     if (renderSystem->IsStereoScopicRenderingSupported()) {
+#else
+    if (false) {
+#endif
         option.Append("#str_swf_stereoscopics"); // Stereoscopic Rendering
         menuOptions.Append(option);
     }
@@ -216,7 +220,12 @@ bool idMenuScreen_Shell_Settings::HandleAction(idWidgetAction& action, const idW
     case WIDGET_ACTION_COMMAND: {
         switch (parms[0].ToInteger()) {
         case SETTING_CMD_CONTROLS: {
+#if defined(__vita__)
+            // the Controls screen only held "Gamepad" on the Vita: straight there
+            menuData->SetNextScreen(SHELL_AREA_GAMEPAD, MENU_TRANSITION_SIMPLE);
+#else
             menuData->SetNextScreen(SHELL_AREA_CONTROLS, MENU_TRANSITION_SIMPLE);
+#endif
             break;
         }
         case SETTING_CMD_GAMEPLAY: {

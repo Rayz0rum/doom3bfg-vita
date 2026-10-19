@@ -205,6 +205,9 @@ public:
     virtual bool IsBinaryModel(const idStr& resName) const = 0;
     virtual bool IsSoundSample(const idStr& resName) const = 0;
     virtual bool GetResourceCacheEntry(const char* fileName, idResourceCacheEntry& rc) = 0;
+    // OS path of the .resources container a resource lives in, and where inside
+    // it - for readers that stream from the container on their own file handle
+    virtual bool GetResourceLocation(const char* fileName, idStr& osPath, int& offset, int& length) = 0;
     virtual void FreeResourceBuffer() = 0;
     virtual void AddImagePreload(const char* resName, int filter, int repeat, int usage, int cube) = 0;
     virtual void AddSamplePreload(const char* resName) = 0;

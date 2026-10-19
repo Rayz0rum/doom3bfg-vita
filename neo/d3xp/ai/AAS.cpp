@@ -75,6 +75,10 @@ idAASLocal::~idAASLocal()
 idAASLocal::Init
 ============
 */
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+void Vita_FloorEdgeCacheClear(); // AAS_pathing.cpp
+#endif
+
 bool idAASLocal::Init(const idStr& mapName, unsigned int mapFileCRC)
 {
     if (file && mapName.Icmp(file->GetName()) == 0 && mapFileCRC == file->GetCRC()) {
@@ -83,6 +87,9 @@ bool idAASLocal::Init(const idStr& mapName, unsigned int mapFileCRC)
     } else {
         Shutdown();
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        Vita_FloorEdgeCacheClear();
+#endif
         file = AASFileManager->LoadAAS(mapName, mapFileCRC);
         if (!file) {
             common->DWarning("Couldn't load AAS file: '%s'", mapName.c_str());
@@ -105,6 +112,9 @@ void idAASLocal::Shutdown()
         RemoveAllObstacles();
         AASFileManager->FreeAAS(file);
         file = NULL;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        Vita_FloorEdgeCacheClear();
+#endif
     }
 }
 

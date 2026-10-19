@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #include "../Game_local.h"
 
@@ -683,6 +684,7 @@ idThread::Execute
 */
 bool idThread::Execute()
 {
+    VITA_ZONE("script threads");
     idThread* oldThread;
     bool done;
 
@@ -695,7 +697,25 @@ bool idThread::Execute()
 
     lastExecuteTime = gameLocal.time;
     ClearWaitFor();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // a whole run over 20 ms: where the script stopped (the slow events
+    // inside it are logged on their own - Script_Interpreter.cpp)
+    const uint64 vitaRunStart = Sys_Microseconds();
+    const function_t* vitaRunFunc = interpreter.GetCurrentFunction();
+#endif
     done = interpreter.Execute();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    const uint64 vitaRunUs = Sys_Microseconds() - vitaRunStart;
+    if (vitaRunUs > 20000) {
+        static int vitaSlowRuns = 0;
+        if (vitaSlowRuns++ < 40) {
+            const function_t* func = interpreter.GetCurrentFunction();
+            common->Printf("slow script thread: '%s' ran %.1f ms (from %s to %s, %s:%d), game time %d\n", GetThreadName(), vitaRunUs / 1000.0,
+                vitaRunFunc ? vitaRunFunc->Name() : "?", func ? func->Name() : (done ? "(done)" : "?"),
+                done ? "-" : interpreter.CurrentFile(), done ? 0 : interpreter.CurrentLine(), gameLocal.time);
+        }
+    }
+#endif
     if (done) {
         End();
         if (interpreter.terminateOnExit) {
@@ -1211,6 +1231,7 @@ idThread::Event_Spawn
 */
 void idThread::Event_Spawn(const char* classname)
 {
+    VITA_ZONE("script: sys.spawn");
     idEntity* ent;
 
     spawnArgs.Set("classname", classname);

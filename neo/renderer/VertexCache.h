@@ -28,6 +28,57 @@ If you have questions concerning this license or the applicable additional terms
 #ifndef __VERTEXCACHE2_H__
 #define __VERTEXCACHE2_H__
 
+#if defined(__vita__)
+
+// idVertexCache::Init() allocates all of these up front. At the stock sizes that
+// is 2 * (31 + 31 + 0.25) + 31 + 31 = ~186 MB of GPU-visible buffers, which was
+// sized for a 512 MB unified-memory console. The Vita has to fit them alongside
+// everything else in main RAM, phycont and 128 MB of CDRAM, so they are scaled
+// to what a 960x544 target actually consumes.
+//
+// Undersizing is safe to iterate on: ActuallyAlloc() returns 0 when a set is
+// full and the surface is dropped with a warning, so a too-small cache shows up
+// as missing geometry rather than a crash.
+// Measured: these land in CDRAM, and at 10 MB each they were 70 MB of the 96 MB
+// VRAM pool, leaving 13 MB for every texture a map loads. The per-frame sets are
+// the safe ones to cut - see the note above - so they take the reduction and the
+// static sets, whose overflow is a FatalError, keep their headroom.
+const int VERTCACHE_INDEX_MEMORY_PER_FRAME = 4 * 1024 * 1024;  // ~2M indices/frame
+const int VERTCACHE_VERTEX_MEMORY_PER_FRAME = 4 * 1024 * 1024; // ~131k idDrawVert/frame
+const int VERTCACHE_JOINT_MEMORY_PER_FRAME = 256 * 1024;
+
+// Four, not two: the Vita lets the GPU run up to two frames behind the CPU
+// (no glFinish at the swap - see GL_BlockingSwapBuffers; vitaGL's display
+// queue holds two pending frames with its three display buffers). While the
+// front end fills frame N+1's set, the back end submits frame N and the GPU
+// may still be drawing N-1 and N-2: four sets keep them all apart. The sets
+// live in vitaGL's RAM pool (dynamic buffers), 8.25 MB each.
+const int VERTCACHE_NUM_FRAMES = 4;
+
+// there are a lot more static indexes than vertexes, because interactions are just new
+// index lists that reference existing vertexes
+// Sized from measurement rather than guessed. 8 MB of static vertex memory was
+// too mean: d3xpdm3 died on "AllocStaticVertex failed", and of the maps that did
+// load, d3dm5 reached 80% and delta4 82% - no margin at all. Vertex demand
+// tracks geometry density, not map file size, which is why a 33 MB deathmatch
+// map overflowed while a 55 MB campaign map fit.
+//
+// Index memory pays for it: the same three maps peaked at 17-19% of 8 MB, so
+// halving it to 4 MB still leaves better than 2x headroom and offsets half the
+// vertex increase. Net cost to the RAM pool is 4 MB.
+//
+// The campaign needs more than those deathmatch maps. Measured with the same
+// data structures on a PC build ("Used N kb of static vertex memory" after
+// each map load, all 47 single-player maps), the peaks are phobos3 (RoE) at
+// 26.5 MB of vertices and 9.6 MB of indexes, then le_enpro2 (26.3 / 8.3) and
+// erebus5 (25.4); the original campaign tops out at enpro (24.7 / 7.2), and
+// mars_city2 alone (17.9 / 5.8) overflowed both old limits. 30 + 11 MB covers
+// every map with 13% to spare.
+const int STATIC_INDEX_MEMORY = 11 * 1024 * 1024;
+const int STATIC_VERTEX_MEMORY = 30 * 1024 * 1024; // must fit in VERTCACHE_OFFSET_MASK
+
+#else
+
 const int VERTCACHE_INDEX_MEMORY_PER_FRAME = 31 * 1024 * 1024;
 const int VERTCACHE_VERTEX_MEMORY_PER_FRAME = 31 * 1024 * 1024;
 const int VERTCACHE_JOINT_MEMORY_PER_FRAME = 256 * 1024;
@@ -38,6 +89,8 @@ const int VERTCACHE_NUM_FRAMES = 2;
 // index lists that reference existing vertexes
 const int STATIC_INDEX_MEMORY = 31 * 1024 * 1024;
 const int STATIC_VERTEX_MEMORY = 31 * 1024 * 1024; // make sure it fits in VERTCACHE_OFFSET_MASK!
+
+#endif
 
 // vertCacheHandle_t packs size, offset, and frame number into 64 bits
 typedef uint64 vertCacheHandle_t;

@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "../Game_local.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 CLASS_DECLARATION(idPhysics_Base, idPhysics_AF)
 END_CLASS
@@ -266,7 +267,7 @@ idAFConstraint::Restore
 void idAFConstraint::Restore(idRestoreGame* saveFile)
 {
     constraintType_t t;
-    saveFile->ReadInt((int&)t);
+    saveFile->ReadEnum(t);
     assert(t == type);
 }
 
@@ -4665,6 +4666,221 @@ void idAFTree::Factor() const
     }
 }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+================================================================================
+
+Vita: the tree solve of the auxiliary constraints, without the generic matrix
+code's overhead and latency.
+
+idPhysics_AF::AuxiliaryForces calls idAFTree::Response once per constraint
+row (40 to 60 rows for a ragdoll touching the floor), and each response solves
+the whole tree (Solve below): per body a handful of tiny matrix-vector
+products - 6 x r and r x 6 with r the 1 to 6 rows of a joint. The generic
+idMatX code runs each product one output at a time: a chain of dependent
+multiply-adds (each waits for the one before it on the Cortex-A9's VFP), plus a
+temporary, a size check and a loop per call. That made the responses most of
+the ragdolls' time - and ragdolls are the worst frames of the fights.
+
+These kernels compute every output of a product side by side, each in exactly
+the stock order (the first product, then += in ascending index), so the chains
+overlap in the pipeline and the results are bit-identical: the build never
+reorders float math (-fno-unsafe-math-optimizations), and VFPv3 has no fused
+multiply-add to change the rounding. vita_afFastTreeVerify (PC test build)
+runs every response both ways and compares the bits.
+
+================================================================================
+*/
+idCVar vita_afFastTree("vita_afFastTree", "1", CVAR_GAME | CVAR_BOOL, "Vita: ragdoll tree responses with the side-by-side kernels (bit-identical); 0 = the generic matrix code");
+#if !defined(__vita__)
+idCVar vita_afFastTreeVerify("vita_afFastTreeVerify", "0", CVAR_GAME | CVAR_BOOL, "PC test build: compute every ragdoll tree response both ways and compare the bits");
+#endif
+static bool vitaAFStockTree = false; // the verify pass, running the stock code
+
+enum { AF_SET = 0, AF_ADD = 1, AF_SUB = 2 };
+
+// dst (=, +=, -=) M * v; M is R x C, row-major: R chains of C multiply-adds
+template <int R, int MODE>
+static ID_INLINE void AF_MulRows(float* dst, const float* m, const int C, const float* v)
+{
+    float sum[R];
+    for (int i = 0; i < R; i++) {
+        sum[i] = m[i * C] * v[0];
+    }
+    for (int j = 1; j < C; j++) {
+        const float vj = v[j];
+        for (int i = 0; i < R; i++) {
+            sum[i] += m[i * C + j] * vj;
+        }
+    }
+    for (int i = 0; i < R; i++) {
+        if (MODE == AF_SET) {
+            dst[i] = sum[i];
+        } else if (MODE == AF_ADD) {
+            dst[i] = dst[i] + sum[i];
+        } else {
+            dst[i] = dst[i] - sum[i];
+        }
+    }
+}
+
+// dst (=, +=, -=) M^T * v; M is R x C, row-major: C chains of R multiply-adds
+template <int C, int MODE>
+static ID_INLINE void AF_MulColumns(float* dst, const float* m, const int R, const float* v)
+{
+    float sum[C];
+    const float v0 = v[0];
+    for (int i = 0; i < C; i++) {
+        sum[i] = m[i] * v0;
+    }
+    for (int j = 1; j < R; j++) {
+        const float* row = m + j * C;
+        const float vj = v[j];
+        for (int i = 0; i < C; i++) {
+            sum[i] += row[i] * vj;
+        }
+    }
+    for (int i = 0; i < C; i++) {
+        if (MODE == AF_SET) {
+            dst[i] = sum[i];
+        } else if (MODE == AF_ADD) {
+            dst[i] = dst[i] + sum[i];
+        } else {
+            dst[i] = dst[i] - sum[i];
+        }
+    }
+}
+
+// the generic code's semantics, sizes checked; anything over 6 x 6 (never
+// seen in a tree) or of an unexpected size goes to the generic code
+template <int MODE>
+static ID_INLINE void AF_Mul(idVecX& dst, const idMatX& M, const idVecX& v)
+{
+    const int R = M.GetNumRows();
+    const int C = M.GetNumColumns();
+    if (dst.GetSize() == R && v.GetSize() == C && C >= 1) {
+        float* d = dst.ToFloatPtr();
+        const float* m = M.ToFloatPtr();
+        const float* x = v.ToFloatPtr();
+        switch (R) {
+        case 1: AF_MulRows<1, MODE>(d, m, C, x); return;
+        case 2: AF_MulRows<2, MODE>(d, m, C, x); return;
+        case 3: AF_MulRows<3, MODE>(d, m, C, x); return;
+        case 4: AF_MulRows<4, MODE>(d, m, C, x); return;
+        case 5: AF_MulRows<5, MODE>(d, m, C, x); return;
+        case 6: AF_MulRows<6, MODE>(d, m, C, x); return;
+        }
+    }
+    if (MODE == AF_SET) {
+        M.Multiply(dst, v);
+    } else if (MODE == AF_ADD) {
+        M.MultiplyAdd(dst, v);
+    } else {
+        M.MultiplySub(dst, v);
+    }
+}
+
+template <int MODE>
+static ID_INLINE void AF_TransposeMul(idVecX& dst, const idMatX& M, const idVecX& v)
+{
+    const int R = M.GetNumRows();
+    const int C = M.GetNumColumns();
+    if (dst.GetSize() == C && v.GetSize() == R && R >= 1) {
+        float* d = dst.ToFloatPtr();
+        const float* m = M.ToFloatPtr();
+        const float* x = v.ToFloatPtr();
+        switch (C) {
+        case 1: AF_MulColumns<1, MODE>(d, m, R, x); return;
+        case 2: AF_MulColumns<2, MODE>(d, m, R, x); return;
+        case 3: AF_MulColumns<3, MODE>(d, m, R, x); return;
+        case 4: AF_MulColumns<4, MODE>(d, m, R, x); return;
+        case 5: AF_MulColumns<5, MODE>(d, m, R, x); return;
+        case 6: AF_MulColumns<6, MODE>(d, m, R, x); return;
+        }
+    }
+    if (MODE == AF_SET) {
+        M.TransposeMultiply(dst, v);
+    } else if (MODE == AF_ADD) {
+        M.TransposeMultiplyAdd(dst, v);
+    } else {
+        M.TransposeMultiplySub(dst, v);
+    }
+}
+
+static ID_INLINE bool AF_FastTree()
+{
+    return !vitaAFStockTree && vita_afFastTree.GetBool();
+}
+
+/*
+================
+idAFTree::VitaSolveFast
+
+  Solve, with the kernels above (same operations, same order)
+================
+*/
+void idAFTree::VitaSolveFast(int auxiliaryIndex) const
+{
+    int i, j;
+    idAFBody *body, *child;
+    idAFConstraint* primaryConstraint;
+
+    // from the leaves up towards the root
+    for (i = sortedBodies.Num() - 1; i >= 0; i--) {
+        body = sortedBodies[i];
+
+        for (j = 0; j < body->children.Num(); j++) {
+            child = body->children[j];
+            primaryConstraint = child->primaryConstraint;
+
+            if (!child->fl.isZero) {
+                AF_TransposeMul<AF_SUB>(primaryConstraint->s, child->J, child->s);
+                primaryConstraint->fl.isZero = false;
+            }
+            if (!primaryConstraint->fl.isZero) {
+                AF_TransposeMul<AF_SUB>(body->s, primaryConstraint->J, primaryConstraint->s);
+                body->fl.isZero = false;
+            }
+        }
+    }
+
+    bool useSymmetry = af_useSymmetry.GetBool();
+
+    // from the root down towards the leaves
+    for (i = 0; i < sortedBodies.Num(); i++) {
+        body = sortedBodies[i];
+        primaryConstraint = body->primaryConstraint;
+
+        if (primaryConstraint) {
+
+            if (useSymmetry && body->parent->maxSubTreeAuxiliaryIndex < auxiliaryIndex) {
+                continue;
+            }
+
+            if (!primaryConstraint->fl.isZero) {
+                AF_Mul<AF_SET>(primaryConstraint->s, primaryConstraint->invI, primaryConstraint->s);
+            }
+            AF_Mul<AF_SUB>(primaryConstraint->s, primaryConstraint->J, primaryConstraint->body2->s);
+
+            primaryConstraint->lm = primaryConstraint->s;
+
+            if (useSymmetry && body->maxSubTreeAuxiliaryIndex < auxiliaryIndex) {
+                continue;
+            }
+
+            if (body->children.Num()) {
+                if (!body->fl.isZero) {
+                    AF_Mul<AF_SET>(body->s, body->invI, body->s);
+                }
+                AF_Mul<AF_SUB>(body->s, body->J, primaryConstraint->s);
+            }
+        } else if (body->children.Num()) {
+            AF_Mul<AF_SET>(body->s, body->invI, body->s);
+        }
+    }
+}
+#endif
+
 /*
 ================
 idAFTree::Solve
@@ -4776,6 +4992,13 @@ void idAFTree::Response(const idAFConstraint* constraint, int row, int auxiliary
         body->GetResponseForce(body->numResponses).Zero();
     }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (AF_FastTree()) {
+        VitaResponseFast(constraint, row, auxiliaryIndex, v);
+        return;
+    }
+#endif
+
     // set right hand side for first constrained body
     body = constraint->body1;
     if (body->tree == this) {
@@ -4839,6 +5062,92 @@ void idAFTree::Response(const idAFConstraint* constraint, int row, int auxiliary
         body->responseIndex[body->numResponses++] = auxiliaryIndex;
     }
 }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+================
+idAFTree::VitaResponseFast
+
+  Response after its right hand side was zeroed, with the kernels (same
+  operations, same order); v is Response's 6 float scratch vector
+================
+*/
+void idAFTree::VitaResponseFast(const idAFConstraint* constraint, int row, int auxiliaryIndex, idVecX& v) const
+{
+    int i, j;
+    idAFBody* body;
+    idAFConstraint *child, *primaryConstraint;
+    VITA_ZONE_BEGIN(responseRhs, "AF response: right-hand side (constraint row through the bodies' inertia)");
+
+    // set right hand side for first constrained body
+    body = constraint->body1;
+    if (body->tree == this) {
+        body->InverseWorldSpatialInertiaMultiply(v, constraint->J1[row]);
+        primaryConstraint = body->primaryConstraint;
+        if (primaryConstraint) {
+            AF_Mul<AF_SET>(primaryConstraint->s, primaryConstraint->J1, v);
+            primaryConstraint->fl.isZero = false;
+        }
+        for (i = 0; i < body->children.Num(); i++) {
+            child = body->children[i]->primaryConstraint;
+            AF_Mul<AF_SET>(child->s, child->J2, v);
+            child->fl.isZero = false;
+        }
+        body->GetResponseForce(body->numResponses) = constraint->J1.SubVec6(row);
+    }
+
+    // set right hand side for second constrained body
+    body = constraint->body2;
+    if (body && body->tree == this) {
+        body->InverseWorldSpatialInertiaMultiply(v, constraint->J2[row]);
+        primaryConstraint = body->primaryConstraint;
+        if (primaryConstraint) {
+            AF_Mul<AF_ADD>(primaryConstraint->s, primaryConstraint->J1, v);
+            primaryConstraint->fl.isZero = false;
+        }
+        for (i = 0; i < body->children.Num(); i++) {
+            child = body->children[i]->primaryConstraint;
+            AF_Mul<AF_ADD>(child->s, child->J2, v);
+            child->fl.isZero = false;
+        }
+        body->GetResponseForce(body->numResponses) = constraint->J2.SubVec6(row);
+    }
+
+    VITA_ZONE_END(responseRhs);
+    // solve for primary constraints
+    VITA_ZONE_BEGIN(responseSolve, "AF response: tree solve (leaves up, root down)");
+    VitaSolveFast(auxiliaryIndex);
+    VITA_ZONE_END(responseSolve);
+
+    bool useSymmetry = af_useSymmetry.GetBool();
+
+    // store body forces in response to the constraint force
+    VITA_ZONE_BEGIN(responseForces, "AF response: body forces");
+    idVecX force;
+    for (i = 0; i < sortedBodies.Num(); i++) {
+        body = sortedBodies[i];
+
+        if (useSymmetry && body->maxAuxiliaryIndex < auxiliaryIndex) {
+            continue;
+        }
+
+        force.SetData(6, body->response + body->numResponses * 8);
+
+        // add forces of all primary constraints acting on this body
+        primaryConstraint = body->primaryConstraint;
+        if (primaryConstraint) {
+            AF_TransposeMul<AF_ADD>(force, primaryConstraint->J1, primaryConstraint->lm);
+        }
+        for (j = 0; j < body->children.Num(); j++) {
+            child = body->children[j]->primaryConstraint;
+            AF_TransposeMul<AF_ADD>(force, child->J2, child->lm);
+        }
+
+        body->responseIndex[body->numResponses++] = auxiliaryIndex;
+    }
+    VITA_ZONE_END(responseForces);
+}
+#endif
 
 /*
 ================
@@ -5210,6 +5519,11 @@ void idPhysics_AF::AuxiliaryForces(float timeStep)
     if (numAuxConstraints == 0) {
         return;
     }
+    // how big the solves are: the LCP's cost grows with the square (and the
+    // cube) of the row count, the tree responses with rows x bodies
+    VITA_ZONE_ADD("AF aux: constraint rows (one-dimensional, summed over solves)", numAuxConstraints);
+    VITA_ZONE_ADD("AF aux: constraint rows squared (summed over solves)", numAuxConstraints * numAuxConstraints);
+    VITA_ZONE_ADD("AF aux: bodies (summed over solves)", bodies.Num());
 
     // allocate memory to store the body response to auxiliary constraint forces
     forcePtr = (float*)_alloca16(bodies.Num() * numAuxConstraints * 8 * sizeof(float));
@@ -5243,6 +5557,7 @@ void idPhysics_AF::AuxiliaryForces(float timeStep)
     }
 
     // calculate forces of primary constraints in response to the auxiliary constraint forces
+    VITA_ZONE_BEGIN(afResponses, "AF aux: tree responses (idAFTree::Response, one per constraint row)");
     for (k = 0, i = 0; i < auxiliaryConstraints.Num(); i++) {
         constraint = auxiliaryConstraints[i];
 
@@ -5257,8 +5572,64 @@ void idPhysics_AF::AuxiliaryForces(float timeStep)
             }
         }
     }
+    VITA_ZONE_END(afResponses);
+#if !defined(__vita__) && defined(ID_VITA_PHYSCHECK)
+    if (vita_afFastTreeVerify.GetBool() && vita_afFastTree.GetBool()) {
+        // keep the fast responses, run the stock code over them, compare
+        idList<float> fastForces;
+        idList<int> fastCounts;
+        for (i = 0; i < bodies.Num(); i++) {
+            body = bodies[i];
+            fastCounts.Append(body->numResponses);
+            for (n = 0; n < body->numResponses; n++) {
+                fastCounts.Append(body->responseIndex[n]);
+                for (l = 0; l < 6; l++) {
+                    fastForces.Append(body->response[n * 8 + l]);
+                }
+            }
+            body->numResponses = 0;
+        }
+        vitaAFStockTree = true;
+        for (k = 0, i = 0; i < auxiliaryConstraints.Num(); i++) {
+            constraint = auxiliaryConstraints[i];
+            for (j = 0; j < constraint->J1.GetNumRows(); j++, k++) {
+                constraint->body1->tree->Response(constraint, j, k);
+                if (constraint->body2 && constraint->body2->tree != constraint->body1->tree) {
+                    constraint->body2->tree->Response(constraint, j, k);
+                }
+            }
+        }
+        vitaAFStockTree = false;
+        int fi = 0, ci = 0, compared = 0, differ = 0;
+        for (i = 0; i < bodies.Num() && differ == 0; i++) {
+            body = bodies[i];
+            const int fastNum = fastCounts[ci++];
+            if (fastNum != body->numResponses) {
+                differ++;
+                gameLocal.Printf("vita_afFastTreeVerify: body %d has %d responses, the stock code %d\n", i, fastNum, body->numResponses);
+                break;
+            }
+            for (n = 0; n < body->numResponses; n++) {
+                const int fastIndex = fastCounts[ci++];
+                for (l = 0; l < 6; l++, fi++) {
+                    compared++;
+                    const float a = fastForces[fi];
+                    const float b = body->response[n * 8 + l];
+                    if (memcmp(&a, &b, sizeof(float)) != 0 || fastIndex != body->responseIndex[n]) {
+                        if (differ++ < 10) {
+                            gameLocal.Printf("vita_afFastTreeVerify: body %d response %d [%d]: fast %.9g (index %d), stock %.9g (index %d)\n", i, n, l, a, fastIndex, b, body->responseIndex[n]);
+                        }
+                    }
+                }
+            }
+        }
+        VITA_ZONE_ADD("AF verify: tree response values compared", compared);
+        VITA_ZONE_ADD("AF verify: tree response values DIFFERENT", differ);
+    }
+#endif
 
     // NOTE: the rows are 16 byte padded
+    VITA_ZONE_BEGIN(afMatrix, "AF aux: constraint matrix (rows x body responses)");
     jmk.SetData(numAuxConstraints, ((numAuxConstraints + 3) & ~3), MATX_ALLOCA(numAuxConstraints * ((numAuxConstraints + 3) & ~3)));
     tmp.SetData(6, VECX_ALLOCA(6));
 
@@ -5309,6 +5680,7 @@ void idPhysics_AF::AuxiliaryForces(float timeStep)
             }
         }
     }
+    VITA_ZONE_END(afMatrix);
 
     invStep = 1.0f / timeStep;
 
@@ -5380,6 +5752,7 @@ void idPhysics_AF::AuxiliaryForces(float timeStep)
 #endif
 
     // calculate auxiliary constraint forces
+    VITA_ZONE_BEGIN(afForces, "AF aux: constraint forces + primary forces again");
     for (k = 0, i = 0; i < auxiliaryConstraints.Num(); i++) {
         constraint = auxiliaryConstraints[i];
 
@@ -5410,6 +5783,7 @@ void idPhysics_AF::AuxiliaryForces(float timeStep)
 
     // recalculate primary constraint forces in response to auxiliary constraint forces
     PrimaryForces(timeStep);
+    VITA_ZONE_END(afForces);
 
     // clear pointers pointing to stack space so tools don't get confused
     for (i = 0; i < bodies.Num(); i++) {
@@ -5802,13 +6176,32 @@ bool idPhysics_AF::EvaluateContacts()
         dir.SubVec3(0).Normalize();
         dir.SubVec3(1).Normalize();
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // Vita (a cut): at most vita_afContactsPerBody contacts a body (stock:
+        // up to 3 a pair of bodies, ~40-60 constraint rows for a ragdoll on
+        // the floor) - each contact is 1 to 3 rows of the LCP, whose cost
+        // grows with the square and cube of the rows: ragdolls were 12-23 ms
+        // of game time a tic after a kill (alphalabs4 fight 3, run 34)
+        extern idCVar vita_afContactsPerBody;
+        const int vitaPerBody = vita_afContactsPerBody.GetInteger();
+        int vitaBodyAdded = 0;
+        numContacts = gameLocal.clip.Contacts(contactInfo, (vitaPerBody > 0) ? Min(10, vitaPerBody * 3) : 10, body->current->worldOrigin, dir.SubVec6(0), 2.0f, // CONTACT_EPSILON,
+            body->clipModel, body->current->worldAxis, body->clipMask, passEntity);
+#else
         numContacts = gameLocal.clip.Contacts(contactInfo, 10, body->current->worldOrigin, dir.SubVec6(0), 2.0f, // CONTACT_EPSILON,
             body->clipModel, body->current->worldAxis, body->clipMask, passEntity);
+#endif
 
 #if 1
         // merge nearby contacts between the same bodies
         // and assure there are at most three planar contacts between any pair of bodies
         for (j = 0; j < numContacts; j++) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            if (vitaPerBody > 0 && vitaBodyAdded >= vitaPerBody) {
+                VITA_ZONE_ADD("AF: contacts left out (vita_afContactsPerBody)", numContacts - j);
+                break;
+            }
+#endif
 
             numBodyContacts = 0;
             for (k = 0; k < contacts.Num(); k++) {
@@ -5828,6 +6221,9 @@ bool idPhysics_AF::EvaluateContacts()
             if (k >= contacts.Num() && numBodyContacts < 3) {
                 contacts.Append(contactInfo[j]);
                 contactBodies.Append(i);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                vitaBodyAdded++;
+#endif
             }
         }
 
@@ -6101,7 +6497,29 @@ bool idPhysics_AF::TestIfAtRest(float timeStep)
 
     // if the simulation should always be suspended after a certain amount time passed
     if (maxMoveTime > 0.0f && current.activateTime > maxMoveTime) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // vita_afMaxMoveTime's cap (0.9 s) is for tangled ragdolls twitching
+        // in place forever; one still falling or sliding was frozen where it
+        // was - a body hanging in the air. Past the cap, a figure with a body
+        // moving faster than 40 u/s keeps going, up to the file's own time or
+        // 5 s at the latest.
+        if (vitaFileMaxMoveTime >= 0.0f) {
+            const float hardMax = (vitaFileMaxMoveTime > 0.0f) ? Min(vitaFileMaxMoveTime, 5.0f) : 5.0f;
+            bool moving = false;
+            for (int b = 0; b < bodies.Num() && !moving; b++) {
+                moving = bodies[b]->current->spatialVelocity.SubVec3(0).LengthSqr() > Square(40.0f);
+            }
+            if (moving && current.activateTime < hardMax) {
+                VITA_ZONE_COUNT("ragdolls kept moving past vita_afMaxMoveTime (still falling or sliding)");
+            } else {
+                return true;
+            }
+        } else {
+            return true;
+        }
+#else
         return true;
+#endif
     }
 
     // test if all bodies hardly moved over a period of time
@@ -6168,6 +6586,16 @@ void idPhysics_AF::Rest()
 {
     int i;
 
+#if defined(VITA_PHYSCHECK)
+    if (current.atRest < 0 && self != NULL) {
+        const float moved = (vpcFromSet && bodies.Num()) ? (bodies[0]->current->worldOrigin - vpcFrom).Length() : 0.0f;
+        Vita_PhysCheck_RagdollRest(self->name.c_str(), current.activateTime, maxMoveTime > 0.0f && current.activateTime >= maxMoveTime,
+            moved, idMath::Sqrt(vpcTopSpeedSqr));
+    }
+    vpcFromSet = false;
+    vpcLongLogged = false;
+    vpcTopSpeedSqr = 0.0f;
+#endif
     current.atRest = gameLocal.time;
 
     for (i = 0; i < bodies.Num(); i++) {
@@ -6187,6 +6615,9 @@ void idPhysics_AF::Activate()
 {
     // if the articulated figure was at rest
     if (current.atRest >= 0) {
+#if defined(VITA_PHYSCHECK)
+        Vita_PhysCheck_RagdollActive();
+#endif
         // normally gravity is added at the end of a simulation frame
         // if the figure was at rest add gravity here so it is applied this simulation frame
         AddGravity();
@@ -6400,8 +6831,25 @@ const idBounds& idPhysics_AF::GetAbsBounds(int id) const
 idPhysics_AF::Evaluate
 ================
 */
+#if defined(__vita__)
+// summed for the perf log (common_frame.cpp): {us, calls}
+struct vitaGameTimer_t {
+    volatile int* sum;
+    uint64 t0;
+    vitaGameTimer_t(volatile int* s, volatile int* calls) : sum(s), t0(Sys_Microseconds()) { __sync_fetch_and_add(calls, 1); }
+    ~vitaGameTimer_t() { __sync_fetch_and_add(sum, (int)(Sys_Microseconds() - t0)); }
+};
+#endif
+#if defined(__vita__)
+volatile int vita_afUs = 0, vita_afCalls = 0;
+#endif
+
 bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
 {
+#if defined(__vita__)
+    vitaGameTimer_t vitaTimer(&vita_afUs, &vita_afCalls);
+#endif
+    VITA_ZONE("physics AF (ragdolls, articulated figures)");
     float timeStep;
 
     if (timeScaleRampStart < MS2SEC(endTimeMSec) && timeScaleRampEnd > MS2SEC(endTimeMSec)) {
@@ -6450,16 +6898,19 @@ bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
 #endif
 
     // evaluate contacts
+    VITA_ZONE_BEGIN(afContacts, "AF: contacts (collision queries)");
     EvaluateContacts();
 
     // setup contact constraints
     SetupContactConstraints();
+    VITA_ZONE_END(afContacts);
 
 #ifdef AF_TIMINGS
     timer_collision.Stop();
 #endif
 
     // evaluate constraint equations
+    VITA_ZONE_BEGIN(afConstraints, "AF: constraint equations + friction");
     EvaluateConstraints(timeStep);
 
     // apply friction
@@ -6467,6 +6918,7 @@ bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
 
     // add frame constraints
     AddFrameConstraints();
+    VITA_ZONE_END(afConstraints);
 
 #ifdef AF_TIMINGS
     int i, numPrimary = 0, numAuxiliary = 0;
@@ -6480,10 +6932,12 @@ bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
 #endif
 
     // factor matrices for primary constraints
+    VITA_ZONE_BEGIN(afPrimary, "AF: primary constraints (factor + forces)");
     PrimaryFactor();
 
     // calculate forces on bodies after applying primary constraints
     PrimaryForces(timeStep);
+    VITA_ZONE_END(afPrimary);
 
 #ifdef AF_TIMINGS
     timer_pc.Stop();
@@ -6491,13 +6945,16 @@ bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
 #endif
 
     // calculate and apply auxiliary constraint forces
+    VITA_ZONE_BEGIN(afAuxiliary, "AF: auxiliary constraints (LCP solve)");
     AuxiliaryForces(timeStep);
+    VITA_ZONE_END(afAuxiliary);
 
 #ifdef AF_TIMINGS
     timer_ac.Stop();
 #endif
 
     // evolve current state to next state
+    VITA_ZONE_BEGIN(afEvolve, "AF: evolve + collisions + rest test");
     Evolve(timeStep);
 
     // debug graphics
@@ -6526,6 +6983,18 @@ bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
     // swap the current and next state
     SwapStates();
 
+#if defined(VITA_PHYSCHECK)
+    if (bodies.Num()) {
+        if (!vpcFromSet) {
+            vpcFromSet = true;
+            vpcFrom = bodies[0]->current->worldOrigin;
+        }
+        for (int b = 0; b < bodies.Num(); b++) {
+            vpcTopSpeedSqr = Max(vpcTopSpeedSqr, bodies[b]->current->spatialVelocity.SubVec3(0).LengthSqr());
+        }
+    }
+#endif
+
     // make sure all clip models are disabled in case they were enabled for self collision
     if (selfCollision && !af_skipSelfCollision.GetBool()) {
         DisableClip();
@@ -6543,6 +7012,32 @@ bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
     } else {
         ActivateContactEntities();
     }
+    VITA_ZONE_END(afEvolve);
+
+#if defined(VITA_PHYSCHECK)
+    // a figure that will not settle: what keeps it going
+    if (current.atRest < 0 && !vpcLongLogged && current.activateTime >= 5.0f && self != NULL) {
+        vpcLongLogged = true;
+        float lin = 0.0f, ang = 0.0f, linAcc = 0.0f, angAcc = 0.0f;
+        for (int b = 0; b < bodies.Num(); b++) {
+            lin = Max(lin, bodies[b]->current->spatialVelocity.SubVec3(0).Length());
+            ang = Max(ang, bodies[b]->current->spatialVelocity.SubVec3(1).Length());
+            linAcc = Max(linAcc, bodies[b]->acceleration.SubVec3(0).Length());
+            angAcc = Max(angAcc, bodies[b]->acceleration.SubVec3(1).Length());
+        }
+        idStr touching;
+        int named = 0;
+        for (int c = 0; c < contactConstraints.Num() && named < 4; c++) {
+            const int e = contactConstraints[c]->GetContact().entityNum;
+            const char* n = (e >= 0 && e < MAX_GENTITIES && gameLocal.entities[e] != NULL) ? gameLocal.entities[e]->name.c_str() : "?";
+            if (touching.Find(n) < 0) {
+                touching += named++ ? ", " : "";
+                touching += n;
+            }
+        }
+        Vita_PhysCheck_RagdollLong(self->name.c_str(), current.activateTime, lin, ang, linAcc, angAcc, contactConstraints.Num(), touching.c_str());
+    }
+#endif
 
     // add gravitational force
     AddGravity();
@@ -6554,6 +7049,9 @@ bool idPhysics_AF::Evaluate(int timeStepMSec, int endTimeMSec)
     if (IsOutsideWorld()) {
         gameLocal.Warning("articulated figure moved outside world bounds for entity '%s' type '%s' at (%s)",
             self->name.c_str(), self->GetType()->classname, bodies[0]->current->worldOrigin.ToString(0));
+#if defined(VITA_PHYSCHECK)
+        Vita_PhysCheck_ObjectOutOfWorld(self->name.c_str(), bodies[0]->current->worldOrigin);
+#endif
         Rest();
     }
 
@@ -6792,6 +7290,12 @@ idPhysics_AF::idPhysics_AF()
     memset(&current, 0, sizeof(current));
     current.atRest = -1;
     current.lastTimeStep = 0.0f;
+#if defined(VITA_PHYSCHECK)
+    vpcFromSet = false;
+    vpcLongLogged = false;
+    vpcFrom.Zero();
+    vpcTopSpeedSqr = 0.0f;
+#endif
     saved = current;
 
     linearFriction = 0.005f;

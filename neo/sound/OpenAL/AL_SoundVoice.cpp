@@ -53,6 +53,34 @@ idSoundVoice_OpenAL::idSoundVoice_OpenAL()
     , hasVUMeter(false)
     , paused(true)
 {
+    ResetALCache();
+#if defined(ID_SOUND_STREAM)
+    numFreeStreamBuffers = 0;
+    streamBuffersCreated = false;
+    streamActive = false;
+    streamStartPending = false;
+    streamStopPending = false;
+    memset(streamBuffers, 0, sizeof(streamBuffers));
+    memset(freeStreamBuffers, 0, sizeof(freeStreamBuffers));
+    streamSample = NULL;
+    streamQueueRate = 0;
+    streamQueueChannels = 0;
+    streamBlock = 0;
+    streamSkip = 0;
+    streamEnded = true;
+    streamRing = NULL;
+    memset(streamReq, 0, sizeof(streamReq));
+    for (int h = 0; h < 2; h++) {
+        streamHalfSample[h] = NULL;
+        streamHalfBlock[h] = 0;
+        streamHalfBlocks[h] = 0;
+        streamHalfValid[h] = false;
+        streamHalfConsumed[h] = false;
+    }
+    fetchSample = NULL;
+    fetchBlock = 0;
+    fetchDone = true;
+#endif
 }
 
 /*
@@ -80,6 +108,7 @@ bool idSoundVoice_OpenAL::CompatibleFormat(idSoundSample_OpenAL* s)
     return false;
 }
 
+#if !defined(ID_SOUND_STREAM) // streaming versions in AL_SoundStream.cpp
 /*
 ========================
 idSoundVoice_OpenAL::Create
@@ -172,6 +201,7 @@ void idSoundVoice_OpenAL::Create(const idSoundSample* leadinSample_, const idSou
 
     // RB: FIXME 0.0f ?
     alSourcef(openalSource, AL_GAIN, 1.0f);
+    ResetALCache();
 
     // OnBufferStart( leadinSample, 0 );
 }
@@ -473,6 +503,7 @@ bool idSoundVoice_OpenAL::Update()
     return true;
 }
 
+#endif // !ID_SOUND_STREAM
 /*
 ========================
 idSoundVoice_OpenAL::IsPlaying
@@ -515,6 +546,10 @@ idSoundVoice_OpenAL::Pause
 */
 void idSoundVoice_OpenAL::Pause()
 {
+#if defined(ID_SOUND_STREAM)
+    // the worker restarts a source that ran dry unless it is paused
+    idScopedCriticalSection lock(streamLock);
+#endif
     if (!alIsSource(openalSource) || paused) {
         return;
     }
@@ -535,6 +570,9 @@ idSoundVoice_OpenAL::UnPause
 */
 void idSoundVoice_OpenAL::UnPause()
 {
+#if defined(ID_SOUND_STREAM)
+    idScopedCriticalSection lock(streamLock);
+#endif
     if (!alIsSource(openalSource) || !paused) {
         return;
     }
@@ -548,6 +586,7 @@ void idSoundVoice_OpenAL::UnPause()
     paused = false;
 }
 
+#if !defined(ID_SOUND_STREAM) // streaming version in AL_SoundStream.cpp
 /*
 ========================
 idSoundVoice_OpenAL::Stop
@@ -572,6 +611,7 @@ void idSoundVoice_OpenAL::Stop()
     }
 }
 
+#endif // !ID_SOUND_STREAM
 /*
 ========================
 idSoundVoice_OpenAL::GetAmplitude
@@ -671,6 +711,7 @@ void idSoundVoice_OpenAL::SetSampleRate(uint32 newSampleRate, uint32 operationSe
     */
 }
 
+#if !defined(ID_SOUND_STREAM) // streaming versions in AL_SoundStream.cpp
 /*
 ========================
 idSoundVoice_OpenAL::OnBufferStart
@@ -694,3 +735,5 @@ void idSoundVoice_OpenAL::OnBufferStart(idSoundSample_OpenAL* sample, int buffer
 
     SubmitBuffer(nextSample, nextBuffer, 0);
 }
+
+#endif // !ID_SOUND_STREAM

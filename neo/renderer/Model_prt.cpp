@@ -30,6 +30,10 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h"
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_particleThin("vita_particleThin", "1", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: particle stages of 4 or more particles build and draw only 1 in 2 (1) or 1 in 4 (2) of them; 0 = all");
+#endif
 #include "Model_local.h"
 
 static const char* parametricParticle_SnapshotName = "_ParametricParticle_Snapshot_";
@@ -71,8 +75,25 @@ void idRenderModelPrt::TouchData()
 idRenderModelPrt::InstantiateDynamicModel
 ====================
 */
+#if defined(__vita__)
+volatile int vita_prtUs = 0;     // per perf window (common_frame.cpp)
+volatile int vita_prtModels = 0;
+struct vitaPrtTimer_t {
+    uint64 t0;
+    vitaPrtTimer_t() : t0(Sys_Microseconds()) { }
+    ~vitaPrtTimer_t()
+    {
+        __sync_fetch_and_add(&vita_prtUs, (int)(Sys_Microseconds() - t0));
+        __sync_fetch_and_add(&vita_prtModels, 1);
+    }
+};
+#endif
+
 idRenderModel* idRenderModelPrt::InstantiateDynamicModel(const struct renderEntity_s* renderEntity, const viewDef_t* viewDef, idRenderModel* cachedModel)
 {
+#if defined(__vita__)
+    vitaPrtTimer_t vitaTimer;
+#endif
     idRenderModelStatic* staticModel;
 
     if (cachedModel && !r_useCachedDynamicModels.GetBool()) {
@@ -162,6 +183,12 @@ idRenderModel* idRenderModelPrt::InstantiateDynamicModel(const struct renderEnti
 
         int numVerts = 0;
         idDrawVert* verts = surf->geometry->verts;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        extern idCVar vita_particleThin;
+        extern bool vita_fullQuality;
+        const int vitaThinMask = (stage->totalParticles >= 4 && !vita_fullQuality) ? ((1 << idMath::ClampInt(0, 2, vita_particleThin.GetInteger())) - 1) : 0;
+        int vitaThinned = 0;
+#endif
 
         for (int index = 0; index < stage->totalParticles; index++) {
             g.index = index;
@@ -169,6 +196,15 @@ idRenderModel* idRenderModelPrt::InstantiateDynamicModel(const struct renderEnti
             // bump the random
             steppingRandom.RandomInt();
             steppingRandom2.RandomInt();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            // Vita (a cut, vita_particleThin): only every other particle of a
+            // stage with 4 or more is built and drawn (the randoms above
+            // still step for each, so the ones kept are the same particles)
+            if (vitaThinMask != 0 && (index & vitaThinMask) != 0) {
+                vitaThinned++;
+                continue;
+            }
+#endif
 
             // calculate local age for this index
             int bunchOffset = stage->particleLife * 1000 * stage->spawnBunching * index / stage->totalParticles;
@@ -219,6 +255,9 @@ idRenderModel* idRenderModelPrt::InstantiateDynamicModel(const struct renderEnti
 
         // numVerts must be a multiple of 4
         assert((numVerts & 3) == 0 && numVerts <= 4 * count);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        VITA_ZONE_ADD("particles left out (vita_particleThin: particle systems)", vitaThinned);
+#endif
 
         // build the indexes
         int numIndexes = 0;

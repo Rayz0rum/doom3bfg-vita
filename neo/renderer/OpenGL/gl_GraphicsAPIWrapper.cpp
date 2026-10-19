@@ -60,16 +60,40 @@ This handles the flipping needed when the view being
 rendered is a mirored view.
 ====================
 */
+#if defined(__vita__)
+// vitaGL programs the GXM viewport with a negative Y scale to match GL's
+// bottom-left origin, which reverses triangle winding in screen space. BFG
+// never calls glFrontFace(), so it inherits GL_CCW and its CT_FRONT_SIDED ->
+// glCullFace( GL_FRONT ) mapping then discards exactly the surfaces meant to be
+// visible. 0 = never cull, 1 = stock behaviour, 2 = stock plus glFrontFace( GL_CW ).
+idCVar vita_cull("vita_cull", "1", CVAR_RENDERER | CVAR_INTEGER, "Vita: 0 = disable culling, 1 = stock, 2 = invert front face");
+#endif
+
 void GL_Cull(int cullType)
 {
-    if (backEnd.glState.faceCulling == cullType) {
+#if defined(__vita__)
+    if (vita_cull.GetInteger() == 0) {
+        cullType = CT_TWO_SIDED;
+    }
+#endif
+    // GL_SetDefaultState and RB_BeginDrawingView poison the cache with -1 to
+    // force the next call to reprogram the driver. That value is not
+    // CT_TWO_SIDED, so the qglEnable below - which only fires when coming *from*
+    // CT_TWO_SIDED - would be skipped, and a front- or back-sided surface would
+    // draw with GL_CULL_FACE still disabled from whatever ran last. Treat the
+    // poison as "state unknown" and program both halves.
+    const bool cacheInvalid = (backEnd.glState.faceCulling != CT_FRONT_SIDED)
+        && (backEnd.glState.faceCulling != CT_BACK_SIDED)
+        && (backEnd.glState.faceCulling != CT_TWO_SIDED);
+
+    if (!cacheInvalid && backEnd.glState.faceCulling == cullType) {
         return;
     }
 
     if (cullType == CT_TWO_SIDED) {
         qglDisable(GL_CULL_FACE);
     } else {
-        if (backEnd.glState.faceCulling == CT_TWO_SIDED) {
+        if (cacheInvalid || backEnd.glState.faceCulling == CT_TWO_SIDED) {
             qglEnable(GL_CULL_FACE);
         }
 
@@ -256,6 +280,23 @@ void GL_SetDefaultState()
     // These are changed by GL_Cull
     qglCullFace(GL_FRONT_AND_BACK);
     qglEnable(GL_CULL_FACE);
+
+    // ...except GL_Cull() early-outs when the requested cull type equals the
+    // cached one, and the memset above just set that cache to 0, which is
+    // CT_FRONT_SIDED. So a front-sided surface drawn before any two-sided one
+    // never reaches qglCullFace() and is still being culled by the
+    // GL_FRONT_AND_BACK set here - it disappears with no GL error. Poison the
+    // cache with a value no cullType_t can hold so the next GL_Cull() always
+    // programs the driver, which is what the comment above already assumes.
+    backEnd.glState.faceCulling = -1;
+
+#if defined(__vita__)
+    if (vita_cull.GetInteger() == 2) {
+        qglFrontFace(GL_CW);
+    } else {
+        qglFrontFace(GL_CCW);
+    }
+#endif
 
     // These are changed by GL_State
     qglColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);

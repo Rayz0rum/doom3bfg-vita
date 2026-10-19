@@ -30,6 +30,9 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "../../idlib/precompiled.h"
+#if defined(__vita__)
+#include "../vita/vita_public.h"
+#endif
 
 // DG: SDL.h somehow needs the following functions, so #undef those silly
 //     "don't use" #defines from Str.h
@@ -77,8 +80,41 @@ GLimp_PreInit
  Calling that function more than once doesn't make a difference
 ===================
 */
+#if defined(__vita__)
+// The display hardware scales any of these to the screen, so a smaller one
+// trades sharpness for GPU fill rate (every lit pixel costs a full interaction
+// pass per light: the flashlight alone is close to a full-screen pass).
+// vitaGL can only be brought up once per process, so it applies at the next start.
+// The display (and so the HUD and menus) is always native 960x544. Only the 3D
+// view renders smaller, by vita_renderResolution (RenderSystem.cpp), and is
+// stretched up before the 2D is drawn. The hint stays wired so a lower display
+// resolution can still be tried by changing this string.
+static const char* VitaResolutionString()
+{
+    return "960x544";
+}
+
+static int vitaRenderW = 960, vitaRenderH = 544;
+
+void Vita_GetRenderResolution(int* w, int* h)
+{
+    *w = vitaRenderW;
+    *h = vitaRenderH;
+}
+#endif
+
 void GLimp_PreInit() // DG: added this function for SDL compatibility
 {
+#if defined(__vita__)
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) {
+        // SDL reads this when its video driver starts and brings vitaGL up at it
+        const char* res = VitaResolutionString();
+        SDL_SetHint("VITA_RESOLUTION", res);
+        sscanf(res, "%dx%d", &vitaRenderW, &vitaRenderH);
+        common->Printf("vita: display %dx%d (HUD and menus at full resolution; the 3D view's size is vita_renderResolution)\n",
+            vitaRenderW, vitaRenderH);
+    }
+#endif
     if (!SDL_WasInit(SDL_INIT_VIDEO)) {
         if (SDL_Init(SDL_INIT_VIDEO))
             common->Error("Error while initializing SDL: %s", SDL_GetError());
@@ -491,12 +527,38 @@ void GLimp_Shutdown()
 GLimp_SwapBuffers
 ===================
 */
+#if defined(__vita__)
+/*
+===================
+GLimp_SetSwapInterval
+
+0 = the swap latches the new frame at the next vblank without waiting for it
+(vitaGL still flips on a vblank, so nothing tears), 1 = wait for the vblank.
+Called when switching between DOOM 3 and the classic games (common_frame.cpp).
+===================
+*/
+void GLimp_SetSwapInterval(int interval)
+{
+    if (SDL_GL_SetSwapInterval(interval) < 0) {
+        common->Printf("vita: swap interval %d refused: %s\n", interval, SDL_GetError());
+    } else {
+        common->Printf("vita: swap interval %d (%s)\n", interval, interval == 0 ? "flip at the next vblank, no wait - the 35 and 60 fps caps" : "vsync");
+    }
+}
+#endif
+
 void GLimp_SwapBuffers()
 {
+    VITA_MARK("swap: SDL_GL_SwapWindow");
 #if SDL_VERSION_ATLEAST(2, 0, 0)
     SDL_GL_SwapWindow(window);
 #else
     SDL_GL_SwapBuffers();
+#endif
+#if defined(__vita__)
+    VITA_MARK("swap: screen sampler");
+    Vita_ScreenSampleAfterSwap();
+    VITA_MARK("swap: done");
 #endif
 }
 

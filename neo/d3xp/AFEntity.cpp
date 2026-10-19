@@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 #pragma hdrstop
 
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT (half-rate ragdolls)
 #include "Game_local.h"
 
 /*
@@ -657,6 +658,27 @@ idAFEntity_Base::Think
 */
 void idAFEntity_Base::Think()
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): a moving ragdoll simulates every other tic, two tics at a
+    // time (idEntity::VitaHalfRateTic)
+    // Only a real ragdoll: idAnimated (every func_animate / cinematic prop -
+    // Campbell's BFG case, the duffle bag) comes through here with its AF
+    // never activated, and an inactive AF does not report "at rest", so they
+    // all moved at 15 Hz (measured on PC: the case presented every 66 ms).
+    extern idCVar vita_afHalfRate;
+    extern bool vita_fullQuality;
+    int vitaSkipTime = 0;
+    vitaThinkSpan_t vitaSpan(&vitaLastThinkTime);
+    const int vitaTic = VitaHalfRateTic(vita_afHalfRate.GetBool() && !vita_fullQuality && af.IsActive() && !af.GetPhysics()->IsAtRest());
+    if (vitaTic == VITA_THINK_SKIP) {
+        VITA_ZONE_COUNT("half-rate think: ragdoll (corpse, AF entity) tics off (vita_afHalfRate)");
+        vitaSpan.lastThink = &vitaSkipTime;
+        return;
+    }
+    if (vitaTic == VITA_THINK_TWO_TICS) {
+        vitaSpan.Span();
+    }
+#endif
     RunPhysics();
     UpdateAnimation();
     if (thinkFlags & TH_UPDATEVISUALS) {
@@ -1246,6 +1268,11 @@ void idAFEntity_Gibbable::SpawnGibs(const idVec3& dir, const char* damageDefName
     entityCenter = GetPhysics()->GetAbsBounds().GetCenter();
     gibNonSolid = damageDef->GetBool("gibNonSolid");
     for (i = 0; i < list.Num(); i++) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        if (!gibNonSolid && list[i]->IsType(idMoveableItem::Type)) {
+            static_cast<idMoveableItem*>(list[i])->VitaSimplifyGib();
+        }
+#endif
         if (gibNonSolid) {
             list[i]->GetPhysics()->SetContents(0);
             list[i]->GetPhysics()->SetClipMask(0);

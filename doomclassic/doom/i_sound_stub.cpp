@@ -121,3 +121,10 @@ void I_UnRegisterSong( int handle ) {}
 
 // Update Music (XMP), check for notifications
 void I_UpdateMusic( void ) {}
+
+// the streamed music's figures (i_sound_openal.cpp streams; this backend does not)
+void I_MusicStats( int* songs, int* underruns, int* chunks, double* synthMsPerSecond )
+{
+	*songs = *underruns = *chunks = 0;
+	*synthMsPerSecond = 0.0;
+}

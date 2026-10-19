@@ -36,6 +36,101 @@ If you have questions concerning this license or the applicable additional terms
 #include "../bv/Bounds.h"
 #include "RenderMatrix.h"
 
+#if defined(__vita__) && defined(__ARM_NEON__)
+#include <arm_neon.h>
+// ---- Vita NEON render matrix kernels (tools/vita/neontest cuts this block) ----
+/*
+========================
+Vita_MultiplyRenderMatrix_NEON / Vita_CullBoundsBits_NEON
+
+idRenderMatrix::Multiply and CullBoundsToMVPbits on the Vita, which takes the
+generic paths (no SSE): out row i is a[i][0] * b row 0 + a[i][1] * b row 1 +
+a[i][2] * b row 2 + a[i][3] * b row 3, and a box corner's clip coordinate i
+is x * m[i][0] + y * m[i][1] + z * m[i][2] + m[i][3] - both summed in the
+generic code's order, four lanes at a time (VMLA rounds the product before
+the add, as the scalar code does), the corners four to a vector, the same
+comparisons for the same bits. NEON flushes denormals to zero, so a value
+below 1.2e-38 can compare differently, nothing else. The cull runs per
+surface, per entity and light, per light and entity in the light jobs -
+thousands of times a frame, ~200 multiply-adds each in scalar code.
+========================
+*/
+static void Vita_MultiplyRenderMatrix_NEON(const float* a, const float* b, float* out)
+{
+    const float32x4_t b0 = vld1q_f32(b + 0);
+    const float32x4_t b1 = vld1q_f32(b + 4);
+    const float32x4_t b2 = vld1q_f32(b + 8);
+    const float32x4_t b3 = vld1q_f32(b + 12);
+    for (int i = 0; i < 4; i++) {
+        const float32x4_t ar = vld1q_f32(a + i * 4);
+        const float32x2_t a01 = vget_low_f32(ar);
+        const float32x2_t a23 = vget_high_f32(ar);
+        float32x4_t row = vmulq_lane_f32(b0, a01, 0);
+        row = vmlaq_lane_f32(row, b1, a01, 1);
+        row = vmlaq_lane_f32(row, b2, a23, 0);
+        row = vmlaq_lane_f32(row, b3, a23, 1);
+        vst1q_f32(out + i * 4, row);
+    }
+}
+
+static inline float32x4_t Vita_ClipRow(const float32x4_t X, const float32x4_t Y, const float32x4_t Z, const float32x4_t r)
+{
+    const float32x2_t r01 = vget_low_f32(r);
+    const float32x2_t r23 = vget_high_f32(r);
+    return vaddq_f32(vmlaq_lane_f32(vmlaq_lane_f32(vmulq_lane_f32(X, r01, 0), Y, r01, 1), Z, r23, 0), vdupq_lane_f32(r23, 1));
+}
+
+// bounds: min x, y, z then max x, y, z; returns the generic code's 'bits'
+static int Vita_CullBoundsBits_NEON(const float* mvp, const float* bounds, bool zeroToOne)
+{
+    const float xs[4] = { bounds[0], bounds[3], bounds[0], bounds[3] };
+    const float ys[4] = { bounds[1], bounds[1], bounds[4], bounds[4] };
+    const float32x4_t X = vld1q_f32(xs);
+    const float32x4_t Y = vld1q_f32(ys);
+    const float32x4_t r0 = vld1q_f32(mvp + 0);
+    const float32x4_t r1 = vld1q_f32(mvp + 4);
+    const float32x4_t r2 = vld1q_f32(mvp + 8);
+    const float32x4_t r3 = vld1q_f32(mvp + 12);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    uint32x4_t bits = vdupq_n_u32(0);
+    for (int k = 0; k < 2; k++) {
+        const float32x4_t Z = vdupq_n_f32(bounds[2 + k * 3]);
+        const float32x4_t c0 = Vita_ClipRow(X, Y, Z, r0);
+        const float32x4_t c1 = Vita_ClipRow(X, Y, Z, r1);
+        const float32x4_t c2 = Vita_ClipRow(X, Y, Z, r2);
+        const float32x4_t c3 = Vita_ClipRow(X, Y, Z, r3);
+        const float32x4_t minW = zeroToOne ? zero : vnegq_f32(c3);
+        bits = vorrq_u32(bits, vandq_u32(vcgtq_f32(c0, minW), vdupq_n_u32(1 << 0)));
+        bits = vorrq_u32(bits, vandq_u32(vcltq_f32(c0, c3), vdupq_n_u32(1 << 1)));
+        bits = vorrq_u32(bits, vandq_u32(vcgtq_f32(c1, minW), vdupq_n_u32(1 << 2)));
+        bits = vorrq_u32(bits, vandq_u32(vcltq_f32(c1, c3), vdupq_n_u32(1 << 3)));
+        bits = vorrq_u32(bits, vandq_u32(vcgtq_f32(c2, minW), vdupq_n_u32(1 << 4)));
+        bits = vorrq_u32(bits, vandq_u32(vcltq_f32(c2, c3), vdupq_n_u32(1 << 5)));
+    }
+    const uint32x2_t b2 = vorr_u32(vget_low_u32(bits), vget_high_u32(bits));
+    return (int)(vget_lane_u32(b2, 0) | vget_lane_u32(b2, 1));
+}
+// ---- end of the Vita NEON render matrix kernels ----
+#endif
+#if defined(ID_VITA_PHYSCHECK) && !defined(__vita__)
+#include <cstdio>
+
+#include <cstdarg>
+// the PC test build's depth bounds check writes to a file (it runs on job threads, whose prints are dropped)
+static void Vita_PcLog(const char* fmt, ...)
+{
+    static FILE* f = fopen("vita_depthbounds.txt", "w");
+    if (f == NULL) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fflush(f);
+}
+#endif
+
 // FIXME:	it would be nice if all render matrices were 16-byte aligned
 //			so there is no need for unaligned loads and stores everywhere
 
@@ -979,6 +1074,10 @@ void idRenderMatrix::Multiply(const idRenderMatrix& a, const idRenderMatrix& b, 
     _mm_storeu_ps(out.m + 2 * 4, t2);
     _mm_storeu_ps(out.m + 3 * 4, t3);
 
+#elif defined(__vita__) && defined(__ARM_NEON__)
+
+    Vita_MultiplyRenderMatrix_NEON(a.m, b.m, out.m);
+
 #else
 
     /*
@@ -1022,7 +1121,7 @@ idRenderMatrix::Inverse
 
 inverse( M ) = ( 1 / determinant( M ) ) * transpose( cofactor( M ) )
 
-This code is based on the code written by Cédric Lallain, published on "Cell Performance"
+This code is based on the code written by Cï¿½dric Lallain, published on "Cell Performance"
 (by Mike Acton) and released under the BSD 3-Clause ("BSD New" or "BSD Simplified") license.
 https://code.google.com/p/cellperformance-snippets/
 
@@ -1839,6 +1938,12 @@ bool idRenderMatrix::CullBoundsToMVPbits(const idRenderMatrix& mvp, const idBoun
 
     *outBits = (byte)(bits ^ 63);
 
+    return (bits != 63);
+
+#elif defined(__vita__) && defined(__ARM_NEON__)
+
+    const int bits = Vita_CullBoundsBits_NEON(mvp.m, bounds.ToFloatPtr(), zeroToOne);
+    *outBits = (byte)(bits ^ 63);
     return (bits != 63);
 
 #else
@@ -3266,6 +3371,27 @@ static int ClipHomogeneousPolygonToSide_Generic(idVec4* __restrict newPoints, id
 
     const float side = sign * offset;
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita: the same points in the same order, but an edge's clip point (a
+    // division) is computed only for an edge that crosses the plane - the
+    // stock code computed one for every edge of every face against every
+    // plane (~300 a light a frame for the scissor) and kept the few crossing
+    // ones. (The PC build uses the SSE path, not this one.)
+    for (int i = 0; i < numPoints; i++) {
+        sides[i] = sign * points[i][axis] < offset * points[i].w;
+    }
+    sides[numPoints] = sides[0];
+    int numNewPoints = 0;
+    for (int i = 0; i < numPoints; i++) {
+        if (sides[i + 0] != 0) {
+            newPoints[numNewPoints++] = points[i];
+        }
+        if ((sides[i + 0] ^ sides[i + 1]) != 0) {
+            const int j = (i + 1) & ((i + 1 - numPoints) >> 31);
+            newPoints[numNewPoints++] = ClipHomogeneousLineToSide(points[i], points[j], axis, side);
+        }
+    }
+#else
     // calculate the plane side for each original point and calculate all potential new points
     for (int i = 0; i < numPoints; i++) {
         int j = (i + 1) & ((i + 1 - numPoints) >> 31);
@@ -3287,6 +3413,7 @@ static int ClipHomogeneousPolygonToSide_Generic(idVec4* __restrict newPoints, id
             newPoints[numNewPoints++] = newPoints[i * 2 + 1];
         }
     }
+#endif
 
     assert(numNewPoints <= 16);
     return numNewPoints;
@@ -3979,8 +4106,116 @@ inside the shadow volume to also calculate the correct maximum Z. This could be 
 testing if the center of the far clipping plane is contained inside the shadow volume.
 ========================
 */
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+========================
+Vita_ShadowDepthBoundsFast
+
+The Vita's GL has no depth bounds test, so the shadow jobs' depth bounds only
+cull a shadow volume whose depth range misses the light's: drawn or not, such
+a volume shadows nothing the light reaches (it lies wholly in front of or
+behind the lit surfaces). So a wider range than the exact one gives the same
+picture - a volume or two drawn for nothing. This one costs a few hundred
+cycles instead of the exact clipping (61 us a call, 4.5-6.5 ms of job time a
+frame): the eight corners of the box and their eight projections to
+infinity, z / w at each. When all of them are in front of the near plane
+(w > 0 and z > -w), so is the whole volume (it is their convex hull, and a
+projective map keeps that), its depth range lies within theirs, and the view
+cannot be inside it. Otherwise it gives up (false) and the exact path runs.
+========================
+*/
+static bool Vita_ShadowDepthBoundsFast(float& min, float& max, const idRenderMatrix& mvp, const idBounds& bounds, const idVec3& localLightOrigin, bool windowSpace)
+{
+    float lo = RENDER_MATRIX_INFINITY;
+    float hi = -RENDER_MATRIX_INFINITY;
+    for (int i = 0; i < 8; i++) {
+        const idVec3 p(bounds[(i ^ (i >> 1)) & 1][0], bounds[(i >> 1) & 1][1], bounds[(i >> 2) & 1][2]);
+        // the corner
+        const float nz = p[0] * mvp[2][0] + p[1] * mvp[2][1] + p[2] * mvp[2][2] + mvp[2][3];
+        const float nw = p[0] * mvp[3][0] + p[1] * mvp[3][1] + p[2] * mvp[3][2] + mvp[3][3];
+        // the corner projected to infinity from the light
+        const idVec3 d = p - localLightOrigin;
+        const float fz = d[0] * mvp[2][0] + d[1] * mvp[2][1] + d[2] * mvp[2][2];
+        const float fw = d[0] * mvp[3][0] + d[1] * mvp[3][1] + d[2] * mvp[3][2];
+        if (nw <= RENDER_MATRIX_PROJECTION_EPSILON || fw <= RENDER_MATRIX_PROJECTION_EPSILON
+            || nz + nw <= RENDER_MATRIX_PROJECTION_EPSILON * nw || fz + fw <= RENDER_MATRIX_PROJECTION_EPSILON * fw) {
+            return false;
+        }
+        const float a = nz / nw;
+        const float b = fz / fw;
+        lo = Min(lo, Min(a, b));
+        hi = Max(hi, Max(a, b));
+    }
+    if (windowSpace) {
+#if !defined(CLIP_SPACE_D3D) // the D3D clip space Z is already in the range [0,1]
+        lo = lo * 0.5f + 0.5f;
+        hi = hi * 0.5f + 0.5f;
+#endif
+        lo = idMath::ClampFloat(0.0f, 1.0f, lo);
+        hi = idMath::ClampFloat(0.0f, 1.0f, hi);
+    }
+    min = lo;
+    max = hi;
+    return true;
+}
+#endif
+
+#if defined(ID_VITA_PHYSCHECK) && !defined(__vita__)
+static void DepthBoundsForShadowBounds_Exact(float& min, float& max, const idRenderMatrix& mvp, const idBounds& bounds, const idVec3& localLightOrigin, bool windowSpace);
+#endif
+
 void idRenderMatrix::DepthBoundsForShadowBounds(float& min, float& max, const idRenderMatrix& mvp, const idBounds& bounds, const idVec3& localLightOrigin, bool windowSpace)
 {
+#if defined(__vita__)
+    if (Vita_ShadowDepthBoundsFast(min, max, mvp, bounds, localLightOrigin, windowSpace)) {
+        return;
+    }
+    // The volume reaches behind the near plane: the whole depth range, so no
+    // cull (same picture, see above). On PC the exact clipping culled 7-14%
+    // of these in fights; drawing those few for nothing costs the GPU less
+    // than the clipping cost the jobs.
+#if !defined(CLIP_SPACE_D3D)
+    min = windowSpace ? 0.0f : -1.0f;
+#else
+    min = 0.0f;
+#endif
+    max = 1.0f;
+    return;
+#elif defined(ID_VITA_PHYSCHECK)
+    // PC test build: the fast range must hold the exact one
+    {
+        float fmin, fmax, emin, emax;
+        const bool fast = Vita_ShadowDepthBoundsFast(fmin, fmax, mvp, bounds, localLightOrigin, windowSpace);
+        DepthBoundsForShadowBounds_Exact(emin, emax, mvp, bounds, localLightOrigin, windowSpace);
+        static int calls, fastCalls, notSuperset, exactEmpty, slowEmpty;
+        calls++;
+        if (!fast && emin > emax) {
+            slowEmpty++;
+        }
+        if (fast) {
+            fastCalls++;
+            if (emin <= emax) {
+                if (fmin > emin + 1e-5f || fmax < emax - 1e-5f) {
+                    if (notSuperset++ < 10) {
+                        Vita_PcLog("vita shadow depth bounds: fast [%.6f %.6f] does not hold exact [%.6f %.6f]\n", fmin, fmax, emin, emax);
+                    }
+                }
+            } else {
+                exactEmpty++;
+            }
+        }
+        if ((calls % 20000) == 0) {
+            Vita_PcLog("vita shadow depth bounds: %d calls, %d fast (%d of them culled by the exact one), %d fast ranges not holding the exact; of the rest %d culled\n", calls, fastCalls, exactEmpty, notSuperset, slowEmpty);
+        }
+        min = emin;
+        max = emax;
+        return;
+    }
+}
+
+static void DepthBoundsForShadowBounds_Exact(float& min, float& max, const idRenderMatrix& mvp, const idBounds& bounds, const idVec3& localLightOrigin, bool windowSpace)
+{
+#endif
 #if defined(USE_INTRINSICS)
 
     const __m128 mvp0 = _mm_loadu_ps(mvp[0]);

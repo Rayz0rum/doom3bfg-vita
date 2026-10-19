@@ -131,6 +131,11 @@ const ExpansionData* GetCurrentExpansion()
 	return &App_Expansion_Data_Local[ DoomLib::expansionSelected ];
 }
 
+const ExpansionData* GetExpansion( int expansion )
+{
+	return &App_Expansion_Data_Local[ expansion ];
+}
+
 void				  SetCurrentExpansion( int expansion )
 {
 	expansionDirty = true;
@@ -316,6 +321,14 @@ void DoomLib::InitControlRemap()
 	classicRemap[K_JOY_DPAD_RIGHT] = K_RIGHTARROW ;
 	classicRemap[K_JOY1] = K_ENTER;
 
+#if defined(__vita__)
+	// The Vita layout carried over: R fire, Triangle (and Cross) use, D-pad
+	// left/right weapon cycle, rear touch run and quick turn come through the
+	// DOOM 3 bindings (G_BuildTiccmd). Select is the PDA in DOOM 3 - here it
+	// opens the automap, as Square already did; Start is the menu (K_JOY9).
+	classicRemap[K_JOY10] = KEY_TAB;
+#endif
+
 
 }
 
@@ -437,7 +450,7 @@ void DoomLib::Shutdown()
 	// De-allocate the zone memory (never happened in original doom, until quit)
 	if( ::g->mainzone )
 	{
-		free( ::g->mainzone );
+		Z_FreeZone(); // every piece of it (z_zone.cpp)
 	}
 
 	// Delete the globals

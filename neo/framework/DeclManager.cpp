@@ -1202,9 +1202,37 @@ void idDeclManagerLocal::BeginLevelLoad()
 idDeclManagerLocal::EndLevelLoad
 ===================
 */
+#if defined(__vita__)
+// Where a load's decl parsing time goes, by type (printed at the end of each
+// level load). Parsing is text work on a slow CPU; this says which kind
+// dominates before anything is changed.
+static int64 vitaDeclParseUs[DECL_MAX_TYPES];
+static int vitaDeclParseCount[DECL_MAX_TYPES];
+#endif
+
 void idDeclManagerLocal::EndLevelLoad()
 {
     insideLevelLoad = false;
+#if defined(__vita__)
+    {
+        int64 total = 0;
+        int count = 0;
+        idStr line;
+        for (int t = 0; t < DECL_MAX_TYPES && t < declTypes.Num(); t++) {
+            if (vitaDeclParseCount[t] == 0 || declTypes[t] == NULL) {
+                continue;
+            }
+            total += vitaDeclParseUs[t];
+            count += vitaDeclParseCount[t];
+            line += va(" %s %d (%d ms)", declTypes[t]->typeName.c_str(), vitaDeclParseCount[t], (int)(vitaDeclParseUs[t] / 1000));
+        }
+        if (count > 0) {
+            common->Printf("decls parsed since the last load: %d in %d ms:%s\n", count, (int)(total / 1000), line.c_str());
+        }
+        memset(vitaDeclParseUs, 0, sizeof(vitaDeclParseUs));
+        memset(vitaDeclParseCount, 0, sizeof(vitaDeclParseCount));
+    }
+#endif
 
     // we don't need to do anything here, but the image manager, model manager,
     // and sound sample manager will need to free media that was not referenced
@@ -1404,11 +1432,34 @@ const idDecl* idDeclManagerLocal::FindType(declType_t type, const char* name, bo
     // if it hasn't been parsed yet, parse it now
     if (decl->declState == DS_UNPARSED) {
         if (!idLib::IsMainThread()) {
+#if defined(__vita__)
+            // On the Vita every GL step a parse can trigger is already put
+            // off to the GL thread when requested from elsewhere: images load
+            // only their header here and the pixels at their first bind,
+            // shaders compile at their first bind, cinematics make their
+            // texture in the back end. So parse - an error here froze the
+            // menus (their first frame is drawn on the game/draw thread).
+            static int offThreadParses = 0;
+            if (offThreadParses < 24) {
+                offThreadParses++;
+                common->Printf("decl: %s '%s' parsed on the game/draw thread\n", GetDeclNameFromType(type), name);
+            }
+#else
             // we can't load images from a background thread on OpenGL,
             // the renderer on the main thread should parse it if needed
             idLib::Error("Attempted to load %s decl '%s' from game thread!", GetDeclNameFromType(type), name);
+#endif
         }
+#if defined(__vita__)
+        const int64 parseStart = Sys_Microseconds();
         decl->ParseLocal();
+        if ((int)type >= 0 && (int)type < DECL_MAX_TYPES) {
+            vitaDeclParseUs[(int)type] += Sys_Microseconds() - parseStart;
+            vitaDeclParseCount[(int)type]++;
+        }
+#else
+        decl->ParseLocal();
+#endif
     }
 
     // mark it as referenced
@@ -2243,6 +2294,11 @@ idDeclLocal::idDeclLocal
 */
 idDeclLocal::idDeclLocal()
 {
+    // (stock bug: never set here - FindTypeWithoutParsing clears it after new,
+    // CreateNewDecl did not and AllocateSelf took whatever the allocator left:
+    // on the Vita a freed idSWFScriptObject, called as the new material -
+    // the verification's first video, 2026-10-18)
+    self = NULL;
     name = "unnamed";
     textSource = NULL;
     textLength = 0;

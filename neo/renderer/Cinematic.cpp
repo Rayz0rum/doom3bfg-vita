@@ -40,6 +40,14 @@ extern idCVar s_noSound;
 
 #include "tr_local.h"
 
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+class idCinematicLocal;
+void Vita_CinematicRegister(idCinematicLocal* cin, bool add);
+bool Vita_CinematicEvict(idCinematicLocal* requester, int now);
+bool Vita_ReadMp4Header(idFile* f, int& width, int& height, int& lengthMs);
+#endif
+
 #define CIN_system 1
 #define CIN_loop 2
 #define CIN_hold 4
@@ -96,6 +104,39 @@ private:
 #endif
     idImage* img;
     bool isRoQ;
+
+#if defined(__vita__)
+    // The Vita plays every video through the hardware H.264 / AAC player
+    // (sceAvPlayer, vita_avplayer.cpp) from the .mp4 shipped beside it,
+    // opened when the video is first drawn rather than when its material is
+    // parsed. See "Video" in VITA_PORT.md.
+    vitaVideo_t* vitaVideo;    // the hardware player, NULL when none
+    idStr vitaMp4Path;         // OS path of the .mp4 ("" when there is none)
+    int vitaStreamW, vitaStreamH, vitaLengthMs; // from the .mp4's header
+    bool vitaLooping;
+    volatile bool vitaRestart; // ResetTime asked for the start (game thread)
+    int vitaLastDrawMs;
+    int vitaAppearMs;          // when it last came on screen (not drawn for a second before)
+    int vitaNextTryMs;         // when to ask for a hardware player again
+    int vitaFails;             // players in a row that gave no frame (backs the retries off)
+    int vitaUploadedQuad;      // the RoQ frame last uploaded (skip unchanged ones)
+    // The software stream beside the hardware one: the Vita's H.264 decoder
+    // serves one player at a time (vita_avplayer.cpp), so a video that cannot
+    // have it - another, more important one is playing - plays its .roq
+    // instead (tools/vita/make_roq.py: the in-world screens, small, 15 fps)
+    // with the engine's own RoQ decoder, as DOOM 3 shipped them. It stays in
+    // software while it is on screen; back on screen later, it asks for the
+    // hardware player first again.
+    idStr vitaRoqName;         // the .roq beside the .mp4 ("" when there is none)
+    bool vitaRoqActive;        // playing in software now
+    bool VitaStartRoQ();
+    void VitaStopRoQ(const char* why);
+    cinData_t ImageForTimeVita(int thisTime);
+    cinData_t ImageForTimeVitaHw();
+    cinData_t ImageForTimeRoQ(int thisTime);
+    void VitaReleasePlayer();
+    friend bool Vita_CinematicEvict(idCinematicLocal* requester, int now);
+#endif
 
     // RB: 64 bit fixes, changed long to int
     size_t mcomp[256];
@@ -201,8 +242,97 @@ idCinematicLocal::InitCinematic
 ==============
 */
 // RB: 64 bit fixes, changed long to int
+#if defined(__vita__)
+// Every video the game has (the 51 in the retail data: tools/vita/convert_video.py
+// makes their .mp4 under base/video and base/sound/VO/video). Checked at
+// startup so a missing or misplaced file is named in console.txt at once.
+static const char* vitaExpectedVideos[] = {
+    "sound/VO/video/deployment.mp4",
+    "sound/VO/video/epd.mp4",
+    "sound/VO/video/generator.mp4",
+    "sound/VO/video/grabber.mp4",
+    "sound/VO/video/hydrocon.mp4",
+    "sound/VO/video/mfs.mp4",
+    "sound/VO/video/video_alphalabs_intro.mp4",
+    "sound/VO/video/video_ancient_civ.mp4",
+    "sound/VO/video/video_bfg.mp4",
+    "sound/VO/video/video_chaingun.mp4",
+    "sound/VO/video/video_demon_museum.mp4",
+    "sound/VO/video/video_ian_report.mp4",
+    "sound/VO/video/video_ipn_news.mp4",
+    "sound/VO/video/video_marine_sops.mp4",
+    "sound/VO/video/video_meyers_report.mp4",
+    "sound/VO/video/video_plasmagun.mp4",
+    "sound/VO/video/video_recycling.mp4",
+    "sound/VO/video/video_soulcube.mp4",
+    "sound/VO/video/video_tablets.mp4",
+    "sound/VO/video/video_uac_welcome.mp4",
+    "video/admin/betruger.mp4",
+    "video/comm1/swann_vidphone1.mp4",
+    "video/comm1/swann_vidphone2.mp4",
+    "video/comm1/swann_vidphone3.mp4",
+    "video/data.mp4",
+    "video/delta1/sarge_video1.mp4",
+    "video/enpro1/lm_meyers_enpro.mp4",
+    "video/erebusteam.mp4",
+    "video/fireball.mp4",
+    "video/hellhole/rescue.mp4",
+    "video/intro/introloop.mp4",
+    "video/loadvideo.mp4",
+    "video/mars1.mp4",
+    "video/mars_rotation.mp4",
+    "video/marscity/decom.mp4",
+    "video/marscity/dropship.mp4",
+    "video/marscity/monoflyby.mp4",
+    "video/marscity/sarge_mission_brief.mp4",
+    "video/marscity/sci_team_request.mp4",
+    "video/marscity/ship.mp4",
+    "video/mc_underground/inv1sm.mp4",
+    "video/mc_underground/inv2sm.mp4",
+    "video/mc_underground/inv3.mp4",
+    "video/mc_underground/inv4sm.mp4",
+    "video/mc_underground/inv5sm.mp4",
+    "video/mc_underground/inv6sm.mp4",
+    "video/mc_underground/inv7sm.mp4",
+    "video/mcneil.mp4",
+    "video/radar.mp4",
+    "video/recycling2/cs_bert01_composite.mp4",
+    "video/recycling2/cs_bert02_composite.mp4",
+    NULL
+};
+
+static void Vita_AuditVideos()
+{
+    int found = 0, missing = 0;
+    idStr missingList;
+    for (int i = 0; vitaExpectedVideos[i] != NULL; i++) {
+        idFile* f = fileSystem->OpenFileRead(vitaExpectedVideos[i]);
+        if (f != NULL) {
+            if (f->Length() < 1024) {
+                common->Printf("video audit: %s is only %d bytes - a broken copy?\n", vitaExpectedVideos[i], f->Length());
+            }
+            fileSystem->CloseFile(f);
+            found++;
+        } else {
+            missing++;
+            missingList += va("\n  %s", vitaExpectedVideos[i]);
+        }
+    }
+    if (missing > 0) {
+        common->Warning("video audit: %d of the game's %d videos are missing on the memory card (copy them into ux0:data/doom3bfg/base/, keeping the folders):%s",
+            missing, found + missing, missingList.c_str());
+    } else {
+        common->Printf("video audit: all %d videos of the game are on the memory card\n", found);
+    }
+}
+#endif
+
 void idCinematic::InitCinematic()
 {
+#if defined(__vita__)
+    // (the video arena is claimed once GXM is up: idRenderSystemLocal::InitOpenGL)
+    Vita_AuditVideos();
+#endif
 #if defined(USE_FFMPEG)
     // Carl: ffmpeg for Bink and regular video files
     common->Warning("Loading FFMPEG...\n");
@@ -373,6 +503,20 @@ idCinematicLocal::idCinematicLocal()
     qStatus[0] = (byte**)Mem_Alloc(32768 * sizeof(byte*), TAG_CINEMATIC);
     qStatus[1] = (byte**)Mem_Alloc(32768 * sizeof(byte*), TAG_CINEMATIC);
 
+#if defined(__vita__)
+    vitaVideo = NULL;
+    vitaStreamW = vitaStreamH = vitaLengthMs = 0;
+    vitaLooping = false;
+    vitaRestart = false;
+    vitaLastDrawMs = 0;
+    vitaAppearMs = 0;
+    vitaNextTryMs = 0;
+    vitaFails = 0;
+    vitaUploadedQuad = -1;
+    vitaRoqActive = false;
+    Vita_CinematicRegister(this, true);
+#endif
+
 #if defined(USE_FFMPEG)
     // Carl: ffmpeg stuff, for bink and normal video files:
     isRoQ = false;
@@ -392,7 +536,14 @@ idCinematicLocal::idCinematicLocal()
     buf = NULL;
     iFile = NULL;
     img = globalImages->AllocStandaloneImage("_cinematic");
+#if defined(__vita__)
+    // A cinematic is created when its material is parsed, which during play
+    // happens on the game/draw thread; vitaGL only works on the GL thread.
+    // The texture is then made at the first frame the back end asks for.
+    if (img != NULL && Vita_IsGLThread()) {
+#else
     if (img != NULL) {
+#endif
         idImageOpts opts;
         opts.format = FMT_RGBA8;
         opts.colorFormat = CFM_DEFAULT;
@@ -410,6 +561,9 @@ idCinematicLocal::~idCinematicLocal
 */
 idCinematicLocal::~idCinematicLocal()
 {
+#if defined(__vita__)
+    Vita_CinematicRegister(this, false);
+#endif
     Close();
 
     // Carl: Original Doom 3 RoQ files:
@@ -571,6 +725,72 @@ bool idCinematicLocal::InitFromFile(const char* qpath, bool amilooping)
     idStr ext;
     fileName.ExtractFileExtension(ext);
     fileName = fileName.StripFileExtension();
+
+#if defined(__vita__)
+    // The .mp4 shipped beside the video. Nothing is opened here - this runs
+    // when the material is parsed, often on the game/draw thread; the
+    // hardware player is asked for when the video is first drawn
+    // (ImageForTimeVita).
+    {
+        vitaMp4Path.Clear();
+        vitaRestart = false;
+        vitaStreamW = vitaStreamH = vitaLengthMs = 0;
+        vitaNextTryMs = 0;
+        vitaFails = 0;
+        vitaUploadedQuad = -1;
+
+        idStr mp4Name = fileName + ".mp4";
+        idFile* probe = fileSystem->OpenFileRead(mp4Name);
+        // Five invasion screens of mc_underground ask for full-size videos
+        // the retail data never had (inv1, inv2, inv5, inv6, inv7); their
+        // small versions (inv1sm...) exist - and the reverse (inv3sm, inv4)
+        if (probe == NULL) {
+            idStr alt = fileName;
+            if (alt.Right(2).Icmp("sm") == 0) {
+                alt = alt.Left(alt.Length() - 2);
+            } else {
+                alt += "sm";
+            }
+            alt += ".mp4";
+            probe = fileSystem->OpenFileRead(alt);
+            if (probe != NULL) {
+                common->Printf("video '%s' does not exist - playing '%s' in its place\n", mp4Name.c_str(), alt.c_str());
+                mp4Name = alt;
+            }
+        }
+        if (probe != NULL) {
+            Vita_ReadMp4Header(probe, vitaStreamW, vitaStreamH, vitaLengthMs);
+            fileSystem->CloseFile(probe);
+            // sceAvPlayer opens the file itself, so it needs a real console
+            // path rather than an engine-relative one.
+            vitaMp4Path = fileSystem->RelativePathToOSPath(mp4Name, "fs_basepath");
+        }
+        if (vitaMp4Path.Length() > 0) {
+            // and its software twin, for when the hardware player is taken
+            vitaRoqName = mp4Name;
+            vitaRoqName.SetFileExtension("roq");
+            idFile* roq = fileSystem->OpenFileRead(vitaRoqName);
+            if (roq != NULL) {
+                fileSystem->CloseFile(roq);
+            } else {
+                vitaRoqName.Clear();
+            }
+            fileName = mp4Name;
+            looping = amilooping;
+            vitaLooping = amilooping;
+            startTime = 0;
+            status = FMV_PLAY;
+            animationLength = (vitaLengthMs > 0) ? vitaLengthMs : 100000;
+            CIN_WIDTH = vitaStreamW;
+            CIN_HEIGHT = vitaStreamH;
+            common->Printf("video '%s': %dx%d, %d ms, %s%s\n", mp4Name.c_str(), vitaStreamW, vitaStreamH, vitaLengthMs, amilooping ? "looping" : "once",
+                vitaRoqName.Length() > 0 ? " (and a .roq for when the hardware player is taken)" : "");
+            return true;
+        }
+        common->Warning("video '%s': no .mp4 beside it on the Vita - it will show black (convert it with tools/vita/convert_video.py)", fileName.c_str());
+    }
+#endif
+
     fileName = fileName + ".roq";
     // if (fileName == "video\\loadvideo.roq") {
     //	fileName = "video\\idlogo.roq";
@@ -634,6 +854,17 @@ idCinematicLocal::Close
 */
 void idCinematicLocal::Close()
 {
+#if defined(__vita__)
+    if (vitaVideo != NULL) {
+        VitaVideo_Close(vitaVideo);
+        vitaVideo = NULL;
+        status = FMV_EOF;
+    }
+    if (vitaRoqActive) {
+        VitaStopRoQ("closed");
+    }
+#endif
+
     if (image) {
         Mem_Free((void*)image);
         image = NULL;
@@ -678,6 +909,12 @@ int idCinematicLocal::AnimationLength()
 // RB begin
 bool idCinematicLocal::IsPlaying() const
 {
+#if defined(__vita__)
+    if (vitaVideo != NULL) {
+        return VitaVideo_IsPlaying(vitaVideo);
+    }
+#endif
+
     return (status == FMV_PLAY);
 }
 // RB end
@@ -689,17 +926,464 @@ idCinematicLocal::ResetTime
 */
 void idCinematicLocal::ResetTime(int time)
 {
+#if defined(__vita__)
+    // From the start, at the next draw (on the GL thread: a player that has
+    // ended is closed and a new one opened; one still playing is rewound).
+    // The PDA calls this from the game thread when a video disc is played.
+    vitaRestart = true;
+#endif
+
     startTime = time; // originally this was: ( backEnd.viewDef ) ? 1000 * backEnd.viewDef->floatTime : -1;
     status = FMV_PLAY;
 }
+
+#if defined(__vita__)
+/*
+==============
+idCinematicLocal::ImageForTimeVita
+
+The hardware decoder paces itself, so the engine time this is nominally
+called with is not used: sceAvPlayer is asked whether a newer frame exists
+and hands one back when it does.
+
+Only cinData_t::image is filled in, never the Y/Cr/Cb triple. GXM converts
+YUV to RGB inside the texture unit, so as far as the renderer is concerned
+this is an ordinary colour texture and the existing single-image branch of
+RB_BindVariableStageImage draws it with the standard textured shader.
+==============
+*/
+cinData_t idCinematicLocal::ImageForTimeVitaHw()
+{
+    cinData_t cinData;
+    memset(&cinData, 0, sizeof(cinData));
+
+    int width = 0;
+    int height = 0;
+
+    if (img != NULL && !img->IsLoaded() && Vita_IsGLThread()) {
+        // created off the GL thread (see the constructor): make it now
+        idImageOpts opts;
+        opts.format = FMT_RGBA8;
+        opts.colorFormat = CFM_DEFAULT;
+        opts.width = 32;
+        opts.height = 32;
+        opts.numLevels = 1;
+        img->AllocImage(opts, TF_LINEAR, TR_REPEAT);
+    }
+
+    if (img != NULL && img->IsLoaded() && Vita_IsGLThread()
+        && VitaVideo_UpdateFrame(vitaVideo, img->GetTexNum(), &width, &height)) {
+        CIN_WIDTH = width;
+        CIN_HEIGHT = height;
+        vitaFails = 0;
+
+        cinData.imageWidth = width;
+        cinData.imageHeight = height;
+        cinData.image = img;
+    }
+
+    // Before the first frame arrives cinData.image stays NULL and the caller
+    // draws black, which is what the other decoders do while starting up.
+    status = VitaVideo_IsPlaying(vitaVideo) ? FMV_PLAY : FMV_EOF;
+    cinData.status = status;
+
+    return cinData;
+}
+#endif
 
 /*
 ==============
 idCinematicLocal::ImageForTime
 ==============
 */
+#if defined(__vita__)
+/*
+==============
+The Vita's cinematics: who has a hardware player
+
+Every cinematic is listed so that one needing a player can take the one of
+another nobody is looking at. There is no time-out: a player stays with its
+video until another needs the room, so a screen looked at again keeps playing
+instead of starting over from black.
+==============
+*/
+static idList<idCinematicLocal*> vitaCinematics;
+// The video a player was just taken for (one player at a time): until it has
+// opened its own, or has not been drawn for half a second, nobody else opens
+// one - the looping screen that gave its player up would otherwise grab it
+// back the moment the old player closes. (Set and read on the GL thread.)
+static idCinematicLocal* vitaPlayerReservedFor = NULL;
+// when a video played once (a cutscene, a PDA disc, a screen's message) was
+// last drawn: a looping screen (the menu's background) does not open a player
+// for 2 s after - in the fourth verification run it took the player back
+// between every two videos, and every open is a chance of a player that
+// never starts
+static int vitaLastOnceDrawMs = -100000;
+static int vitaPlayerReservedMs = 0;
+static idSysMutex vitaCinematicsLock;
+
+void Vita_CinematicRegister(idCinematicLocal* cin, bool add)
+{
+    idScopedCriticalSection lock(vitaCinematicsLock);
+    if (add) {
+        vitaCinematics.Append(cin);
+    } else {
+        vitaCinematics.Remove(cin);
+        if (vitaPlayerReservedFor == cin) {
+            vitaPlayerReservedFor = NULL;
+        }
+    }
+}
+
+// The player of the cinematic drawn longest ago, given up for the requester:
+// one not drawn for 200 ms, or - for a video played once (a PDA video, a
+// cutscene) - any looping one (world screens, menu backgrounds). True if one
+// was closed (its memory comes back when the worker has closed it).
+bool Vita_CinematicEvict(idCinematicLocal* requester, int now)
+{
+    idScopedCriticalSection lock(vitaCinematicsLock);
+    idCinematicLocal* victim = NULL;
+    for (int i = 0; i < vitaCinematics.Num(); i++) {
+        idCinematicLocal* c = vitaCinematics[i];
+        if (c == requester || c->vitaVideo == NULL) {
+            continue;
+        }
+        // Who gives up a player: one nobody has drawn for 200 ms; a looping
+        // screen when a video played once wants it; and otherwise the video
+        // that came on screen before the one asking - the newest thing on
+        // screen is what the player is looking at (the intro over the menu's
+        // background). The one that lost cannot take it back while the newer
+        // one stays on screen, so two videos never trade a player to and fro.
+        // not drawn for a second: a hitch (a screenshot written, a level's
+        // first frames) is not leaving the screen - 200 ms let the menu's
+        // background take the player from a video still on screen
+        const bool idle = (now - c->vitaLastDrawMs) > 1000;
+        // a video played once that has reached its end holds its last frame
+        // on screen and nothing more: its player is anyone's (one player at a
+        // time, vita_avplayer.cpp)
+        const bool finished = !VitaVideo_IsPlaying(c->vitaVideo);
+        const bool outranked = !requester->vitaLooping && c->vitaLooping;
+        const bool older = c->vitaAppearMs < requester->vitaAppearMs;
+        if (!idle && !outranked && !older && !finished) {
+            continue;
+        }
+        if (victim == NULL || c->vitaLastDrawMs < victim->vitaLastDrawMs) {
+            victim = c;
+        }
+    }
+    if (victim == NULL) {
+        static int lastLog = 0;
+        if (now - lastLog > 2000) {
+            lastLog = now;
+            common->Printf("video '%s' waits: every player belongs to a video that came on screen after it\n", requester->fileName.c_str());
+        }
+        return false;
+    }
+    common->Printf("video '%s' gives its hardware player to '%s' (%s)\n", victim->fileName.c_str(), requester->fileName.c_str(),
+        (now - victim->vitaLastDrawMs) > 1000 ? "not drawn any more" : !VitaVideo_IsPlaying(victim->vitaVideo) ? "it has finished" : (!requester->vitaLooping && victim->vitaLooping) ? "a looping screen gives way to a video played once" : "the newer video on screen wins");
+    victim->VitaReleasePlayer();
+    vitaPlayerReservedFor = requester;
+    vitaPlayerReservedMs = now;
+    return true;
+}
+
+// the .mp4's picture size and length, from its header (the converter writes
+// the index at the front: -movflags +faststart)
+bool Vita_ReadMp4Header(idFile* f, int& width, int& height, int& lengthMs)
+{
+    width = height = lengthMs = 0;
+    const int fileLen = f->Length();
+    int pos = 0;
+    while (pos + 8 <= fileLen) {
+        byte hdr[16];
+        f->Seek(pos, FS_SEEK_SET);
+        if (f->Read(hdr, 8) != 8) {
+            return false;
+        }
+        int64 size = ((int64)hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
+        int headerLen = 8;
+        if (size == 1) {
+            if (f->Read(hdr + 8, 8) != 8) {
+                return false;
+            }
+            size = 0;
+            for (int i = 8; i < 16; i++) {
+                size = (size << 8) | hdr[i];
+            }
+            headerLen = 16;
+        } else if (size == 0) {
+            size = fileLen - pos;
+        }
+        if (size < headerLen) {
+            return false;
+        }
+        if (memcmp(hdr + 4, "moov", 4) == 0 && size < 4 * 1024 * 1024) {
+            const int moovLen = (int)size - headerLen;
+            byte* moov = (byte*)Mem_Alloc(moovLen, TAG_CINEMATIC);
+            if (f->Read(moov, moovLen) != moovLen) {
+                Mem_Free(moov);
+                return false;
+            }
+            // walk the boxes inside: mvhd (length), trak > tkhd (size)
+            struct walk_t {
+                static int U32(const byte* p)
+                {
+                    return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+                }
+            };
+            int timescale = 0;
+            int64 duration = 0;
+            for (int o = 0; o + 8 <= moovLen;) {
+                int bsize = walk_t::U32(moov + o);
+                if (bsize < 8 || o + bsize > moovLen) {
+                    break;
+                }
+                const byte* b = moov + o;
+                if (memcmp(b + 4, "mvhd", 4) == 0) {
+                    const int version = b[8];
+                    if (version == 1 && bsize >= 40) {
+                        timescale = walk_t::U32(b + 28);
+                        duration = ((int64)walk_t::U32(b + 32) << 32) | (uint32)walk_t::U32(b + 36);
+                    } else if (bsize >= 28) {
+                        timescale = walk_t::U32(b + 20);
+                        duration = (uint32)walk_t::U32(b + 24);
+                    }
+                } else if (memcmp(b + 4, "trak", 4) == 0) {
+                    for (int t = 8; t + 8 <= bsize;) {
+                        const int tsize = walk_t::U32(b + t);
+                        if (tsize < 8 || t + tsize > bsize) {
+                            break;
+                        }
+                        const byte* tb = b + t;
+                        if (memcmp(tb + 4, "tkhd", 4) == 0) {
+                            const int version = tb[8];
+                            const int off = (version == 1) ? 96 : 84; // width, height: 16.16 at the end
+                            if (tsize >= off + 8) {
+                                const int w = walk_t::U32(tb + off) >> 16;
+                                const int h = walk_t::U32(tb + off + 4) >> 16;
+                                if (w > 0 && h > 0 && width == 0) {
+                                    width = w;
+                                    height = h;
+                                }
+                            }
+                        }
+                        t += tsize;
+                    }
+                }
+                o += bsize;
+            }
+            Mem_Free(moov);
+            if (timescale > 0) {
+                lengthMs = (int)(duration * 1000 / timescale);
+            }
+            return width > 0;
+        }
+        pos += (int)size;
+    }
+    return false;
+}
+
+/*
+==============
+idCinematicLocal::VitaStartRoQ / VitaStopRoQ
+
+The software stream (see vitaRoqName): the RoQ opened as InitFromFile opens
+one, played from its start. At most VITA_MAX_ROQ_STREAMS at once - each
+costs the render thread its decoding and a texture upload a frame.
+==============
+*/
+#define VITA_MAX_ROQ_STREAMS 4
+static int vitaRoqStreams = 0;
+
+bool idCinematicLocal::VitaStartRoQ()
+{
+    if (vitaRoqStreams >= VITA_MAX_ROQ_STREAMS) {
+        return false;
+    }
+    const idStr keepName = fileName;
+    iFile = fileSystem->OpenFileRead(vitaRoqName);
+    if (iFile == NULL) {
+        vitaRoqName.Clear();
+        return false;
+    }
+    isRoQ = true;
+    ROQSize = iFile->Length();
+    looping = vitaLooping;
+    CIN_HEIGHT = DEFAULT_CIN_HEIGHT;
+    CIN_WIDTH = DEFAULT_CIN_WIDTH;
+    samplesPerPixel = 4;
+    startTime = 0;
+    buf = NULL;
+    iFile->Read(file, 16);
+    const unsigned short id = (unsigned short)(file[0]) + (unsigned short)(file[1]) * 256;
+    frameRate = file[6];
+    if (frameRate == 32.0f) {
+        frameRate = 1000.0f / 32.0f;
+    }
+    if (id != ROQ_FILE) {
+        common->Printf("video '%s': '%s' is not a RoQ file - no software stream\n", keepName.c_str(), vitaRoqName.c_str());
+        fileSystem->CloseFile(iFile);
+        iFile = NULL;
+        vitaRoqName.Clear();
+        return false;
+    }
+    RoQ_init();
+    status = FMV_PLAY;
+    vitaRoqActive = true;
+    vitaRoqStreams++;
+    vitaUploadedQuad = -1;
+    fileName = keepName;
+    common->Printf("video '%s' plays in software ('%s', %.0f fps) - the hardware player is another video's (%d software stream(s))\n",
+        fileName.c_str(), vitaRoqName.c_str(), frameRate, vitaRoqStreams);
+    return true;
+}
+
+void idCinematicLocal::VitaStopRoQ(const char* why)
+{
+    if (!vitaRoqActive) {
+        return;
+    }
+    const idStr keepName = fileName;
+    RoQShutdown(); // (it clears fileName)
+    fileName = keepName;
+    vitaRoqActive = false;
+    vitaRoqStreams--;
+    status = FMV_PLAY;
+    common->Printf("video '%s': software stream stopped (%s)\n", fileName.c_str(), why);
+}
+
+void idCinematicLocal::VitaReleasePlayer()
+{
+    if (vitaVideo != NULL) {
+        VitaVideo_Close(vitaVideo);
+        vitaVideo = NULL;
+    }
+    vitaNextTryMs = 0;
+}
+
+/*
+==============
+idCinematicLocal::ImageForTimeVita
+
+On the GL thread, at each draw: the hardware player, asked for here the first
+time the video is drawn (taking the player of one nobody is looking at when
+there is no room). Until its first frame the caller draws black, as with any
+decoder starting up.
+==============
+*/
+cinData_t idCinematicLocal::ImageForTimeVita(int thisTime)
+{
+    const int now = Sys_Milliseconds();
+    if (vitaLastDrawMs == 0 || now - vitaLastDrawMs > 1000) {
+        vitaAppearMs = now; // (back) on screen
+        if (vitaRoqActive) {
+            VitaStopRoQ("it left the screen"); // the hardware player first, again
+        }
+        common->Printf("video '%s' on screen (%dx%d, %s, %s)\n", fileName.c_str(), vitaStreamW, vitaStreamH,
+            vitaLooping ? "looping" : "once", vitaVideo != NULL ? "has a player" : "needs a player");
+    }
+    vitaLastDrawMs = now;
+
+    if (!vitaLooping) {
+        vitaLastOnceDrawMs = now;
+    }
+
+    if (vitaRoqActive) {
+        // in software while it stays on screen (a restart is ResetTime's,
+        // which the RoQ decoder follows by itself)
+        vitaRestart = false;
+        return ImageForTimeRoQ(thisTime);
+    }
+    bool waits = false; // the hardware player is not coming for this video soon
+    const bool loopHolds = vitaLooping && now - vitaLastOnceDrawMs < 2000;
+    if (loopHolds && vitaVideo == NULL) {
+        waits = true;
+    }
+    // A player that has not started 1.5 s after its open (they start in
+    // 150-300 ms) is given up when the video has its .roq: the intro's
+    // tracking screen (monoflyby, 2.7 s long) stalled and the 6 s wait was
+    // longer than the video. The player is closed once it gets going (or
+    // left alone), vita_avplayer.cpp.
+    if (vitaVideo != NULL && vitaRoqName.Length() > 0 && VitaVideo_StartupMs(vitaVideo) > 1500) {
+        vitaFails++;
+        common->Printf("video '%s': no frame from the hardware player %d ms after its open - its .roq instead\n", fileName.c_str(), VitaVideo_StartupMs(vitaVideo));
+        VitaReleasePlayer();
+        vitaNextTryMs = now + (2000 << (vitaFails < 4 ? vitaFails : 4));
+    }
+
+    if (vitaRestart) {
+        vitaRestart = false;
+        if (vitaVideo != NULL) {
+            if (VitaVideo_IsPlaying(vitaVideo) && !VitaVideo_Failed(vitaVideo)) {
+                VitaVideo_Rewind(vitaVideo);
+            } else {
+                VitaReleasePlayer(); // ended: a new player from the start
+            }
+        }
+    }
+
+    if (vitaVideo != NULL && VitaVideo_Failed(vitaVideo)) {
+        // backed off (2, 4, 8, 16 s): opening and closing a player that cannot
+        // run, over and over, is churn inside sceAvPlayer for nothing
+        vitaFails++;
+        const int wait = 1000 << (vitaFails < 4 ? vitaFails : 4);
+        common->Printf("video '%s': the hardware player gave no frame (%d in a row) - trying again in %d ms\n", fileName.c_str(), vitaFails, wait);
+        VitaReleasePlayer();
+        vitaNextTryMs = now + wait;
+    }
+    if (vitaPlayerReservedFor != NULL && vitaPlayerReservedFor != this) {
+        // the player was taken for another video: it opens first, unless it
+        // has left the screen
+        if (now - vitaPlayerReservedFor->vitaLastDrawMs > 1000 || now - vitaPlayerReservedMs > 20000) {
+            vitaPlayerReservedFor = NULL;
+        } else {
+            waits = true;
+        }
+    }
+    if (vitaVideo == NULL && now < vitaNextTryMs && vitaFails > 0) {
+        waits = true; // backing off after players that gave no frame
+    }
+    if (vitaVideo == NULL && now >= vitaNextTryMs && !loopHolds && (vitaPlayerReservedFor == NULL || vitaPlayerReservedFor == this)) {
+        vitaVideo = VitaVideo_Open(vitaMp4Path.c_str(), vitaLooping, vitaStreamW, vitaStreamH);
+        if (vitaVideo != NULL && vitaPlayerReservedFor == this) {
+            vitaPlayerReservedFor = NULL;
+        }
+        if (vitaVideo == NULL && Vita_CinematicEvict(this, now)) {
+            // its memory comes back once the worker has closed it
+            vitaNextTryMs = now + 100;
+        } else if (vitaVideo == NULL) {
+            vitaNextTryMs = now + 250;
+            waits = true; // a more important video has it
+        }
+    }
+    if (vitaVideo != NULL) {
+        return ImageForTimeVitaHw();
+    }
+    // (not in its first 600 ms on screen: a player closing or the gap after
+    // one is not a reason to go to software)
+    if (waits && vitaRoqName.Length() > 0 && now - vitaAppearMs > 600 && VitaStartRoQ()) {
+        return ImageForTimeRoQ(thisTime);
+    }
+    cinData_t none;
+    memset(&none, 0, sizeof(none));
+    none.status = FMV_PLAY; // waiting for a player: still "playing"
+    return none;
+}
+#endif
+
 cinData_t idCinematicLocal::ImageForTime(int thisTime)
 {
+#if defined(__vita__)
+    if (vitaMp4Path.Length() > 0) {
+        return ImageForTimeVita(thisTime);
+    }
+    return ImageForTimeRoQ(thisTime);
+}
+
+cinData_t idCinematicLocal::ImageForTimeRoQ(int thisTime)
+{
+#endif
+
 #if defined(USE_FFMPEG)
     // Carl: Handle BFG format BINK videos separately
     if (!isRoQ)
@@ -790,7 +1474,18 @@ cinData_t idCinematicLocal::ImageForTime(int thisTime)
     cinData.imageWidth = CIN_WIDTH;
     cinData.imageHeight = CIN_HEIGHT;
     cinData.status = status;
+#if defined(__vita__)
+    // the first frame is decoded when the material is parsed, possibly on the
+    // game/draw thread: leave the upload to the back end's next call; and a
+    // frame already uploaded is not uploaded again (a screen is bound several
+    // times a frame, the video changes 30 times a second at most)
+    if (Vita_IsGLThread() && (numQuads != vitaUploadedQuad || !img->IsLoaded())) {
+        img->UploadScratch(image, CIN_WIDTH, CIN_HEIGHT);
+        vitaUploadedQuad = numQuads;
+    }
+#else
     img->UploadScratch(image, CIN_WIDTH, CIN_HEIGHT);
+#endif
     cinData.image = img;
 
     return cinData;

@@ -60,6 +60,10 @@ public:
     // the compressed images are normalize to reduce compression artifacts,
     // color must be scaled down by this
     idVec4 channelScale;
+
+    // PS Vita: index of the vita_ui glyph drawn instead of this atlas bitmap
+    // (a stock Xbox 360 / PS3 button prompt), or -1. Set in LoadBinary.
+    int vitaGlyph;
 };
 
 struct purgableSwfImage_t {
@@ -207,6 +211,31 @@ public:
     }
 
     idSWFScriptObject* HitTest(idSWFSpriteInstance* spriteInstance, const swfRenderState_t& renderState, int x, int y, idSWFScriptObject* parentObject);
+
+#if defined(__vita__)
+    // Drawing on top of a rendered SWF from outside it (the Vita controller
+    // layout). Coordinates are post-transform screen pixels, the space
+    // RenderSprite works in; VitaFrameToScreen() maps SWF frame units to it.
+    const swfMatrix_t& VitaFrameToScreen() const
+    {
+        return vitaFrameToScreen;
+    }
+    void VitaDrawQuad(const idVec2& tl, const idVec2& tr, const idVec2& br, const idVec2& bl,
+        float s1, float t1, float s2, float t2, const idMaterial* material);
+
+    // While set, this sprite is still walked by the renderer but draws
+    // nothing; the screen bounds of what it would have drawn are recorded and
+    // read back with VitaGetCaptureBounds() after the next Render().
+    void VitaSetCaptureSprite(idSWFSpriteInstance* sprite)
+    {
+        vitaCaptureSprite = sprite;
+    }
+    bool VitaGetCaptureBounds(idVec2& mins, idVec2& maxs, float* alpha = NULL) const;
+
+    // Scale applied to the whole SWF about the screen centre (menus / HUD
+    // readability on the 5" screen). Rendering only.
+    float VitaUiScale() const;
+#endif
 
 private:
     idStr filename;
@@ -361,16 +390,32 @@ private:
             imageWidth = 0;
             imageHeight = 0;
             baseline = 0;
+            s1 = t1 = 0.0f;
+            s2 = t2 = 1.0f;
         };
 
         int startIndex;
         int endIndex;
         const idMaterial* material;
+        float s1, t1, s2, t2; // sub-rectangle of material (the Vita glyph atlas)
         short imageWidth;
         short imageHeight;
         int baseline;
     };
     idList<tooltipIcon_t, TAG_SWF> tooltipIconList;
+
+#if defined(__vita__)
+    swfMatrix_t vitaFrameToScreen;
+    idSWFSpriteInstance* vitaCaptureSprite;
+    int vitaCapturing;              // > 0 while inside the capture sprite
+    bool vitaCaptureAny;            // bounds being accumulated this Render()
+    idVec2 vitaCaptureMins, vitaCaptureMaxs;
+    float vitaCaptureAlpha;         // most opaque thing seen inside it
+    bool vitaCaptureValid;          // result of the previous Render()
+    idVec2 vitaCapturedMins, vitaCapturedMaxs;
+    float vitaCapturedAlpha;
+    void VitaCaptureRect(const swfRect_t& rect, const swfMatrix_t& matrix);
+#endif
 
     const idMaterial* guiSolid;
     const idMaterial* guiCursor_arrow;

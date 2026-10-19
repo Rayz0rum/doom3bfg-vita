@@ -293,6 +293,21 @@ extern volatile int ignoredReturnValue;
 #define MAX_UNSIGNED_TYPE( x )	( ( ( ( 1U << ( ( sizeof( x ) - 1 ) * 8 ) ) - 1 ) << 8 ) | 255U )
 #define MIN_UNSIGNED_TYPE( x )	0
 
+// Vita: where the main (and the game/draw) thread is right now. A watchdog
+// thread in neo/sys/vita/vita_main.cpp logs the last mark if it stops moving,
+// so a hang names its own location in console.txt. A mark is one store; the
+// strings must be literals.
+#if defined(__vita__)
+extern volatile const char* vita_mainPhase;
+extern volatile unsigned int vita_mainPhaseSeq;
+extern volatile const char* vita_gamePhase;
+#define VITA_MARK( s )		do { vita_mainPhase = ( s ); vita_mainPhaseSeq = vita_mainPhaseSeq + 1; } while( 0 )
+#define VITA_MARK_GAME( s )	do { vita_gamePhase = ( s ); } while( 0 )
+#else
+#define VITA_MARK( s )		do { } while( 0 )
+#define VITA_MARK_GAME( s )	do { } while( 0 )
+#endif
+
 #endif
 
 

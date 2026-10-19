@@ -192,6 +192,12 @@ public:
 
     int thinkFlags;   // TH_? flags
     int dormantStart; // time that the entity was first closed off from player
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita: half-rate thinking (far monsters, ragdolls - see VitaHalfRateTic)
+    int vitaLastThinkTime = 0; // game time of this entity's last think that ran
+    enum { VITA_THINK_FULL, VITA_THINK_SKIP, VITA_THINK_TWO_TICS };
+    int VitaHalfRateTic(bool wanted);
+#endif
     bool cinematic;   // during cinematics, entity will only think if cinematic is set
 
     renderView_t* renderView; // for camera views from this entity

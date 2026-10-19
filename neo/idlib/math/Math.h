@@ -36,6 +36,52 @@ If you have questions concerning this license or the applicable additional terms
 #include <float.h>
 #endif
 
+#if defined(__vita__) && !defined(ID_VITA_NEON_MATH)
+// Off by default since 2026-10-03: with these (and RunFast flush-to-zero) the
+// Vita's float results differed from libm's in the last bits, and Doom 3's
+// physics is chaotic enough that mars_city2's ragdoll/door settling frames at
+// load ended up in a jammed, minutes-long state that the libm build never
+// reached. Build with -DID_VITA_NEON_MATH to try them again.
+#endif
+#if defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON)
+// math-neon (github.com/Rinnegatamante/math-neon, linked as libmathneon):
+// NEON versions of the libm functions. newlib's are written for accuracy over
+// the whole float range and are slow on the Cortex-A9; these are a few
+// polynomial steps (sin/cos within 8e-7, inverse square root within 1.2e-7,
+// asin/acos within 5e-5, exp/log/pow within 1e-6 relative). Declared here
+// rather than through math_neon.h, which has no extern "C" guard and defines
+// a one-argument ALIGN() that would replace idlib's. The wrappers below keep
+// the inputs these routines do not handle (zero for the reciprocal tricks in
+// atan2, exponents out of range, pow of non-positive numbers) on libm.
+// ID_TEST_MATH_NEON: a PC build calls the same algorithms through math-neon's
+// plain C versions (*_c), to test their effect on the game away from the Vita.
+#if defined(__vita__)
+#define ID_MN(name) name##_neon_hfp
+#else
+#define ID_MN(name) name##_c
+#endif
+extern "C" {
+    float sinf_neon_hfp(float x);
+    float cosf_neon_hfp(float x);
+    float atan2f_neon_hfp(float y, float x);
+    float asinf_neon_hfp(float x);
+    float acosf_neon_hfp(float x);
+    float expf_neon_hfp(float x);
+    float logf_neon_hfp(float x);
+    float powf_neon_hfp(float x, float y);
+    float invsqrtf_neon_hfp(float x);
+    float sinf_c(float x);
+    float cosf_c(float x);
+    float atan2f_c(float y, float x);
+    float asinf_c(float x);
+    float acosf_c(float x);
+    float expf_c(float x);
+    float logf_c(float x);
+    float powf_c(float x, float y);
+    float invsqrtf_c(float x);
+}
+#endif
+
 /*
 ===============================================================================
 
@@ -509,8 +555,13 @@ idMath::InvSqrt
 */
 ID_INLINE float idMath::InvSqrt(float x)
 {
-
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    // a divide and a square root, both unpipelined on the VFP, against a NEON
+    // estimate refined by Newton-Raphson steps
+    return (x > FLT_SMALLEST_NON_DENORMAL) ? ID_MN(invsqrtf)(x) : INFINITY;
+#else
     return (x > FLT_SMALLEST_NON_DENORMAL) ? sqrtf(1.0f / x) : INFINITY;
+#endif
 }
 
 /*
@@ -520,7 +571,11 @@ idMath::InvSqrt16
 */
 ID_INLINE float idMath::InvSqrt16(float x)
 {
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    return (x > FLT_SMALLEST_NON_DENORMAL) ? ID_MN(invsqrtf)(x) : INFINITY;
+#else
     return (x > FLT_SMALLEST_NON_DENORMAL) ? sqrtf(1.0f / x) : INFINITY;
+#endif
 }
 
 /*
@@ -530,7 +585,11 @@ idMath::Sqrt
 */
 ID_INLINE float idMath::Sqrt(float x)
 {
+#if defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON)
+    return (x >= 0.0f) ? sqrtf(x) : 0.0f; // one VSQRT
+#else
     return (x >= 0.0f) ? x * InvSqrt(x) : 0.0f;
+#endif
 }
 
 /*
@@ -560,7 +619,11 @@ idMath::Sin
 */
 ID_INLINE float idMath::Sin(float a)
 {
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    return ID_MN(sinf)(a);
+#else
     return sinf(a);
+#endif
 }
 
 /*
@@ -604,7 +667,11 @@ idMath::Cos
 */
 ID_INLINE float idMath::Cos(float a)
 {
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    return ID_MN(cosf)(a);
+#else
     return cosf(a);
+#endif
 }
 
 /*
@@ -666,6 +733,9 @@ ID_INLINE void idMath::SinCos(float a, float& s, float& c)
 		fstp	dword ptr [ecx]
 		fstp	dword ptr [edx]
         }
+#elif (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    s = ID_MN(sinf)(a);
+    c = ID_MN(cosf)(a);
 #else
     // DG: non-MSVC version
     s = sinf(a);
@@ -788,7 +858,11 @@ ID_INLINE float idMath::ASin(float a)
     if (a >= 1.0f) {
         return HALF_PI;
     }
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    return ID_MN(asinf)(a);
+#else
     return asinf(a);
+#endif
 }
 
 /*
@@ -825,7 +899,11 @@ ID_INLINE float idMath::ACos(float a)
     if (a >= 1.0f) {
         return 0.0f;
     }
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    return ID_MN(acosf)(a);
+#else
     return acosf(a);
+#endif
 }
 
 /*
@@ -914,6 +992,12 @@ ID_INLINE float idMath::ATan(float y, float x)
     // SRS - Don't need this assertion since atan2f(y,x) handles x=0, y=0 and x=0, y>0 or y<0 cases properly
     // SRS - This assertion can cause game to stop prematurely when _DEBUG is defined and asserts are enabled
     // assert( fabs( y ) > idMath::FLT_SMALLEST_NON_DENORMAL || fabs( x ) > idMath::FLT_SMALLEST_NON_DENORMAL );
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    // the NEON version takes reciprocals of |x| and |y/x|: zeros stay on libm
+    if (fabsf(x) > FLT_SMALLEST_NON_DENORMAL && fabsf(y) > FLT_SMALLEST_NON_DENORMAL) {
+        return ID_MN(atan2f)(y, x);
+    }
+#endif
     return atan2f(y, x);
 }
 
@@ -972,6 +1056,11 @@ idMath::Pow
 */
 ID_INLINE float idMath::Pow(float x, float y)
 {
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    if (x > FLT_SMALLEST_NON_DENORMAL) {
+        return ID_MN(powf)(x, y);
+    }
+#endif
     return powf(x, y);
 }
 
@@ -992,6 +1081,11 @@ idMath::Exp
 */
 ID_INLINE float idMath::Exp(float f)
 {
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    if (f > -80.0f && f < 80.0f) { // it scales by 2^n through the exponent bits
+        return ID_MN(expf)(f);
+    }
+#endif
     return expf(f);
 }
 
@@ -1036,6 +1130,11 @@ idMath::Log
 */
 ID_INLINE float idMath::Log(float f)
 {
+#if (defined(ID_VITA_NEON_MATH) || defined(ID_TEST_MATH_NEON))
+    if (f > FLT_SMALLEST_NON_DENORMAL) {
+        return ID_MN(logf)(f);
+    }
+#endif
     return logf(f);
 }
 

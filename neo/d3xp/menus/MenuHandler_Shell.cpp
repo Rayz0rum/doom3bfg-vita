@@ -27,7 +27,16 @@ If you have questions concerning this license or the applicable additional terms
 */
 #pragma hdrstop
 #include "precompiled.h"
+
+#if defined(__vita__)
+#include "../../sys/vita/vita_public.h"
+#define VITA_MENU(x) Vita_Checkpoint("menu: %s", x)
+#else
+#define VITA_MENU(x)
+#endif
 #include "../Game_local.h"
+#include "../../sys/sys_net_friends.h"
+#include "../../sys/sys_net_online.h"
 
 extern idCVar g_demoMode;
 
@@ -372,12 +381,14 @@ idMenuHandler_Shell::Initialize
 */
 void idMenuHandler_Shell::Initialize(const char* swfFile, idSoundWorld* sw)
 {
+    VITA_MENU("idMenuHandler::Initialize");
     idMenuHandler::Initialize(swfFile, sw);
 
     //---------------------
     // Initialize the menus
     //---------------------
 #define BIND_SHELL_SCREEN(screenId, className, menuHandler) \
+    VITA_MENU(#className);                                  \
     menuScreens[(screenId)] = new (TAG_SWF) className();    \
     menuScreens[(screenId)]->Initialize(menuHandler);       \
     menuScreens[(screenId)]->AddRef();
@@ -387,9 +398,13 @@ void idMenuHandler_Shell::Initialize(const char* swfFile, idSoundWorld* sw)
     }
 
     // done for build game purposes so these get touched
+    VITA_MENU("idSWF doomIntro");
     delete new idSWF("doomIntro", NULL);
+    VITA_MENU("idSWF roeIntro");
     delete new idSWF("roeIntro", NULL);
+    VITA_MENU("idSWF leIntro");
     delete new idSWF("leIntro", NULL);
+    VITA_MENU("binding screens");
 
     if (inGame) {
         BIND_SHELL_SCREEN(SHELL_AREA_ROOT, idMenuScreen_Shell_Pause, this);
@@ -1155,6 +1170,10 @@ void idMenuHandler_Shell::UpdateLobby(idMenuWidget_LobbyList* lobbyList)
         }
 
         lobbyPlayer->name = lobby.GetLobbyUserName(lobbyUserID);
+        // the game's owner: this console's own account, or a verified badge
+        if ((lobby.GetLocalUserFromLobbyUser(lobbyUserID) != NULL && netFriends.IsOwner()) || netOnline.IsOwnerName(lobbyPlayer->name)) {
+            lobbyPlayer->name += va(" ^3%s^0", idLocalization::GetString("#str_vita_owner_tag"));
+        }
         // Voice
         lobbyPlayer->voiceState = session->GetDisplayStateFromVoiceState(session->GetLobbyUserVoiceState(lobbyUserID));
     }

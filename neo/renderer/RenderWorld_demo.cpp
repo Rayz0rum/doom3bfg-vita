@@ -95,10 +95,14 @@ bool idRenderWorldLocal::ProcessDemoCommand(idDemoFile* readDemo, renderView_t* 
     demoCommand_t dc;
     qhandle_t h;
 
-    if (!readDemo->ReadInt((int&)dc)) {
+    // See the note in idSoundWorldLocal::ProcessDemoCommand: a one byte enum
+    // cannot be the target of a four byte read.
+    int dcValue;
+    if (!readDemo->ReadInt(dcValue)) {
         // a demoShot may not have an endFrame, but it is still valid
         return false;
     }
+    dc = (demoCommand_t)dcValue;
 
     switch (dc) {
     case DC_LOADMAP:

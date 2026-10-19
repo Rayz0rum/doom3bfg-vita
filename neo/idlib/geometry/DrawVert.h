@@ -113,6 +113,11 @@ class idDrawVert {
     friend class idRenderModelStatic;
 
     friend void TransformVertsAndTangents(idDrawVert* targetVerts, const int numVerts, const idDrawVert* baseVerts, const idJointMat* joints);
+#if defined(__vita__)
+    friend void Vita_TransformVertsAndTangents_NEON(idDrawVert* targetVerts, const int numVerts, const idDrawVert* baseVerts, const idJointMat* joints); // Model_md5.cpp
+    friend void Vita_UnitNormalsTangents_NEON(float* unit, const int numVerts, const idDrawVert* baseVerts);                                              // Model_md5.cpp
+    friend void Vita_TransformVertsAndTangentsUnit_NEON(idDrawVert* targetVerts, const int numVerts, const idDrawVert* baseVerts, const float* unit, const idJointMat* joints); // Model_md5.cpp
+#endif
 
 public:
     idVec3 xyz; // 12 bytes

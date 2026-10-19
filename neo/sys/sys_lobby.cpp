@@ -28,6 +28,8 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 #pragma hdrstop
 #include "sys_lobby.h"
+#include "sys_net_friends.h"
+#include "sys_net_online.h"
 
 extern idCVar net_connectTimeoutInSeconds;
 extern idCVar net_headlessServer;
@@ -1776,7 +1778,20 @@ int idLobby::HandleInitialPeerConnection(idBitMsg& msg, const lobbyAddress_t& pe
     // See if this was from an invite we sent out. If it wasn't, make sure we aren't invite only
     const bool fromInvite = msg.ReadBool();
 
-    if (!fromInvite && MatchTypeInviteOnly(parms.matchFlags)) {
+    // a console banned by the owner or by this host (by HW ID)
+    if (netOnline.IsAddressBanned(peerAddress.netAddr)) {
+        idLib::Printf("NET: Denying %s - that console is banned\n", peerAddress.ToString());
+        SendGoodbye(peerAddress);
+        return -1;
+    }
+
+    // (no platform invites here: being a game-specific friend, or on the same
+    // local network, stands for one - see sys_net_friends.h)
+    const bool friendOrLAN = netFriends.IsFriendAddress(peerAddress.netAddr) || Sys_IsLANAddress(peerAddress.netAddr);
+    if (!fromInvite && friendOrLAN && MatchTypeInviteOnly(parms.matchFlags)) {
+        idLib::Printf("NET: letting %s into the invite only match (%s)\n", peerAddress.ToString(), Sys_IsLANAddress(peerAddress.netAddr) ? "local network" : "friend");
+    }
+    if (!fromInvite && !friendOrLAN && MatchTypeInviteOnly(parms.matchFlags)) {
         idLib::Printf("NET: Denying user %s because they were not invited to an invite only match\n", peerAddress.ToString());
         SendGoodbye(peerAddress);
         return -1;

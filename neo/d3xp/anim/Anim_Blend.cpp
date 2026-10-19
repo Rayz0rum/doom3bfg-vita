@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "../Game_local.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 static const char* channelNames[ANIM_NumAnimChannels] = {
     "all", "torso", "legs", "head", "eyelids"
@@ -893,6 +894,11 @@ void idAnim::CallFrameCommands(idEntity* ent, int from, int to) const
 
                 target = gameLocal.FindEntity(command.string->c_str());
                 if (target) {
+                    extern idCVar vita_logStory;
+                    if (vita_logStory.GetBool()) {
+                        common->Printf("story [%d ms]: '%s' anim '%s' frame %d triggers '%s' (%s)\n", gameLocal.time, ent->name.c_str(), FullName(), frame + 1,
+                            target->name.c_str(), target->GetClassname());
+                    }
                     SetTimeState ts(target->timeGroup);
                     target->Signal(SIG_TRIGGER);
                     target->ProcessEvent(&EV_Activate, ent);
@@ -1207,6 +1213,7 @@ void idAnimBlend::Reset(const idDeclModelDef* _modelDef)
     frame = 0;
     allowMove = true;
     allowFrameCommands = true;
+    vitaCmdStart = -0x7fffffff;
     animNum = 0;
 
     memset(animWeights, 0, sizeof(animWeights));
@@ -1842,6 +1849,24 @@ void idAnimBlend::CallFrameCommands(idEntity* ent, int fromtime, int totime) con
     md5anim = anim->MD5Anim(0);
     md5anim->ConvertTimeToFrame(fromFrameTime, cycle, frame1);
     md5anim->ConvertTimeToFrame(toFrameTime, cycle, frame2);
+
+    // The first pass over a newly started animation must include its first
+    // frame. Stock code relies on that pass starting exactly at the start
+    // time; a pass that begins a tic or two later (an entity that skipped
+    // its think that tic, a frame that ran no tic) jumped over frame 1's
+    // commands - and story scripts open doors there (Brooks's window_g in
+    // mc_underground: frame 1 unlocks the checkpoint door). Caught and
+    // logged here.
+    if (vitaCmdStart != starttime) {
+        const bool missedStart = fromFrameTime > 0 && (fromtime - starttime) <= 250;
+        vitaCmdStart = starttime;
+        if (missedStart) {
+            common->Printf("anim: '%s' on '%s': its first frame commands were about to be skipped (first pass from %d ms after its start) - run from frame 1\n",
+                anim->FullName(), ent->GetName(), fromtime - starttime);
+            anim->CallFrameCommands(ent, -1, frame2.frame1);
+            return;
+        }
+    }
 
     if (fromFrameTime <= 0) {
         // make sure first frame is called
@@ -3245,8 +3270,8 @@ void idAnimator::Save(idSaveGame* savefile) const
         savefile->WriteInt(jointMods[i]->jointnum);
         savefile->WriteMat3(jointMods[i]->mat);
         savefile->WriteVec3(jointMods[i]->pos);
-        savefile->WriteInt((int&)jointMods[i]->transform_pos);
-        savefile->WriteInt((int&)jointMods[i]->transform_axis);
+        savefile->WriteEnum(jointMods[i]->transform_pos);
+        savefile->WriteEnum(jointMods[i]->transform_axis);
     }
 
     savefile->WriteInt(numJoints);
@@ -3271,7 +3296,7 @@ void idAnimator::Save(idSaveGame* savefile) const
 
     savefile->WriteInt(AFPoseJointMods.Num());
     for (i = 0; i < AFPoseJointMods.Num(); i++) {
-        savefile->WriteInt((int&)AFPoseJointMods[i].mod);
+        savefile->WriteEnum(AFPoseJointMods[i].mod);
         savefile->WriteMat3(AFPoseJointMods[i].axis);
         savefile->WriteVec3(AFPoseJointMods[i].origin);
     }
@@ -3317,11 +3342,11 @@ void idAnimator::Restore(idRestoreGame* savefile)
     jointMods.SetNum(num);
     for (i = 0; i < num; i++) {
         jointMods[i] = new (TAG_ANIM) jointMod_t;
-        savefile->ReadInt((int&)jointMods[i]->jointnum);
+        savefile->ReadEnum(jointMods[i]->jointnum);
         savefile->ReadMat3(jointMods[i]->mat);
         savefile->ReadVec3(jointMods[i]->pos);
-        savefile->ReadInt((int&)jointMods[i]->transform_pos);
-        savefile->ReadInt((int&)jointMods[i]->transform_axis);
+        savefile->ReadEnum(jointMods[i]->transform_pos);
+        savefile->ReadEnum(jointMods[i]->transform_axis);
     }
 
     savefile->ReadInt(numJoints);
@@ -3352,7 +3377,7 @@ void idAnimator::Restore(idRestoreGame* savefile)
     AFPoseJointMods.SetGranularity(1);
     AFPoseJointMods.SetNum(num);
     for (i = 0; i < AFPoseJointMods.Num(); i++) {
-        savefile->ReadInt((int&)AFPoseJointMods[i].mod);
+        savefile->ReadEnum(AFPoseJointMods[i].mod);
         savefile->ReadMat3(AFPoseJointMods[i].axis);
         savefile->ReadVec3(AFPoseJointMods[i].origin);
     }
@@ -4390,8 +4415,25 @@ bool idAnimator::FrameHasChanged(int currentTime) const
 idAnimator::CreateFrame
 =====================
 */
+#if defined(__vita__)
+// summed for the perf log (common_frame.cpp): {us, calls}
+struct vitaGameTimer_t {
+    volatile int* sum;
+    uint64 t0;
+    vitaGameTimer_t(volatile int* s, volatile int* calls) : sum(s), t0(Sys_Microseconds()) { __sync_fetch_and_add(calls, 1); }
+    ~vitaGameTimer_t() { __sync_fetch_and_add(sum, (int)(Sys_Microseconds() - t0)); }
+};
+#endif
+#if defined(__vita__)
+volatile int vita_animUs = 0, vita_animCalls = 0;
+#endif
+
 bool idAnimator::CreateFrame(int currentTime, bool force)
 {
+#if defined(__vita__)
+    vitaGameTimer_t vitaTimer(&vita_animUs, &vita_animCalls);
+#endif
+    VITA_ZONE("animation frame (idAnimator::CreateFrame)");
     int i, j;
     int numJoints;
     int parentNum;

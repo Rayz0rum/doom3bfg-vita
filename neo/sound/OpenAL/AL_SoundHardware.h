@@ -66,6 +66,12 @@ public:
         return freeVoices.Num();
     }
 
+#if defined(ID_SOUND_STREAM)
+    // the sound worker thread's round (AL_SoundStream.cpp): every voice with
+    // a stream to keep queued, or only those waiting to start
+    void ServiceStreamVoices(bool all);
+#endif
+
     // OpenAL info
     static void PrintDeviceList(const char* list);
     static void PrintALCInfo(ALCdevice* device);

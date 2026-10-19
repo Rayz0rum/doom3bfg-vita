@@ -44,6 +44,7 @@ idSWFDictionaryEntry::idSWFDictionaryEntry()
     , imageSize(0, 0)
     , imageAtlasOffset(0, 0)
     , channelScale(1.0f, 1.0f, 1.0f, 1.0f)
+    , vitaGlyph(-1)
 {
 }
 
@@ -78,6 +79,8 @@ idSWFDictionaryEntry& idSWFDictionaryEntry::operator=(idSWFDictionaryEntry& othe
     edittext = other.edittext;
     imageSize = other.imageSize;
     imageAtlasOffset = other.imageAtlasOffset;
+    channelScale = other.channelScale;
+    vitaGlyph = other.vitaGlyph;
     other.type = SWF_DICT_NULL;
     other.material = NULL;
     other.shape = NULL;
@@ -104,6 +107,8 @@ idSWFDictionaryEntry& idSWFDictionaryEntry::operator=(idSWFDictionaryEntry&& oth
     edittext = other.edittext;
     imageSize = other.imageSize;
     imageAtlasOffset = other.imageAtlasOffset;
+    channelScale = other.channelScale;
+    vitaGlyph = other.vitaGlyph;
     other.type = SWF_DICT_NULL;
     other.material = NULL;
     other.shape = NULL;

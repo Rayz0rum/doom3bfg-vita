@@ -334,6 +334,7 @@ protected:
 private:
     idStr name;
     uintptr_t threadHandle;
+    core_t startCore; // the core asked for at start (applied on the Vita, see ThreadProc)
     bool isWorker;
     bool isRunning;
     volatile bool isTerminating;

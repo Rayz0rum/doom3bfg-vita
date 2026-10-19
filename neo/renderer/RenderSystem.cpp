@@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#endif
+
 idRenderSystemLocal tr;
 idRenderSystem* renderSystem = &tr;
 
@@ -42,8 +46,39 @@ This prints both front and back end counters, so it should
 only be called when the back end thread is idle.
 =====================
 */
+#if defined(__vita__)
+// summed over frames for the perf log (common_frame.cpp): what the scene asked
+// of the CPU and GPU - a fight's blood and gibs show up here
+uint64 vita_pcSums[8];
+#endif
+
+// the last frame's counters, for the benchmark (VitaBench.cpp)
+struct vitaBenchScene_t {
+    int views, skinnedVerts, shadowVolumes, entities, lights, draws, tris, shadowTris, interactions;
+};
+vitaBenchScene_t vita_benchScene;
+
 static void R_PerformanceCounters()
 {
+    vita_benchScene.views = tr.pc.c_numViews;
+    vita_benchScene.skinnedVerts = tr.pc.c_deformedVerts;
+    vita_benchScene.shadowVolumes = tr.pc.c_createShadowVolumes;
+    vita_benchScene.entities = tr.pc.c_visibleViewEntities;
+    vita_benchScene.lights = tr.pc.c_viewLights;
+    vita_benchScene.draws = backEnd.pc.c_drawElements + backEnd.pc.c_shadowElements;
+    vita_benchScene.tris = (backEnd.pc.c_drawIndexes + backEnd.pc.c_shadowIndexes) / 3;
+    vita_benchScene.shadowTris = backEnd.pc.c_shadowIndexes / 3;
+    vita_benchScene.interactions = tr.pc.c_createInteractions;
+#if defined(__vita__)
+    vita_pcSums[0] += tr.pc.c_deformedVerts;                                // CPU-skinned vertices
+    vita_pcSums[1] += tr.pc.c_createShadowVolumes;
+    vita_pcSums[2] += tr.pc.c_visibleViewEntities;
+    vita_pcSums[3] += tr.pc.c_viewLights;
+    vita_pcSums[4] += backEnd.pc.c_drawElements + backEnd.pc.c_shadowElements; // draw calls
+    vita_pcSums[5] += (backEnd.pc.c_drawIndexes + backEnd.pc.c_shadowIndexes) / 3;
+    vita_pcSums[6] += backEnd.pc.c_shadowIndexes / 3;
+    vita_pcSums[7] += tr.pc.c_createInteractions;
+#endif
     if (r_showPrimitives.GetInteger() != 0) {
         common->Printf("views:%i draws:%i tris:%i (shdw:%i)\n",
             tr.pc.c_numViews,
@@ -101,6 +136,7 @@ void idRenderSystemLocal::RenderCommandBuffers(const emptyCommand_t* const cmdHe
             break;
         }
     }
+
     if (!hasView) {
         return;
     }
@@ -832,9 +868,82 @@ fill rate requirements while still allowing the GUIs to be full resolution.
 In split screen mode the rendering size is also smaller.
 ========================
 */
+#if defined(__vita__)
+// The 3D view only: it is drawn into the top-left of the 960x544 screen at this
+// size, then stretched to fill it (RB_PostProcess) before the HUD and menus are
+// drawn at full resolution, so they stay sharp. Read every frame.
+//
+// The 3D view's resolution moves between 544x312 and 720x408 (by request);
+// this cvar is the top of that range. With vita_dynamicResolution off it is
+// simply the size used.
+idCVar vita_renderResolution("vita_renderResolution", "720x408", CVAR_ARCHIVE | CVAR_RENDERER,
+    "Vita: resolution of the 3D view, at most 720x408 and at least 544x312 (the HUD and menus always draw at 960x544)");
+
+// Dynamic resolution (common_frame.cpp drives it): the 3D view steps down from
+// vita_renderResolution towards 640x360 while 30 fps cannot be held or memory
+// runs tight, and back up when there is time to spare. The HUD and menus are
+// unaffected - they are always drawn at 960x544.
+// (544x312 at the bottom since the fifth round of cuts - 640x360 before: the
+// fights stayed GPU-bound at 640x360)
+static const int VITA_RES_MIN_W = 544, VITA_RES_MIN_H = 312;
+static const int VITA_RES_MAX_W = 720, VITA_RES_MAX_H = 408;
+static const int VITA_RES_STEPS = 8; // 720x408 696x392 672x384 648x368 616x352 592x336 568x328 544x312
+int vita_dynamicResolutionStep = 0;
+
+static void Vita_RenderResolutionTop(int& w, int& h)
+{
+    w = VITA_RES_MAX_W;
+    h = VITA_RES_MAX_H;
+    if (sscanf(vita_renderResolution.GetString(), "%dx%d", &w, &h) != 2) {
+        w = VITA_RES_MAX_W;
+        h = VITA_RES_MAX_H;
+    }
+    w = idMath::ClampInt(VITA_RES_MIN_W, VITA_RES_MAX_W, w);
+    h = idMath::ClampInt(VITA_RES_MIN_H, VITA_RES_MAX_H, h);
+}
+
+int Vita_DynamicResolutionSteps()
+{
+    int w, h;
+    Vita_RenderResolutionTop(w, h);
+    return (w == VITA_RES_MIN_W && h == VITA_RES_MIN_H) ? 1 : VITA_RES_STEPS;
+}
+
+void Vita_RenderSizeForStep(int step, int* outW, int* outH)
+{
+    int w, h;
+    Vita_RenderResolutionTop(w, h);
+    const int steps = Vita_DynamicResolutionSteps();
+    step = idMath::ClampInt(0, steps - 1, step);
+    if (steps > 1 && step > 0) {
+        // even steps from the top down to 640x360, on multiples of 8
+        const float f = (float)step / (float)(steps - 1);
+        w = ((idMath::Ftoi(w + (VITA_RES_MIN_W - w) * f) + 4) / 8) * 8;
+        h = ((idMath::Ftoi(h + (VITA_RES_MIN_H - h) * f) + 4) / 8) * 8;
+    }
+    *outW = w;
+    *outH = h;
+}
+
+bool Vita_RenderScale(float& x, float& y)
+{
+    int w, h;
+    Vita_RenderSizeForStep(vita_dynamicResolutionStep, &w, &h);
+    x = w / 960.0f;
+    y = h / 544.0f;
+    return (w != 960 || h != 544);
+}
+#endif
+
 void idRenderSystemLocal::PerformResolutionScaling(int& newWidth, int& newHeight)
 {
 
+#if defined(__vita__)
+    // the exact size of the current step (scaling 960 by 704/960 and
+    // truncating gave 703x399)
+    Vita_RenderSizeForStep(vita_dynamicResolutionStep, &newWidth, &newHeight);
+    return;
+#endif
     float xScale = 1.0f;
     float yScale = 1.0f;
     resolutionScale.GetCurrentResolutionScale(xScale, yScale);

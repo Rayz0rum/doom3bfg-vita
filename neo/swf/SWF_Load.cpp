@@ -28,6 +28,9 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "../renderer/Font.h"
+#if defined(__vita__)
+#include "../sys/vita/vita_ui.h"
+#endif
 
 #pragma warning(disable : 4355) // 'this' : used in base member initializer list
 
@@ -148,6 +151,9 @@ bool idSWF::LoadBinary(const char* bfilename, ID_TIME_T sourceTime)
     f->ReadBig(frameWidth);
     f->ReadBig(frameHeight);
     f->ReadBig(frameRate);
+#if defined(__vita__)
+    int vitaGlyphMatches = 0;
+#endif
 
     if (mouseX == -1) {
         mouseX = (frameWidth / 2);
@@ -181,6 +187,18 @@ bool idSWF::LoadBinary(const char* bfilename, ID_TIME_T sourceTime)
             for (int j = 0; j < 4; j++) {
                 f->ReadBig(dictionary[i].channelScale[j]);
             }
+#if defined(__vita__)
+            // stock Xbox 360 / PS3 button prompts are recognised by their
+            // rectangle in this SWF's atlas and drawn as Vita buttons
+            if (imageName[0] == '.') {
+                dictionary[i].vitaGlyph = Vita_UI_SwfGlyph(filename.c_str(),
+                    dictionary[i].imageAtlasOffset.x, dictionary[i].imageAtlasOffset.y,
+                    dictionary[i].imageSize.x, dictionary[i].imageSize.y);
+                if (dictionary[i].vitaGlyph >= 0) {
+                    vitaGlyphMatches++;
+                }
+            }
+#endif
             break;
         }
         case SWF_DICT_MORPH:
@@ -316,6 +334,10 @@ bool idSWF::LoadBinary(const char* bfilename, ID_TIME_T sourceTime)
         }
     }
     delete f;
+
+#if defined(__vita__)
+    idLib::Printf("vita: %s: %d button prompt bitmaps drawn as Vita buttons\n", filename.c_str(), vitaGlyphMatches);
+#endif
 
     return true;
 }

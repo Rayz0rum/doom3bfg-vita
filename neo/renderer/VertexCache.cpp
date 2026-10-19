@@ -159,11 +159,30 @@ call on loading a new map
 */
 void idVertexCache::FreeStaticData()
 {
-    // Destroy and recreate the static buffers to clear state
-    staticData.vertexBuffer.FreeBufferObject();
-    staticData.indexBuffer.FreeBufferObject();
-    staticData.vertexBuffer.AllocBufferObject(NULL, STATIC_VERTEX_MEMORY);
-    staticData.indexBuffer.AllocBufferObject(NULL, STATIC_INDEX_MEMORY);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK) // (the PC test build too: map loads in a row, screenshots compared)
+    // Kept, not recreated: freeing the 30 MB + 11 MB static set only queues it
+    // for vitaGL's garbage collector (the GPU may still read it), so the new
+    // 30 MB block never fitted - run 7's vitaGL.log has 64 "forcefully free"
+    // garbage collections of exactly 31457280 bytes, one per level load and
+    // return to the menu, each waiting on the GPU, and the pools fragmented a
+    // little more every time. Mapping hands back the buffers' plain memory
+    // (BufferObject.cpp), the old level's frames are long done before the new
+    // one uploads anything (the loading screen draws only GUIs from the frame
+    // buffers), and the offsets start over below: nothing else is needed.
+    if (staticData.vertexBuffer.GetAllocedSize() == STATIC_VERTEX_MEMORY && staticData.indexBuffer.GetAllocedSize() == STATIC_INDEX_MEMORY) {
+        static int kept = 0;
+        if (kept++ == 0) {
+            idLib::Printf("vita: the static vertex cache (%d + %d MB) is kept across level loads\n", STATIC_VERTEX_MEMORY >> 20, STATIC_INDEX_MEMORY >> 20);
+        }
+    } else
+#endif
+    {
+        // Destroy and recreate the static buffers to clear state
+        staticData.vertexBuffer.FreeBufferObject();
+        staticData.indexBuffer.FreeBufferObject();
+        staticData.vertexBuffer.AllocBufferObject(NULL, STATIC_VERTEX_MEMORY);
+        staticData.indexBuffer.AllocBufferObject(NULL, STATIC_INDEX_MEMORY);
+    }
 
     ClearGeoBufferSet(staticData);
 
@@ -177,6 +196,15 @@ void idVertexCache::FreeStaticData()
 idVertexCache::ActuallyAlloc
 ==============
 */
+#if defined(__vita__)
+// per perf window (common_frame.cpp): what the frames put into the GPU's
+// buffers - vitaGL keeps dynamic buffers in its uncached RAM pool, where CPU
+// stores are slow - and the time the copies into them took
+volatile int vita_vcCopyUs = 0;
+volatile int vita_vcCopyKB = 0;
+int64 vita_vcFrameBytes = 0;
+#endif
+
 vertCacheHandle_t idVertexCache::ActuallyAlloc(geoBufferSet_t& vcs, const void* data, int bytes, cacheType_t type)
 {
     if (bytes == 0) {
@@ -221,7 +249,14 @@ vertCacheHandle_t idVertexCache::ActuallyAlloc(geoBufferSet_t& vcs, const void* 
     // Actually perform the data transfer
     if (data != NULL) {
         MapGeoBufferSet(vcs);
+#if defined(__vita__)
+        const uint64 copyStart = Sys_Microseconds();
         CopyBuffer(*base + offset, (const byte*)data, bytes);
+        __sync_fetch_and_add(&vita_vcCopyUs, (int)(Sys_Microseconds() - copyStart));
+        __sync_fetch_and_add(&vita_vcCopyKB, (bytes + 512) >> 10);
+#else
+        CopyBuffer(*base + offset, (const byte*)data, bytes);
+#endif
     }
 
     vertCacheHandle_t handle = ((uint64)(currentFrame & VERTCACHE_FRAME_MASK) << VERTCACHE_FRAME_SHIFT) | ((uint64)(offset & VERTCACHE_OFFSET_MASK) << VERTCACHE_OFFSET_SHIFT) | ((uint64)(bytes & VERTCACHE_SIZE_MASK) << VERTCACHE_SIZE_SHIFT);
@@ -308,6 +343,9 @@ void idVertexCache::BeginBackEnd()
     mostUsedVertex = Max(mostUsedVertex, frameData[listNum].vertexMemUsed.GetValue());
     mostUsedIndex = Max(mostUsedIndex, frameData[listNum].indexMemUsed.GetValue());
     mostUsedJoint = Max(mostUsedJoint, frameData[listNum].jointMemUsed.GetValue());
+#if defined(__vita__)
+    vita_vcFrameBytes += frameData[listNum].vertexMemUsed.GetValue() + frameData[listNum].indexMemUsed.GetValue() + frameData[listNum].jointMemUsed.GetValue();
+#endif
 
     if (r_showVertexCache.GetBool()) {
         idLib::Printf("%08d: %d allocations, %dkB vertex, %dkB index, %ikB joint : %dkB vertex, %dkB index, %ikB joint\n",

@@ -193,6 +193,10 @@ elseif(MSVC)
     endif()
 endif()
 
+if(VITA)
+    # one section per function, for -Wl,--gc-sections (see the VITA block further down)
+    add_compile_options(-ffunction-sections -fdata-sections)
+endif()
 add_subdirectory(neo/idlib)
 
 file(GLOB AAS_INCLUDES neo/aas/*.h)
@@ -351,12 +355,14 @@ set(XAUDIO2_SOURCES
 set(OPENAL_INCLUDES
     neo/sound/OpenAL/AL_SoundHardware.h
     neo/sound/OpenAL/AL_SoundSample.h
+    neo/sound/OpenAL/AL_SoundStream.h
     neo/sound/OpenAL/AL_SoundVoice.h
 )
 
 set(OPENAL_SOURCES
     neo/sound/OpenAL/AL_SoundHardware.cpp
     neo/sound/OpenAL/AL_SoundSample.cpp
+    neo/sound/OpenAL/AL_SoundStream.cpp
     neo/sound/OpenAL/AL_SoundVoice.cpp
 )
 
@@ -366,6 +372,19 @@ set(STUBAUDIO_SOURCES neo/sound/stub/SoundSample.cpp)
 
 file(GLOB SYS_INCLUDES neo/sys/*.h)
 file(GLOB SYS_SOURCES neo/sys/*.cpp)
+
+# Online multiplayer (the PS Vita port): its code is not published - it lives
+# in neo/sys/online when present (the official builds). Without it, the
+# local-only stand-in (neo/sys/sys_net_local.cpp) is built: multiplayer over
+# the local network and to friends added by address, no online play.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/neo/sys/online/sys_net_online.cpp")
+    file(GLOB SYS_ONLINE_SOURCES neo/sys/online/*.cpp)
+    list(REMOVE_ITEM SYS_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/neo/sys/sys_net_local.cpp")
+    list(APPEND SYS_SOURCES ${SYS_ONLINE_SOURCES})
+    message(STATUS "Multiplayer: online play included (neo/sys/online)")
+else()
+    message(STATUS "Multiplayer: local network only (the online code is not in this source tree)")
+endif()
 
 file(GLOB UI_INCLUDES neo/ui/*.h)
 file(GLOB UI_SOURCES neo/ui/*.cpp)
@@ -419,6 +438,8 @@ set(GAMED3XP_SOURCES
     neo/d3xp/AimAssist.cpp
     neo/d3xp/BrittleFracture.cpp
     neo/d3xp/Camera.cpp
+    neo/d3xp/VitaVerify_game.cpp
+    neo/d3xp/VitaBots.cpp
     #neo/d3xp/EndLevel.cpp
     neo/d3xp/Entity.cpp
     neo/d3xp/Fx.cpp
@@ -714,6 +735,20 @@ file(GLOB COMMON_SOURCES neo/sys/common/*.cpp)
 
 file(GLOB SDL_INCLUDES neo/sys/sdl/*.h)
 file(GLOB SDL_SOURCES neo/sys/sdl/*.cpp)
+
+if(VITA)
+    # sdl_qgl.cpp is the desktop runtime GL-pointer loader/trace layer. The Vita
+    # links vitaGL statically and uses qgl_linked.h, so it is both unnecessary and
+    # full of GL 1.x fixed-function symbols GLES2 removed.
+    list(REMOVE_ITEM SDL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/neo/sys/sdl/sdl_qgl.cpp)
+    # newlib has no fopen64/ftello64/fseeko64; minizip already provides this switch.
+    add_definitions(-DIOAPI_NO_64)
+    # The Windows build of vita-elf-create corrupts its heap and dies (exit 127)
+    # once the ELF carries more than about 278k relocations, which this one
+    # reached. One section per function lets the linker drop everything that is
+    # never called (--gc-sections below), which is a good share of BFG's code.
+    # (the compile flags for that are set before idlib is added, near the top)
+endif()
 
 source_group("aas" FILES ${AAS_INCLUDES})
 source_group("aas" FILES ${AAS_SOURCES})
@@ -1306,7 +1341,7 @@ else()
         # Copy base/default.cfg
         file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/base/default.cfg
              DESTINATION ${CMAKE_BINARY_DIR}/base)
-    elseif(UNIX)
+    elseif(UNIX OR VITA)
         if(FFMPEG)
             find_package(FFmpeg REQUIRED)
             add_definitions(-DUSE_FFMPEG)
@@ -1325,8 +1360,13 @@ else()
             ${POSIX_SOURCES}
             ${SDL_INCLUDES}
             ${SDL_SOURCES}
-            neo/sys/linux/linux_main.cpp
         )
+
+        if(VITA)
+            list(APPEND DOOM_SOURCES neo/sys/vita/vita_main.cpp neo/sys/vita/vita_compat.cpp neo/sys/vita/vita_mem.cpp neo/sys/vita/vita_avplayer.cpp neo/sys/vita/vita_selftest.cpp neo/sys/vita/vita_ui.cpp neo/sys/vita/vita_ui_assets.cpp neo/sys/vita/vita_trophies.cpp)
+        else()
+            list(APPEND DOOM_SOURCES neo/sys/linux/linux_main.cpp)
+        endif()
 
         if(OPENAL)
             find_package(OpenAL REQUIRED)
@@ -1431,12 +1471,17 @@ else()
     # we need to recreate the precompiled header for Doom3BFG
     # (i.e. can't use the one created for idlib before)
     # because some definitions (e.g. -D__IDLIB__ -D__DOOM_DLL__) differ
+    # See the note in neo/idlib/CMakeLists.txt: GCC PCH cannot be mapped on Windows hosts.
+    if(VITA OR CMAKE_HOST_WIN32 OR CMAKE_HOST_SYSTEM_NAME MATCHES "Windows|MSYS|MINGW|CYGWIN")
+        set(_pch_cmd_main ${CMAKE_COMMAND} -E echo "Doom3BFG: PCH generation disabled")
+    else()
+        set(_pch_cmd_main ${CMAKE_CXX_COMPILER} ${_compiler_FLAGS} -std=gnu++14 -x c++-header neo/idlib/precompiled.h -o neo/idlib/precompiled.h.gch)
+    endif()
+
     add_custom_target(
         precomp_header_rbdoom3bfg
         ALL
-        COMMAND
-            ${CMAKE_CXX_COMPILER} ${_compiler_FLAGS} -std=gnu++14 -x c++-header
-            neo/idlib/precompiled.h -o neo/idlib/precompiled.h.gch
+        COMMAND ${_pch_cmd_main}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Creating idlib/precompiled.h.gch for Doom3BFG"
     )
@@ -1502,6 +1547,75 @@ else()
         )
     endif()
 
+    if(VITA)
+        target_link_options(Doom3BFG PRIVATE
+            -Wl,--gc-sections
+            # libstdc++ decides whether the program is threaded by checking
+            # whether pthread_cancel - a weak reference - got linked in, and
+            # nothing here calls it. Without it every function-local static
+            # was initialized single-threaded: two threads constructing the
+            # same one at once read as a recursive initialization and called
+            # std::terminate (the benchmark's first frame aborted on a job
+            # thread). Pulled in, the C++ guards use pthread_once and a mutex.
+            -Wl,--undefined=pthread_cancel
+            -Wl,--wrap=malloc
+            -Wl,--wrap=free
+            -Wl,--wrap=calloc
+            -Wl,--wrap=realloc
+            -Wl,--wrap=memalign
+            -Wl,--wrap=aligned_alloc
+            -Wl,--wrap=valloc
+            -Wl,--wrap=malloc_usable_size
+        )
+        target_link_libraries(
+            Doom3BFG
+            idlib
+            SDL2
+            # vitaGL and its shader-compiler chain. Order matters: vitashark and
+            # the ShaccCg pieces are only pulled in by vitaGL.
+            vitaGL
+            vitashark
+            SceShaccCgExt
+            SceShaccCg_stub
+            taihen_stub
+            mathneon
+            openal
+            # Sce stubs required by SDL2's VITA_VGL video driver, vitaGL and openal.
+            SceAppMgr_stub
+            SceAppUtil_stub
+            SceAudio_stub
+            SceAudioIn_stub
+            # Hardware H.264/AAC playback for idCinematic
+            # (neo/sys/vita/vita_avplayer.cpp neo/sys/vita/vita_selftest.cpp). All stubs - the decoders live
+            # in the firmware, so this costs the ELF almost nothing.
+            SceAvPlayer_stub
+            SceAudiodec_stub
+            SceCodecEngine_stub
+            SceVideodec_stub
+            SceCommonDialog_stub
+            # Trophies (neo/sys/vita/vita_trophies.cpp)
+            SceNpTrophy_stub
+            SceKernelModulemgr_stub # sceKernelGetSystemSwVersion (the firmware, in the log)
+            SceCtrl_stub
+            SceDisplay_stub
+            SceGxm_stub
+            SceHid_stub
+            SceIme_stub
+            SceKernelDmacMgr_stub
+            SceMotion_stub
+            ScePower_stub
+            SceProcessmgr_stub
+            SceSysmodule_stub
+            SceTouch_stub
+            # Networking (Sys_InitNetworking / the lobby backend).
+            SceNet_stub
+            SceNetCtl_stub
+            pthread
+            m
+            z
+        )
+    endif()
+
     if("${CMAKE_SYSTEM}" MATCHES "FreeBSD")
         target_link_libraries(
             Doom3BFG
@@ -1514,4 +1628,113 @@ else()
             ${FFMPEG_LIBRARIES}
         )
     endif()
+endif()
+
+
+# ==============================================================================
+# PS Vita packaging
+#
+# The Vita loads a self-signed FSELF from inside a VPK. vita.toolchain.cmake
+# provides vita_create_self()/vita_create_vpk(), which drive vita-elf-create,
+# vita-make-fself, vita-mksfoex and vita-pack-vpk in the right order. The
+# -Wl,-q the toolchain adds to the link is what keeps the relocations these
+# tools need.
+# ==============================================================================
+if(VITA)
+    # vita.toolchain.cmake does not pull this in; it defines vita_create_self()
+    # and vita_create_vpk().
+    include("${VITASDK}/share/vita.cmake" REQUIRED)
+
+    # vitaGL only accepts GLSL when it was built with HAVE_GLSL_SUPPORT=1. Built
+    # without it, glShaderSource() expects Cg instead and every shader in the
+    # game fails to compile - at runtime, on hardware, with nothing at link time
+    # to suggest why. Catch a stock vitaGL here instead.
+    find_library(VITAGL_LIBRARY NAMES vitaGL PATHS "${VITASDK}/arm-vita-eabi/lib" NO_DEFAULT_PATH)
+    if(NOT VITAGL_LIBRARY)
+        message(FATAL_ERROR "libvitaGL.a not found in ${VITASDK}/arm-vita-eabi/lib")
+    endif()
+    execute_process(
+        COMMAND "${VITASDK}/bin/arm-vita-eabi-nm" "${VITAGL_LIBRARY}"
+        OUTPUT_VARIABLE _vitagl_symbols
+        ERROR_QUIET
+    )
+    if(NOT _vitagl_symbols MATCHES "glsl_translator_process")
+        message(FATAL_ERROR
+            "This libvitaGL.a has no GLSL translator, so every shader would fail "
+            "to compile on the device. Rebuild vitaGL with HAVE_GLSL_SUPPORT=1, "
+            "keeping the other flags this port expects:
+"
+            "  make HAVE_WRAPPED_ALLOCATORS=1 NO_DEBUG=1 DRAW_SPEEDHACK=1 "
+            "CIRCULAR_VERTEX_POOL=2 HAVE_GLSL_SUPPORT=1 install")
+    endif()
+    if(NOT _vitagl_symbols MATCHES "__real_malloc")
+        message(FATAL_ERROR
+            "This libvitaGL.a was not built with HAVE_WRAPPED_ALLOCATORS=1, but "
+            "neo/sys/vita/vita_mem.cpp defines the __wrap_* allocators it pairs "
+            "with. Rebuild vitaGL with the flags above.")
+    endif()
+
+    # vitaGL comes in as the bare link flag -lvitaGL, which CMake does not treat
+    # as a dependency of the executable. Reinstalling a rebuilt libvitaGL.a
+    # therefore leaves Doom3BFG untouched and vita_create_vpk() happily
+    # repackages the stale one, so a vitaGL change appears to have no effect on
+    # hardware. Name the archive explicitly so the link rule tracks it.
+    set_property(TARGET Doom3BFG APPEND PROPERTY LINK_DEPENDS "${VITAGL_LIBRARY}")
+
+    # Same for SDL2, which is also linked by bare name out of the VitaSDK
+    # prefix. The Vita video and GL init both live in it, so a rebuilt SDL that
+    # does not force a relink is the same silent-stale-binary trap.
+    find_library(VITA_SDL2_LIBRARY NAMES SDL2 PATHS "$ENV{VITASDK}/arm-vita-eabi/lib" NO_DEFAULT_PATH)
+    if(VITA_SDL2_LIBRARY)
+        set_property(TARGET Doom3BFG APPEND PROPERTY LINK_DEPENDS "${VITA_SDL2_LIBRARY}")
+    endif()
+
+    set(VITA_APP_NAME "DOOM 3 BFG Edition")
+    set(VITA_TITLEID  "DBFG00001") # = the trophy pack's communication ID (vita_trophies.cpp)
+    set(VITA_VERSION  "00.90")
+    # ATTRIBUTE2=12 requests the extended memory budget. DOOM 3 BFG needs every
+    # byte the console will hand out; see neo/sys/vita/vita_mem.cpp.
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
+
+    # vita-elf-create (Windows build) dies at ~284k relocations and this ELF
+    # had ~280k. Over 100k of them are PC-relative branches inside the text
+    # segment, which come out the same wherever the module loads: drop them
+    # right after the link (tools/vita/strip_branch_relocs.py - the loaded
+    # segments it produces were checked byte-for-byte identical).
+    find_program(VITA_PYTHON3 NAMES python3 python)
+    if(VITA_PYTHON3)
+        add_custom_command(TARGET Doom3BFG POST_BUILD
+            COMMAND ${VITA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/vita/strip_branch_relocs.py $<TARGET_FILE:Doom3BFG>
+            COMMENT "Dropping branch relocations vita-elf-create does not need"
+            VERBATIM)
+    else()
+        message(WARNING "python3 not found: branch relocations are not stripped and vita-elf-create may fail past ~284k relocations")
+    endif()
+
+    vita_create_self(eboot.bin Doom3BFG UNSAFE)
+
+    set(_vita_vpk_files)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/neo/sys/vita/sce_sys/icon0.png")
+        list(APPEND _vita_vpk_files
+            FILE neo/sys/vita/sce_sys/icon0.png sce_sys/icon0.png
+            FILE neo/sys/vita/sce_sys/pic0.png sce_sys/pic0.png
+            FILE neo/sys/vita/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+            FILE neo/sys/vita/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+            FILE neo/sys/vita/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+        )
+    endif()
+
+    # the trophy pack: the PS3 set, made from the user's disc by
+    # tools/vita/make_trophy_pack.py (see neo/sys/vita/vita_trophies.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/neo/sys/vita/sce_sys/trophy/DBFG00001_00/TROPHY.TRP")
+        list(APPEND _vita_vpk_files
+            FILE neo/sys/vita/sce_sys/trophy/DBFG00001_00/TROPHY.TRP sce_sys/trophy/DBFG00001_00/TROPHY.TRP
+        )
+    endif()
+
+    vita_create_vpk(Doom3BFG.vpk ${VITA_TITLEID} eboot.bin
+        VERSION ${VITA_VERSION}
+        NAME ${VITA_APP_NAME}
+        ${_vita_vpk_files}
+    )
 endif()

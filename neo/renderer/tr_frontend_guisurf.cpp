@@ -32,6 +32,113 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 #include "Model_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT: the world screen refresh counts in the perf log
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+==========================================================================================
+
+Vita: GUI drawing recorded and played back (a fidelity cut, approved for the
+benchmark's 33 ms goal)
+
+World screens - computer panels, monitors, the weapon's ammo counter - are
+redrawn every frame by stock BFG: their GUI runs and emits fresh quads (2.4 ms
+a frame in CPU Complex). A screen that is far from the view
+(vita_guiNearDistance) and not being looked at (its center more than
+vita_guiFocusAngle off the view axis, widened by its size) now redraws every
+other frame, at 15 Hz, and the frame in between plays back the quads its
+last redraw made (idGuiModel::VitaReplay - the same surfaces and vertices).
+Screens close by or looked at redraw every frame, as stock. Screens take
+turns (half on even frames, half on odd). The HUD uses the same recording
+at 15 Hz (PlayerView.cpp, vita_hudHalfRate). The PDA is a full screen menu
+of its own and is not touched.
+
+==========================================================================================
+*/
+idCVar vita_guiLOD("vita_guiLOD", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_ARCHIVE, "Vita: world screens far away and not looked at redraw at 15 Hz (the frame between plays back their last drawing)");
+idCVar vita_guiNearDistance("vita_guiNearDistance", "96", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: world screens closer than this redraw every frame");
+idCVar vita_guiFarDistance("vita_guiFarDistance", "320", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: world screens farther than this (and not looked at) redraw at 7.5 Hz instead of 15; 0 = never");
+idCVar vita_guiFocusAngle("vita_guiFocusAngle", "8", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: world screens within this many degrees of the view's center (plus their own size) redraw every frame");
+
+static const int VITA_GUI_SLOTS = 32;
+static vitaGuiCapture_t vitaGuiSlots[VITA_GUI_SLOTS];
+
+static vitaGuiCapture_t* Vita_GuiSlot(const void* key, bool create)
+{
+    for (int i = 0; i < VITA_GUI_SLOTS; i++) {
+        if (vitaGuiSlots[i].key == key) {
+            return &vitaGuiSlots[i];
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    // the one drawn longest ago
+    int oldest = 0;
+    for (int i = 1; i < VITA_GUI_SLOTS; i++) {
+        if (vitaGuiSlots[i].frame < vitaGuiSlots[oldest].frame) {
+            oldest = i;
+        }
+    }
+    vitaGuiCapture_t* slot = &vitaGuiSlots[oldest];
+    slot->key = key;
+    slot->valid = false;
+    slot->frame = -1;
+    return slot;
+}
+
+void idRenderSystemLocal::VitaGuiCaptureBegin(const void* key)
+{
+#if !defined(__vita__)
+    Vita_GuiSlot(key, true)->kind = 1; // only the HUD records through here
+#endif
+    guiModel->VitaBeginCapture(Vita_GuiSlot(key, true));
+}
+
+void idRenderSystemLocal::VitaGuiCaptureEnd()
+{
+    guiModel->VitaEndCapture();
+}
+
+bool idRenderSystemLocal::VitaGuiReplay(const void* key)
+{
+    const vitaGuiCapture_t* slot = Vita_GuiSlot(key, false);
+    if (slot == NULL || !slot->valid || slot->frame != frameCount - 1) {
+        return false;
+    }
+    guiModel->VitaReplay(slot);
+    return true;
+}
+
+// a world screen far from the view and not looked at: redrawn 1 frame in 2
+// (15 Hz), or 1 in 4 (7.5 Hz) beyond vita_guiFarDistance; 1 = every frame
+static int Vita_GuiRateDivisor(const drawSurf_t* drawSurf)
+{
+    extern bool vita_fullQuality;
+    if (!vita_guiLOD.GetBool() || vita_fullQuality || tr.viewDef == NULL || tr.viewDef->viewEntitys == NULL) {
+        return 1;
+    }
+    const idBounds& b = drawSurf->frontEndGeo->bounds;
+    const idVec3 localCenter = b.GetCenter();
+    idVec3 center;
+    R_LocalPointToGlobal(drawSurf->space->modelMatrix, localCenter, center);
+    idVec3 dir = center - tr.viewDef->renderView.vieworg;
+    const float dist = dir.Normalize();
+    if (dist < vita_guiNearDistance.GetFloat()) {
+        return 1;
+    }
+    const float radius = b.GetRadius(localCenter);
+    const float cosAngle = idMath::ClampFloat(-1.0f, 1.0f, dir * tr.viewDef->renderView.viewaxis[0]);
+    const float allowed = DEG2RAD(vita_guiFocusAngle.GetFloat()) + idMath::ATan(radius, dist);
+    if (idMath::ACos(cosAngle) < allowed) {
+        return 1; // looked at
+    }
+    if (vita_guiFarDistance.GetFloat() > 0.0f && dist > vita_guiFarDistance.GetFloat()) {
+        return 4;
+    }
+    return 2;
+}
+#endif
 
 /*
 ==========================================================================================
@@ -180,7 +287,44 @@ static void R_RenderGuiSurf(idUserInterface* gui, const drawSurf_t* drawSurf)
 
     // call the gui, which will call the 2D drawing functions
     tr.guiModel->Clear();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    const int vitaDivisor = Vita_GuiRateDivisor(drawSurf);
+    if (vitaDivisor > 1) {
+        vitaGuiCapture_t* slot = Vita_GuiSlot(gui, true);
+        // screens take turns (their redraw frame: frameCount + phase a
+        // multiple of the divisor); one is played back until its next turn,
+        // never longer than divisor - 1 frames
+        const int mask = vitaDivisor - 1;
+        const int phase = (int)(((uintptr_t)gui >> 4) & mask);
+        const int age = tr.frameCount - slot->frame;
+        const bool fresh = slot->valid && (age == 0 || (age > 0 && age < vitaDivisor && ((tr.frameCount + phase) & mask) != 0));
+        if (fresh) {
+            if (vitaDivisor == 4) {
+                VITA_ZONE_COUNT("world screens played back (7.5 Hz: beyond vita_guiFarDistance, not looked at)");
+            } else {
+                VITA_ZONE_COUNT("world screens played back (15 Hz: far, not looked at)");
+            }
+            tr.guiModel->VitaReplay(slot);
+        } else {
+            if (vitaDivisor == 4) {
+                VITA_ZONE_COUNT("world screens redrawn at 7.5 Hz (beyond vita_guiFarDistance, not looked at)");
+            } else {
+                VITA_ZONE_COUNT("world screens redrawn at 15 Hz (far, not looked at)");
+            }
+#if !defined(__vita__)
+            slot->kind = 0;
+#endif
+            tr.guiModel->VitaBeginCapture(slot);
+            gui->Redraw(tr.viewDef->renderView.time[0]);
+            tr.guiModel->VitaEndCapture();
+        }
+    } else {
+        VITA_ZONE_COUNT("world screens redrawn every frame (near or looked at)");
+        gui->Redraw(tr.viewDef->renderView.time[0]);
+    }
+#else
     gui->Redraw(tr.viewDef->renderView.time[0]);
+#endif
     tr.guiModel->EmitToCurrentView(modelMatrix, drawSurf->space->weaponDepthHack);
     tr.guiModel->Clear();
 

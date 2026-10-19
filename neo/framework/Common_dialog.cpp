@@ -279,7 +279,7 @@ idCommonDialog::AddDynamicDialog
 ========================
 */
 void idCommonDialog::AddDynamicDialog(gameDialogMessages_t msg, const idStaticList<idSWFScriptFunction*, 4>& callbacks,
-    const idStaticList<idStrId, 4>& optionText, bool pause, idStrStatic<256> overrideMsg,
+    const idStaticList<idStrId, 4>& optionText, bool pause, idStrStatic<1024> overrideMsg,
     bool leaveOnMapHeapReset, bool waitOnAtlas, bool renderDuringLoad)
 {
 
@@ -290,6 +290,22 @@ void idCommonDialog::AddDynamicDialog(gameDialogMessages_t msg, const idStaticLi
     idDialogInfo info;
     info.msg = msg;
     info.overrideMsg = overrideMsg;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // The dialog SWF draws nothing - text or buttons - for a message of six
+    // lines or more, yet the dialog is up and holds the input (a soft lock).
+    // Lines past the fifth are joined onto it.
+    {
+        int lines = 0;
+        for (int i = 0; i < info.overrideMsg.Length(); i++) {
+            if (info.overrideMsg[i] == '\n' && ++lines >= 5) {
+                info.overrideMsg[i] = ' ';
+            }
+        }
+        if (lines >= 5) {
+            idLib::Warning("dialog message had %d lines - joined to 5 (the dialog shows nothing past 5)", lines + 1);
+        }
+    }
+#endif
     info.type = DIALOG_DYNAMIC;
     info.pause = pause;
     info.leaveOnClear = leaveOnMapHeapReset;

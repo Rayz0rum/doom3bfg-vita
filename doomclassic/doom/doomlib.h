@@ -150,6 +150,7 @@ extern int					chosenEpisode;
 extern idMatchParameters	matchParms;
 
 const ExpansionData* 		GetCurrentExpansion();
+const ExpansionData* 		GetExpansion( int expansion );
 void						SetCurrentExpansion( int expansion );
 
 void						SetIdealExpansion( int expansion );

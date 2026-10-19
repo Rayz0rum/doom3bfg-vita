@@ -106,6 +106,8 @@ void I_StopSong( int handle );
 void I_UnRegisterSong( int handle );
 // Update Music (XMP), check for notifications
 void I_UpdateMusic( void );
+// the streamed music's figures for the verification (i_sound_openal.cpp; zeros elsewhere)
+void I_MusicStats( int* songs, int* underruns, int* chunks, double* synthMsPerSecond );
 
 int Mus2Midi( unsigned char* bytes, unsigned char* out, int* len );
 

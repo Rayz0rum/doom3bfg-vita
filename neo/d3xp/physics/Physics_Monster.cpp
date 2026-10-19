@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #include "../Game_local.h"
 
@@ -346,7 +347,7 @@ void idPhysics_Monster::Restore(idRestoreGame* savefile)
     savefile->ReadBool(useVelocityMove);
     savefile->ReadBool(noImpact);
 
-    savefile->ReadInt((int&)moveResult);
+    savefile->ReadEnum(moveResult);
     savefile->ReadObject(reinterpret_cast<idClass*&>(blockingEntity));
 }
 
@@ -470,6 +471,7 @@ idPhysics_Monster::Evaluate
 */
 bool idPhysics_Monster::Evaluate(int timeStepMSec, int endTimeMSec)
 {
+    VITA_ZONE("physics monster");
     idVec3 masterOrigin, oldOrigin;
     idMat3 masterAxis;
     float timeStep;

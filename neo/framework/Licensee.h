@@ -63,7 +63,12 @@ If you have questions concerning this license or the applicable additional terms
 
 // RB begin
 // Default base path (used only if none could be found)
-#ifdef __APPLE__
+#if defined(__vita__)
+// The VPK only carries eboot.bin, so app0: can never hold the ~10 GB of game
+// data. Both the data and the writable state live here, and vita_main.cpp
+// creates the directory before common->Init() runs.
+#define DEFAULT_BASEPATH "ux0:data/doom3bfg"
+#elif defined(__APPLE__)
 #define DEFAULT_BASEPATH "/Applications/RBDoom3BFG.app/Contents/Resources"
 #else
 #define DEFAULT_BASEPATH "/usr/share/games/doom3bfg"

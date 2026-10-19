@@ -43,9 +43,30 @@ If you have questions concerning this license or the applicable additional terms
 
 typedef int fixed_t;
 
+#if defined(__vita__)
+// Inline on the Vita: these run for every wall column and floor span, and
+// without LTO each use was a call into m_fixed.cpp. Same arithmetic (one
+// SMULL; FixedDiv2's VFP double divide stays out of line).
+fixed_t FixedDiv2( fixed_t a, fixed_t b );
+static inline fixed_t FixedMul( fixed_t a, fixed_t b )
+{
+	return fixed_t( ( ( long long ) a * ( long long ) b ) >> FRACBITS );
+}
+static inline fixed_t FixedDiv( fixed_t a, fixed_t b )
+{
+	const fixed_t aa = a < 0 ? -a : a;
+	const fixed_t ab = b < 0 ? -b : b;
+	if( ( aa >> 14 ) >= ab )
+	{
+		return ( a ^ b ) < 0 ? ( fixed_t )0x80000000 : ( fixed_t )0x7fffffff;
+	}
+	return FixedDiv2( a, b );
+}
+#else
 fixed_t FixedMul( fixed_t a, fixed_t b );
 fixed_t FixedDiv( fixed_t a, fixed_t b );
 fixed_t FixedDiv2( fixed_t a, fixed_t b );
+#endif
 
 
 

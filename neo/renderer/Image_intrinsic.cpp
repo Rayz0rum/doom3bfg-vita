@@ -85,6 +85,10 @@ void idImage::MakeDefault()
     defaulted = true;
 }
 
+#if defined(__vita__)
+#include "../sys/vita/vita_ui.h"
+#endif
+
 static void R_DefaultImage(idImage* image)
 {
     image->MakeDefault();
@@ -409,6 +413,11 @@ void idImageManager::CreateIntrinsicImages()
     accumImage = ImageFromFunction("_accum", R_RGBA8Image);
     currentRenderImage = ImageFromFunction("_currentRender", R_RGBA8Image);
     currentDepthImage = ImageFromFunction("_currentDepth", R_DepthImage);
+
+#if defined(__vita__)
+    // Vita button glyphs and controller picture for the menus
+    Vita_UI_CreateImages();
+#endif
 
     // save a copy of this for material comparison, because currentRenderImage may get
     // reassigned during stereo rendering

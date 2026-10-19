@@ -472,8 +472,21 @@ W_ReadLump
 
 	handle = l->handle;
 
+#if defined(__vita__)
+	// counted for the classic timing line (common_frame.cpp): a lump cache that
+	// keeps missing would show up here as reads every frame
+	const uint64 vitaReadStart = Sys_Microseconds();
+#endif
 	handle->Seek( l->position, FS_SEEK_SET );
 	c = handle->Read( dest, l->size );
+#if defined(__vita__)
+	extern int vitaClassicLumpReads;
+	extern int64 vitaClassicLumpBytes;
+	extern uint64 vitaClassicLumpUs;
+	vitaClassicLumpReads++;
+	vitaClassicLumpBytes += l->size;
+	vitaClassicLumpUs += Sys_Microseconds() - vitaReadStart;
+#endif
 
 	if( c < l->size )
 	{

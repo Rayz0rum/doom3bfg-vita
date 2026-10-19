@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #include "../Game_local.h"
 
@@ -1168,6 +1169,17 @@ idClip::Translation
 bool idClip::Translation(trace_t& results, const idVec3& start, const idVec3& end,
     const idClipModel* mdl, const idMat3& trmAxis, int contentMask, const idEntity* passEntity)
 {
+    return TranslationSkipping(results, start, end, mdl, trmAxis, contentMask, passEntity, NULL);
+}
+
+bool idClip::TranslationSkipping(trace_t& results, const idVec3& start, const idVec3& end,
+    const idClipModel* mdl, const idMat3& trmAxis, int contentMask, const idEntity* passEntity, const idEntity* skipEntity,
+    bool* skippedReachable)
+{
+    VITA_ZONE_COUNT("clip translations");
+    if (skippedReachable != NULL) {
+        *skippedReachable = true; // until shown otherwise
+    }
     int i, num;
     idClipModel *touch, *clipModelList[MAX_GENTITIES];
     idBounds traceBounds;
@@ -1184,7 +1196,13 @@ bool idClip::Translation(trace_t& results, const idVec3& start, const idVec3& en
     if (!passEntity || passEntity->entityNumber != ENTITYNUM_WORLD) {
         // test world
         idClip::numTranslations++;
-        collisionModelManager->Translation(&results, start, end, trm, trmAxis, contentMask, 0, vec3_origin, mat3_default);
+        if (trm != NULL) {
+            VITA_ZONE("clip translation: world (box)");
+            collisionModelManager->Translation(&results, start, end, trm, trmAxis, contentMask, 0, vec3_origin, mat3_default);
+        } else {
+            VITA_ZONE("clip translation: world (point)");
+            collisionModelManager->Translation(&results, start, end, trm, trmAxis, contentMask, 0, vec3_origin, mat3_default);
+        }
         results.c.entityNum = results.fraction != 1.0f ? ENTITYNUM_WORLD : ENTITYNUM_NONE;
         if (results.fraction == 0.0f) {
             return true; // blocked immediately by the world
@@ -1204,7 +1222,26 @@ bool idClip::Translation(trace_t& results, const idVec3& start, const idVec3& en
         radius = trm->bounds.GetRadius();
     }
 
-    num = GetTraceClipModels(traceBounds, contentMask, passEntity, clipModelList);
+    {
+        VITA_ZONE("clip translation: find entities");
+        num = GetTraceClipModels(traceBounds, contentMask, passEntity, clipModelList);
+    }
+    idClipModel* skipped[MAX_GENTITIES];
+    int numSkipped = 0;
+    if (skipEntity != NULL) {
+        for (i = 0; i < num; i++) {
+            idClipModel* cm = clipModelList[i];
+            if (cm == NULL) {
+                continue;
+            }
+            // as gameLocal.GetTraceEntity would name a contact with it
+            const idEntity* master = cm->entity->GetBindMaster();
+            if ((master != NULL) ? (master == skipEntity) : (cm->entity == skipEntity)) {
+                skipped[numSkipped++] = cm;
+                clipModelList[i] = NULL;
+            }
+        }
+    }
 
     for (i = 0; i < num; i++) {
         touch = clipModelList[i];
@@ -1214,9 +1251,11 @@ bool idClip::Translation(trace_t& results, const idVec3& start, const idVec3& en
         }
 
         if (touch->renderModelHandle != -1) {
+            VITA_ZONE("clip translation: render models");
             idClip::numRenderModelTraces++;
             TraceRenderModel(trace, start, end, radius, trmAxis, touch);
         } else {
+            VITA_ZONE("clip translation: entity models");
             idClip::numTranslations++;
             collisionModelManager->Translation(&trace, start, end, trm, trmAxis, contentMask,
                 touch->Handle(), touch->origin, touch->axis);
@@ -1232,6 +1271,18 @@ bool idClip::Translation(trace_t& results, const idVec3& start, const idVec3& en
         }
     }
 
+    if (skippedReachable != NULL) {
+        // a contact with a model lies within the moving model's radius of its
+        // bounds; none of the skipped ones within reach of the path up to just
+        // past the contact found means none of them comes first
+        const idVec3 reachEnd = start + (end - start) * Min(1.0f, results.fraction + 0.01f);
+        bool reachable = false;
+        for (i = 0; i < numSkipped && !reachable; i++) {
+            reachable = skipped[i]->absBounds.Expand(radius + 1.0f).LineIntersection(start, reachEnd);
+        }
+        *skippedReachable = reachable;
+    }
+
     return (results.fraction < 1.0f);
 }
 
@@ -1243,6 +1294,7 @@ idClip::Rotation
 bool idClip::Rotation(trace_t& results, const idVec3& start, const idRotation& rotation,
     const idClipModel* mdl, const idMat3& trmAxis, int contentMask, const idEntity* passEntity)
 {
+    VITA_ZONE("clip rotation (rigid bodies, movers)");
     int i, num;
     idClipModel *touch, *clipModelList[MAX_GENTITIES];
     idBounds traceBounds;
@@ -1311,6 +1363,7 @@ idClip::Motion
 bool idClip::Motion(trace_t& results, const idVec3& start, const idVec3& end, const idRotation& rotation,
     const idClipModel* mdl, const idMat3& trmAxis, int contentMask, const idEntity* passEntity)
 {
+    VITA_ZONE_COUNT("clip motions");
     int i, num;
     idClipModel *touch, *clipModelList[MAX_GENTITIES];
     idVec3 dir, endPosition;

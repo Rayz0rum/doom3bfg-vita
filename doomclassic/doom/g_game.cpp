@@ -248,6 +248,19 @@ fixed_t DegreesToDoomAngleTurn( float degrees )
 // or reads it from the demo buffer.
 // If recording a demo, write it out
 //
+#if defined(__vita__)
+// Turning, on the Vita: the DOOM 3 view yaw this tic builder has already
+// turned the player by. Stock code turned by the difference between the last
+// two DOOM 3 commands, which loses the turn whenever a frame writes two copies
+// of the same command (two 35 Hz tics in one frame) and repeats it whenever a
+// tic is built with no new command in between - jerky turning, a quick turn
+// that stopped short, and turning nobody asked for. Turning by what the view
+// moved since the last tic cannot do either. Reset at every level start.
+static bool vitaYawValid = false;
+static float vitaYawConsumed = 0.0f; // degrees
+static int vitaYawTicsLeft = 0;      // tics left in the current NetUpdate batch
+#endif
+
 void G_BuildTiccmd( ticcmd_t* cmd, idUserCmdMgr* userCmdMgr, int newTics )
 {
 	int		i;
@@ -344,8 +357,28 @@ void G_BuildTiccmd( ticcmd_t* cmd, idUserCmdMgr* userCmdMgr, int newTics )
 			angleDelta.yaw /= newTics;
 		}
 
+#if defined(__vita__)
+		{
+			const float viewYaw = SHORT2ANGLE( curTech5Command.angles[ 1 ] );
+			if( !vitaYawValid || numCommands == 0 )
+			{
+				vitaYawConsumed = viewYaw;
+				vitaYawValid = ( numCommands > 0 );
+			}
+			const float owed = idMath::AngleNormalize180( viewYaw - vitaYawConsumed );
+			if( vitaYawTicsLeft <= 0 )
+			{
+				vitaYawTicsLeft = ( newTics > 0 ) ? newTics : 1;
+			}
+			const float turn = owed / ( float )vitaYawTicsLeft;	// spread over the batch
+			vitaYawTicsLeft--;
+			vitaYawConsumed = idMath::AngleNormalize360( vitaYawConsumed + turn );
+			cmd->angleturn = DegreesToDoomAngleTurn( turn );
+		}
+#else
 		// idAngles is stored in degrees. Convert to doom format.
 		cmd->angleturn = DegreesToDoomAngleTurn( angleDelta.yaw );
+#endif
 
 
 		// Translate buttons
@@ -603,6 +636,10 @@ void G_BuildTiccmd( ticcmd_t* cmd, idUserCmdMgr* userCmdMgr, int newTics )
 
 void G_DoLoadLevel()
 {
+#if defined(__vita__)
+	vitaYawValid = false; // start turning from wherever the view is now
+	vitaYawTicsLeft = 0;
+#endif
 	int             i;
 
 	M_ClearRandom();

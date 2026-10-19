@@ -55,7 +55,12 @@ void Sys_ExecuteSavegameCommandAsyncImpl(idSaveLoadParms* savegameParms)
     session->GetSaveGameManager().GetSaveGameThread().data.saveLoadParms = savegameParms;
 
     if (session->GetSaveGameManager().GetSaveGameThread().GetThreadHandle() == 0) {
+#if defined(__vita__)
+        // nothing waits on it frame to frame: core 3 (Thread.cpp), off the game's cores
+        session->GetSaveGameManager().GetSaveGameThread().StartWorkerThread("Savegame", (core_t)6);
+#else
         session->GetSaveGameManager().GetSaveGameThread().StartWorkerThread("Savegame", CORE_ANY);
+#endif
     }
 
     session->GetSaveGameManager().GetSaveGameThread().SignalWork();

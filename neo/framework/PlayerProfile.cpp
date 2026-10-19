@@ -29,6 +29,9 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 #pragma hdrstop
 #include "PlayerProfile.h"
+#if defined(__vita__)
+#include "../sys/vita/vita_ui.h"
+#endif
 
 // After releasing a version to the market, here are limitations for compatibility:
 //	- the major version should not ever change
@@ -155,6 +158,31 @@ bool idPlayerProfile::Serialize(idSerializer& ser)
         cvarDict.Delete("r_vidMode");
         cvarDict.Delete("r_multisamples");
         cvarDict.Delete("com_engineHz");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // Vita: the port's own settings (vita_*) come from the config file and
+        // the tuning reset (Common.cpp), never from the profile - it loads
+        // after both and brought back whatever it was saved with: run 35
+        // played with vita_afMaxMoveTime 4 (a value from before the ragdoll
+        // cap was lowered) although the reset had set 0.9 twice
+        {
+            idStrList vitaKeys;
+            for (int i = 0; i < cvarDict.GetNumKeyVals(); i++) {
+                const idKeyValue* kv = cvarDict.GetKeyVal(i);
+                // (and the settings the Vita menus no longer show, held at
+                // fixed values: g_weaponShadows, r_skipShadows, sys_lang)
+                if (idStr::Icmpn(kv->GetKey().c_str(), "vita_", 5) == 0 || idStr::Icmp(kv->GetKey().c_str(), "g_weaponShadows") == 0
+                    || idStr::Icmp(kv->GetKey().c_str(), "r_skipShadows") == 0 || idStr::Icmp(kv->GetKey().c_str(), "sys_lang") == 0) {
+                    if (idStr::Cmp(kv->GetValue().c_str(), cvarSystem->GetCVarString(kv->GetKey().c_str())) != 0) {
+                        common->Printf("vita: profile: %s %s ignored (kept %s from the config / tuning)\n", kv->GetKey().c_str(), kv->GetValue().c_str(), cvarSystem->GetCVarString(kv->GetKey().c_str()));
+                    }
+                    vitaKeys.Append(kv->GetKey());
+                }
+            }
+            for (int i = 0; i < vitaKeys.Num(); i++) {
+                cvarDict.Delete(vitaKeys[i].c_str());
+            }
+        }
+#endif
         cvarSystem->SetCVarsFromDict(cvarDict);
         common->StartupVariable(NULL);
     }
@@ -190,6 +218,12 @@ bool idPlayerProfile::Serialize(idSerializer& ser)
                 ser.SerializeString(bind);
                 idKeyInput::SetBinding(i, bind.c_str());
             }
+#if defined(__vita__)
+            // a saved profile carries the pad binds of whatever scheme saved
+            // it (the stock 360 one, before this port had its own); the Vita
+            // scheme is defined in code, so put it back on top
+            Vita_ApplyControlScheme();
+#endif
         }
     } else {
 
@@ -398,16 +432,26 @@ void idPlayerProfile::ExecConfig(bool save, bool forceDefault)
 
     if (!customConfig || forceDefault) {
         cmdSystem->AppendCommandText("exec default.cfg\n");
+#if !defined(__vita__)
         cmdSystem->AppendCommandText("exec joy_360_0.cfg\n");
+#endif
     }
 
+#if !defined(__vita__)
     if (leftyFlip) {
         cmdSystem->AppendCommandText("exec joy_lefty.cfg");
     } else {
         cmdSystem->AppendCommandText("exec joy_righty.cfg");
     }
+#endif
 
     cmdSystem->ExecuteCommandBuffer();
+
+#if defined(__vita__)
+    // The stock code ran joy_360_0.cfg and the lefty/righty stick config here.
+    // On the Vita the pad has one fixed scheme, bound in code.
+    Vita_ApplyControlScheme();
+#endif
 
     if (!save) {
         cvarSystem->ClearModifiedFlags(CVAR_ARCHIVE);

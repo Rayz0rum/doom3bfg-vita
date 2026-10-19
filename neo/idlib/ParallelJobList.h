@@ -28,6 +28,30 @@ If you have questions concerning this license or the applicable additional terms
 #ifndef __PARALLELJOBLIST_H__
 #define __PARALLELJOBLIST_H__
 
+// a job that took 3 ms or more (ParallelJobList.cpp), for the benchmark log
+struct vitaBenchSlowJob_t {
+    const char* name;
+    const char* list;
+    int us;
+    int thread;
+    uint64 endUs;
+};
+#define VITA_BENCH_SLOW_JOBS 128
+
+// every job by type (ParallelJobList.cpp), for the benchmark log: how many,
+// the CPU time they took on all threads, and the part the game/draw thread
+// ran itself while it waited for its job lists
+struct vitaBenchJobType_t {
+    const void* function;
+    const char* name;
+    volatile int count;
+    volatile uint64 us;
+    volatile int gdCount;
+    volatile uint64 gdUs;
+    volatile int maxUs;
+};
+#define VITA_BENCH_JOB_TYPES 48
+
 struct CellSpursJob128;
 class idColor;
 

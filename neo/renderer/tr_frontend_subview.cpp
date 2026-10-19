@@ -457,10 +457,17 @@ bool R_GenerateSurfaceSubview(const drawSurf_t* drawSurf)
     assert(tr.viewDef != NULL);
     idScreenRect* v = &tr.viewDef->viewport;
     idScreenRect scissor;
-    scissor.x1 = v->x1 + idMath::Ftoi((v->x2 - v->x1 + 1) * 0.5f * (ndcBounds[0][0] + 1.0f));
-    scissor.y1 = v->y1 + idMath::Ftoi((v->y2 - v->y1 + 1) * 0.5f * (ndcBounds[0][1] + 1.0f));
-    scissor.x2 = v->x1 + idMath::Ftoi((v->x2 - v->x1 + 1) * 0.5f * (ndcBounds[1][0] + 1.0f));
-    scissor.y2 = v->y1 + idMath::Ftoi((v->y2 - v->y1 + 1) * 0.5f * (ndcBounds[1][1] + 1.0f));
+    // (relative to the viewport, like viewDef->scissor and every scissor the
+    // back end offsets by viewport.x1/y1. Stock code added the viewport's
+    // origin here, harmless while it is 0 - but the Vita's 3D view is cropped
+    // into the top of the screen (viewport y1 = 544 - 408 = 136), so a
+    // mirror's scissor was shifted 136 rows up and then clipped by the view's
+    // own: a black band over the mirror that moved as it filled more or less
+    // of the screen)
+    scissor.x1 = idMath::Ftoi((v->x2 - v->x1 + 1) * 0.5f * (ndcBounds[0][0] + 1.0f));
+    scissor.y1 = idMath::Ftoi((v->y2 - v->y1 + 1) * 0.5f * (ndcBounds[0][1] + 1.0f));
+    scissor.x2 = idMath::Ftoi((v->x2 - v->x1 + 1) * 0.5f * (ndcBounds[1][0] + 1.0f));
+    scissor.y2 = idMath::Ftoi((v->y2 - v->y1 + 1) * 0.5f * (ndcBounds[1][1] + 1.0f));
 
     // nudge a bit for safety
     scissor.Expand();
@@ -471,6 +478,18 @@ bool R_GenerateSurfaceSubview(const drawSurf_t* drawSurf)
         // cropped out
         return false;
     }
+#if defined(__vita__)
+    {
+        static int lastLogMs = 0;
+        const int nowMs = Sys_Milliseconds();
+        if (nowMs - lastLogMs > 2000) {
+            lastLogMs = nowMs;
+            common->Printf("vita: subview '%s': scissor %d,%d-%d,%d of the %dx%d view (viewport origin %d,%d)\n",
+                drawSurf->material->GetName(), scissor.x1, scissor.y1, scissor.x2, scissor.y2,
+                v->x2 - v->x1 + 1, v->y2 - v->y1 + 1, v->x1, v->y1);
+        }
+    }
+#endif
 
     // see what kind of subview we are making
     if (shader->GetSort() != SS_SUBVIEW) {

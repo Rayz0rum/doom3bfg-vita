@@ -243,6 +243,9 @@ protected:
     jointHandle_t soundJoint;
 
     idIK_Walk walkIK;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    bool vitaWalkIKOff; // beyond vita_ikDistance: the walk IK's joint mods cleared, not evaluated (Actor.cpp)
+#endif
 
     idStr animPrefix;
     idStr painAnim;

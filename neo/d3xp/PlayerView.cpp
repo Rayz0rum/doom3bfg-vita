@@ -30,6 +30,10 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "Game_local.h"
+#include "../sys/vita/vita_zones.h" // GD_SCOPE: the game/draw thread's tree of passes (VitaBench.cpp)
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_hudHalfRate("vita_hudHalfRate", "1", CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "Vita: the HUD redraws every other frame (15 Hz); the frame between plays back its last drawing");
+#endif
 
 // _D3XP : rename all gameLocal.time to gameLocal.slow.time for merge!
 
@@ -418,6 +422,7 @@ void idPlayerView::SingleView(const renderView_t* view, idMenuHandler_HUD* hudMa
     // if the objective system is up, don't do normal drawing
     if (player->objectiveSystemOpen) {
         if (player->pdaMenu != NULL) {
+            GD_SCOPE("PDA");
             player->pdaMenu->Update();
         }
         return;
@@ -437,7 +442,10 @@ void idPlayerView::SingleView(const renderView_t* view, idMenuHandler_HUD* hudMa
     }
 
     // process the frame
-    fxManager->Process(&hackedView);
+    {
+        GD_SCOPE("3D view + screen effects (fxManager->Process)");
+        fxManager->Process(&hackedView);
+    }
 
     if (!hudManager) {
         return;
@@ -464,7 +472,29 @@ void idPlayerView::SingleView(const renderView_t* view, idMenuHandler_HUD* hudMa
                 }
             }
         }
-        player->DrawHUD(hudManager);
+        {
+            GD_SCOPE("HUD (player->DrawHUD)");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            // Vita (a fidelity cut): the HUD - its stats, cursor and the
+            // weapon screen's state included - redraws every other frame; the
+            // frame between plays its last drawing back (idGuiModel::VitaReplay)
+            static int vitaHudKey;
+            extern bool vita_fullQuality;
+            if (vita_hudHalfRate.GetBool() && !vita_fullQuality) {
+                if ((renderSystem->GetFrameCount() & 1) && player->VitaHudShown() && renderSystem->VitaGuiReplay(&vitaHudKey)) {
+                    VITA_ZONE_COUNT("HUD played back (15 Hz)");
+                } else {
+                    renderSystem->VitaGuiCaptureBegin(&vitaHudKey);
+                    player->DrawHUD(hudManager);
+                    renderSystem->VitaGuiCaptureEnd();
+                }
+            } else {
+                player->DrawHUD(hudManager);
+            }
+#else
+            player->DrawHUD(hudManager);
+#endif
+        }
 
         if (player->spectating) {
             return;

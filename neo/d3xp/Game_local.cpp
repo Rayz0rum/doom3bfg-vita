@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "Game_local.h"
+#include "../sys/vita/vita_zones.h" // GD_SCOPE / GD_PASS: the game/draw thread's tree of passes (VitaBench.cpp)
 
 #ifdef GAME_DLL
 
@@ -442,6 +443,10 @@ void idGameLocal::Shutdown()
 #endif
 }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_cinematicFullQuality("vita_cinematicFullQuality", "1", CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "Vita: no fidelity cuts at all while a cinematic plays (vita_fullQuality)");
+#endif
+extern bool vita_fullQuality;
 idCVar g_recordSaveGameTrace("g_recordSaveGameTrace", "0", CVAR_BOOL, "");
 
 /*
@@ -1367,7 +1372,7 @@ bool idGameLocal::InitFromSaveGame(const char* mapName, idRenderWorld* renderWor
 
     savegame.ReadBool(inCinematic);
 
-    savegame.ReadInt((int&)gameType);
+    savegame.ReadEnum(gameType);
 
     savegame.ReadInt(framenum);
     savegame.ReadInt(previousTime);
@@ -1433,9 +1438,9 @@ bool idGameLocal::InitFromSaveGame(const char* mapName, idRenderWorld* renderWor
     savegame.ReadDict(&spawnArgs);
 
     savegame.ReadInt(playerPVS.i);
-    savegame.ReadInt((int&)playerPVS.h);
+    savegame.ReadEnum(playerPVS.h);
     savegame.ReadInt(playerConnectedAreas.i);
-    savegame.ReadInt((int&)playerConnectedAreas.h);
+    savegame.ReadEnum(playerConnectedAreas.h);
 
     savegame.ReadVec3(gravity);
 
@@ -1522,6 +1527,10 @@ idGameLocal::MapShutdown
 void idGameLocal::MapShutdown()
 {
     Printf("--------- Game Map Shutdown ----------\n");
+
+    // the bots' navigation graph is saved for the next game on this map (VitaBots.cpp)
+    extern void VitaBot_MapShutdown();
+    VitaBot_MapShutdown();
 
     gamestate = GAMESTATE_SHUTDOWN;
 
@@ -2279,8 +2288,84 @@ void idGameLocal::RunTimeGroup2(idUserCmdMgr& userCmdMgr)
 idGameLocal::RunEntityThink
 ================
 */
+#if defined(__vita__)
+/*
+================
+Per-class think time, for the perf log
+
+Every entity think, timed and summed by class (the game thread alone runs
+them), plus the event / script time; common_frame.cpp prints the top classes
+once per perf window (Vita_GameThinkReport).
+================
+*/
+struct vitaClassTime_t {
+    const idTypeInfo* type;
+    int us;
+    int thinks;
+};
+static vitaClassTime_t vitaClassTimes[64];
+static int vitaNumClassTimes = 0;
+static int vitaEventsUs = 0;
+
+static void Vita_NoteThink(const idTypeInfo* type, int us)
+{
+    for (int i = 0; i < vitaNumClassTimes; i++) {
+        if (vitaClassTimes[i].type == type) {
+            vitaClassTimes[i].us += us;
+            vitaClassTimes[i].thinks++;
+            return;
+        }
+    }
+    if (vitaNumClassTimes < 64) {
+        vitaClassTimes[vitaNumClassTimes].type = type;
+        vitaClassTimes[vitaNumClassTimes].us = us;
+        vitaClassTimes[vitaNumClassTimes].thinks = 1;
+        vitaNumClassTimes++;
+    }
+}
+
+void Vita_GameThinkReport(double frames)
+{
+    if (frames <= 0.0) {
+        return;
+    }
+    char line[768];
+    int len = idStr::snPrintf(line, sizeof(line), "vita game thinks [ms / thinks per frame]: events+scripts %.1f |", vitaEventsUs / 1000.0 / frames);
+    for (int shown = 0; shown < 8; shown++) {
+        int best = -1;
+        for (int i = 0; i < vitaNumClassTimes; i++) {
+            if (vitaClassTimes[i].us > 0 && (best < 0 || vitaClassTimes[i].us > vitaClassTimes[best].us)) {
+                best = i;
+            }
+        }
+        if (best < 0 || vitaClassTimes[best].us < 50) {
+            break;
+        }
+        if (len < (int)sizeof(line) - 64) {
+            len += idStr::snPrintf(line + len, sizeof(line) - len, " %s %.1f/%.1f", vitaClassTimes[best].type->classname,
+                vitaClassTimes[best].us / 1000.0 / frames, vitaClassTimes[best].thinks / frames);
+        }
+        vitaClassTimes[best].us = -vitaClassTimes[best].us; // shown (the table is cleared below)
+    }
+    common->Printf("%s" "\n", line);
+    vitaNumClassTimes = 0;
+    vitaEventsUs = 0;
+}
+#endif
+
 void idGameLocal::RunEntityThink(idEntity& ent, idUserCmdMgr& userCmdMgr)
 {
+    // one node per class in the game/draw thread's tree (everything the
+    // entity's think does nests below it)
+#if defined(__vita__)
+    // the per-class think time and the class's node share one clock read at
+    // each end (a read is a system call: ~0.7 us, and there are 150 to 250
+    // thinks a frame in a fight)
+    const uint64 vitaThinkStart = Sys_Microseconds();
+    const int vitaGD = VitaGD_PushAt(ent.GetType()->classname, vitaThinkStart);
+#else
+    GD_SCOPE(ent.GetType()->classname);
+#endif
     if (ent.entityNumber < MAX_PLAYERS) {
         // Players may run more than one think per frame in MP,
         // if there is a large buffer of usercmds from the network.
@@ -2290,6 +2375,11 @@ void idGameLocal::RunEntityThink(idEntity& ent, idUserCmdMgr& userCmdMgr)
         // Non-player entities always run one think.
         ent.Think();
     }
+#if defined(__vita__)
+    const uint64 vitaThinkEnd = Sys_Microseconds();
+    VitaGD_PopAt(vitaGD, vitaThinkEnd);
+    Vita_NoteThink(ent.GetType(), (int)(vitaThinkEnd - vitaThinkStart));
+#endif
 }
 
 idCVar g_recordTrace("g_recordTrace", "0", CVAR_BOOL, "");
@@ -2309,6 +2399,17 @@ void idGameLocal::RunFrame(idUserCmdMgr& cmdMgr, gameReturn_t& ret)
     idPlayer* player;
     const renderView_t* view;
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    {
+        const bool want = vita_cinematicFullQuality.GetBool() && inCinematic;
+        if (want != vita_fullQuality) {
+            common->Printf("vita: full quality %s (%s) at game time %d ms - every fidelity cut %s\n", want ? "ON" : "off",
+                inCinematic ? "cinematic playing" : "cinematic over", time, want ? "suspended" : "back");
+            vita_fullQuality = want;
+        }
+    }
+#endif
+
     if (g_recordTrace.GetBool()) {
         bool result = BeginTraceRecording("e:\\gametrace.pix2");
         if (!result) {
@@ -2326,6 +2427,7 @@ void idGameLocal::RunFrame(idUserCmdMgr& cmdMgr, gameReturn_t& ret)
         return;
     }
 
+    GD_PASS_BEGIN("tic setup (time, render view, smoke, gravity, PVS, sort)");
     SyncPlayersWithLobbyUsers(false);
     ServerSendNetworkSyncCvars();
 
@@ -2401,6 +2503,7 @@ void idGameLocal::RunFrame(idUserCmdMgr& cmdMgr, gameReturn_t& ret)
         timer_think.Start();
 
         // let entities think
+        GD_PASS("entity thinks");
         if (g_timeentities.GetFloat()) {
             num = 0;
             for (ent = activeEntities.Next(); ent != NULL; ent = ent->activeNode.Next()) {
@@ -2453,6 +2556,7 @@ void idGameLocal::RunFrame(idUserCmdMgr& cmdMgr, gameReturn_t& ret)
         //}
 
         // remove any entities that have stopped thinking
+        GD_PASS("deactivate entities, events (idEvent::ServiceEvents)");
         if (numEntitiesToDeactivate) {
             idEntity* next_ent;
             int c = 0;
@@ -2480,13 +2584,20 @@ void idGameLocal::RunFrame(idUserCmdMgr& cmdMgr, gameReturn_t& ret)
         SelectTimeGroup(false);
 
         timer_events.Stop();
+#if defined(__vita__)
+        vitaEventsUs += (int)(timer_events.Milliseconds() * 1000.0);
+#endif
 
         // free the player pvs
+        GD_PASS("free PVS, multiplayer, return value");
         FreePlayerPVS();
 
         // do multiplayer related stuff
         if (common->IsMultiplayer()) {
             mpGame.Run();
+            // the bots' navigation graph and bot count (VitaBots.cpp, host only)
+            extern void VitaBot_HostFrame();
+            VitaBot_HostFrame();
         }
 
         // display how long it took to calculate the current game frame
@@ -2500,8 +2611,10 @@ void idGameLocal::RunFrame(idUserCmdMgr& cmdMgr, gameReturn_t& ret)
     }
 
     // show any debug info for this frame
+    GD_PASS("debug info");
     RunDebugInfo();
     D_DrawDebugLines();
+    GD_PASS_END();
 
     if (g_recordTrace.GetBool()) {
         EndTraceRecording();
@@ -2543,8 +2656,206 @@ Runs a Think or a ClientThink for a player. Will write the client's
 position and firecount to the usercmd.
 ====================
 */
+
+#if defined(ID_VITA_PHYSCHECK) && !defined(__vita__)
+/*
+================================================================================
+
+PC test driver for the tick-rate checks (VitaPhysCheck.h): the same scripted
+input on game-time steps, so a run at com_engineHz 60 and one at 30 can be
+compared line by line. "vitaTestRun" starts it (it waits for the map); at the
+end it prints vitaPhysReport and quits.
+
+================================================================================
+*/
+struct vitaTestStep_t {
+    int ms;            // how long the step lasts, game time
+    int forward, right;
+    int buttons;
+    int impulse;       // -1 none
+    const char* cmd;   // console text to run when the step starts, or NULL
+};
+
+static const vitaTestStep_t vitaTestSteps[] = {
+    { 6000, 0, 0, 0, -1, "god; notarget; give all; vitaPhysReport" },
+    { 2500, 127, 0, 0, -1, NULL },                   // walk forward
+    { 800, 0, 0, 0, -1, NULL },
+    { 2500, -127, 0, 0, -1, NULL },                  // walk back
+    { 800, 0, 0, 0, -1, NULL },
+    { 2500, 127, 0, BUTTON_RUN, -1, NULL },          // run forward
+    { 800, 0, 0, 0, -1, NULL },
+    { 2500, -127, 0, BUTTON_RUN, -1, NULL },         // run back
+    { 800, 0, 0, 0, -1, NULL },
+    { 2500, 127, 0, BUTTON_CROUCH, -1, NULL },       // crouch forward
+    { 800, 0, 0, BUTTON_CROUCH, -1, NULL },
+    { 2500, -127, 0, BUTTON_CROUCH, -1, NULL },      // crouch back
+    { 1000, 0, 0, 0, -1, NULL },
+    { 150, 0, 0, BUTTON_JUMP, -1, NULL }, { 1500, 0, 0, 0, -1, NULL },
+    { 150, 0, 0, BUTTON_JUMP, -1, NULL }, { 1500, 0, 0, 0, -1, NULL },
+    { 150, 0, 0, BUTTON_JUMP, -1, NULL }, { 1500, 0, 0, 0, -1, NULL },
+    { 150, 0, 0, BUTTON_JUMP, -1, NULL }, { 1500, 0, 0, 0, -1, NULL },
+    { 150, 0, 0, BUTTON_JUMP, -1, NULL }, { 2500, 0, 0, 0, -1, "vitaPhysReport" },
+    // weapons: select, raise, hold fire 3 s
+    { 1800, 0, 0, 0, 2, NULL }, { 3000, 0, 0, BUTTON_ATTACK, -1, NULL }, { 800, 0, 0, 0, -1, NULL },    // pistol
+    { 1800, 0, 0, 0, 3, NULL }, { 4000, 0, 0, BUTTON_ATTACK, -1, NULL }, { 800, 0, 0, 0, -1, NULL },    // shotgun
+    { 1800, 0, 0, 0, 5, NULL }, { 3000, 0, 0, BUTTON_ATTACK, -1, NULL }, { 800, 0, 0, 0, -1, NULL },    // machinegun
+    { 1800, 0, 0, 0, 6, NULL }, { 4000, 0, 0, BUTTON_ATTACK, -1, NULL }, { 800, 0, 0, 0, -1, NULL },    // chaingun
+    { 1800, 0, 0, 0, 8, NULL }, { 3000, 0, 0, BUTTON_ATTACK, -1, NULL }, { 800, 0, 0, 0, -1, NULL },    // plasma gun
+    { 1800, 0, 0, 0, 9, NULL }, { 4000, 0, 0, BUTTON_ATTACK, -1, NULL }, { 800, 0, 0, 0, -1, "vitaPhysReport" }, // rockets
+    // ragdolls: three zombies down the corridor a round, killed by shotgun
+    // damage (rounds 1 and 2) or a rocket and then the shotgun damage (3, 4)
+    { 1500, 0, 0, 0, -1, "@spawn 1" }, { 1500, 0, 0, 0, -1, "@kill 1" }, { 9000, 0, 0, 0, -1, NULL },
+    { 500, 0, 0, 0, -1, "vitaPhysReport" }, { 500, 0, 0, 0, -1, "@remove 1" },
+    { 1500, 0, 0, 0, -1, "@spawn 2" }, { 1500, 0, 0, 0, -1, "@kill 2" }, { 9000, 0, 0, 0, -1, NULL },
+    { 500, 0, 0, 0, -1, "vitaPhysReport" }, { 500, 0, 0, 0, -1, "@remove 2" },
+    { 1800, 0, 0, 0, 9, "@spawn 3" }, { 300, 0, 0, BUTTON_ATTACK, -1, NULL }, { 1500, 0, 0, 0, -1, NULL },
+    { 1500, 0, 0, 0, -1, "@kill 3" }, { 9000, 0, 0, 0, -1, NULL },
+    { 500, 0, 0, 0, -1, "vitaPhysReport" }, { 500, 0, 0, 0, -1, "@remove 3" },
+    { 1800, 0, 0, 0, 9, "@spawn 4" }, { 300, 0, 0, BUTTON_ATTACK, -1, NULL }, { 1500, 0, 0, 0, -1, NULL },
+    { 1500, 0, 0, 0, -1, "@kill 4" }, { 9000, 0, 0, 0, -1, NULL },
+    { 500, 0, 0, 0, -1, "vitaPhysReport" }, { 500, 0, 0, 0, -1, "@remove 4" },
+    // objects
+    { 7000, 0, 0, 0, -1, "@objects" },
+    { 7000, 0, 0, 0, -1, NULL },
+    { 500, 0, 0, 0, -1, "vitaPhysReport" },
+    { 500, 0, 0, 0, -1, "quit" },
+};
+
+static volatile int vitaTestState = -2; // -2 off, -1 armed, >= 0 step
+static int vitaTestStepStart = 0;
+static byte vitaTestImpulseSeq = 0;
+static idVec3 vitaTestOrigin;
+static float vitaTestYaw;
+
+// "@spawn N", "@kill N", "@remove N": round N's three zombies, placed from
+// where the test started, down the way the player faced
+static void Vita_TestRagdolls(const char* text)
+{
+    static const char* classes[] = { "monster_zombie_fat", "monster_zombie_labcoat_skinny" }; // in mars_city2's resources
+    char what[16] = "";
+    int round = 0;
+    if (sscanf(text, "@%15s %d", what, &round) != 2) {
+        return;
+    }
+    idPlayer* player = gameLocal.GetLocalPlayer();
+    idVec3 forward, right;
+    idAngles(0.0f, vitaTestYaw, 0.0f).ToVectors(&forward, &right, NULL);
+    for (int i = 0; i < 3; i++) {
+        const idStr name = va("vitatest_%d_%d", round, i);
+        idEntity* ent = gameLocal.FindEntity(name.c_str());
+        if (!idStr::Cmp(what, "spawn")) {
+            const float side = ((i & 1) ? 30.0f : -30.0f) * ((round & 1) ? 1.0f : -1.0f);
+            const idVec3 start = vitaTestOrigin + idVec3(0.0f, 0.0f, 1.0f);
+            const idVec3 want = start + forward * (150.0f + 80.0f * i) + right * side;
+            trace_t tr;
+            gameLocal.clip.TraceBounds(tr, start, want, idBounds(idVec3(-20.0f, -20.0f, 0.0f), idVec3(20.0f, 20.0f, 72.0f)), MASK_MONSTERSOLID, player);
+            const idVec3 at = tr.endpos - forward * (tr.fraction < 1.0f ? 8.0f : 0.0f);
+            const char* cls = classes[(round + i) % 2];
+            cmdSystem->BufferCommandText(CMD_EXEC_APPEND, va("spawn %s name %s origin \"%.1f %.1f %.1f\" angle %.1f\n", cls, name.c_str(), at.x, at.y, at.z, vitaTestYaw + 180.0f));
+            gameLocal.Printf("vitatest: %s (%s) %.0f units ahead\n", name.c_str(), cls, (at - start).Length());
+        } else if (!idStr::Cmp(what, "kill")) {
+            if (ent != NULL && ent->IsType(idActor::Type) && ent->health > 0) {
+                ent->Damage(player, player, forward, "damage_shotgun", 20.0f, INVALID_JOINT);
+                gameLocal.Printf("vitatest: %s killed (health %d)\n", name.c_str(), ent->health);
+            } else {
+                gameLocal.Printf("vitatest: %s %s\n", name.c_str(), ent == NULL ? "missing" : "already dead");
+            }
+        } else if (!idStr::Cmp(what, "remove")) {
+            if (ent != NULL) {
+                const idVec3& o = ent->GetPhysics()->GetOrigin();
+                gameLocal.Printf("vitatest: %s before removal: %s, %s, ragdoll %s, hidden %d, at (%.0f %.0f %.0f)\n", name.c_str(),
+                    ent->GetPhysics()->GetType()->classname, ent->GetPhysics()->IsAtRest() ? "at rest" : "MOVING",
+                    ent->IsType(idAFEntity_Base::Type) ? (static_cast<idAFEntity_Base*>(ent)->IsActiveAF() ? "active" : "not active") : "-",
+                    ent->IsHidden() ? 1 : 0, o.x, o.y, o.z);
+                ent->PostEventMS(&EV_Remove, 0);
+            } else {
+                gameLocal.Printf("vitatest: %s is gone before removal\n", name.c_str());
+            }
+        }
+    }
+}
+
+// "@objects": things that are in mars_city2, dropped from 40 units in front
+static void Vita_TestObjects()
+{
+    static const char* classes[] = { "moveable_trashcan01", "moveable_kitchenchair", "moveable_cokecan", "moveable_fireext" };
+    idVec3 forward, right;
+    idAngles(0.0f, vitaTestYaw, 0.0f).ToVectors(&forward, &right, NULL);
+    for (int i = 0; i < 4; i++) {
+        const idVec3 at = vitaTestOrigin + forward * 48.0f + right * (-36.0f + 24.0f * i) + idVec3(0.0f, 0.0f, 40.0f);
+        cmdSystem->BufferCommandText(CMD_EXEC_APPEND, va("spawn %s name vitatest_obj_%d origin \"%.1f %.1f %.1f\"\n", classes[i], i, at.x, at.y, at.z));
+    }
+}
+
+static void Vita_TestCommand(const char* text)
+{
+    if (!idStr::Cmp(text, "@objects")) {
+        Vita_TestObjects();
+    } else if (text[0] == '@') {
+        Vita_TestRagdolls(text);
+    } else {
+        cmdSystem->BufferCommandText(CMD_EXEC_APPEND, va("%s\n", text));
+    }
+}
+
+CONSOLE_COMMAND(vitaTestRun, "run the scripted tick-rate test (VitaPhysCheck.h) once the map is running", 0)
+{
+    vitaTestState = -1;
+}
+
+static void Vita_TestDriver(usercmd_t& cmd)
+{
+    if (vitaTestState == -2) {
+        return;
+    }
+    const int now = gameLocal.time;
+    if (vitaTestState == -1) {
+        vitaTestState = 0;
+        vitaTestStepStart = now;
+        vitaTestImpulseSeq = cmd.impulseSequence;
+        if (gameLocal.GetLocalPlayer() != NULL) {
+            vitaTestOrigin = gameLocal.GetLocalPlayer()->GetPhysics()->GetOrigin();
+            vitaTestYaw = gameLocal.GetLocalPlayer()->viewAngles.yaw;
+        }
+        gameLocal.Printf("vitatest: started at %.0f Hz\n", com_engineHz_latched);
+        if (vitaTestSteps[0].cmd) {
+            Vita_TestCommand(vitaTestSteps[0].cmd);
+        }
+    }
+    const int numSteps = sizeof(vitaTestSteps) / sizeof(vitaTestSteps[0]);
+    while (vitaTestState < numSteps && now - vitaTestStepStart >= vitaTestSteps[vitaTestState].ms) {
+        vitaTestStepStart += vitaTestSteps[vitaTestState].ms;
+        vitaTestState++;
+        if (vitaTestState < numSteps) {
+            const vitaTestStep_t& s = vitaTestSteps[vitaTestState];
+            if (s.cmd) {
+                Vita_TestCommand(s.cmd);
+            }
+            if (s.impulse >= 0) {
+                vitaTestImpulseSeq++;
+            }
+        }
+    }
+    if (vitaTestState >= numSteps) {
+        vitaTestState = -2;
+        return;
+    }
+    const vitaTestStep_t& s = vitaTestSteps[vitaTestState];
+    cmd.forwardmove = (signed char)s.forward;
+    cmd.rightmove = (signed char)s.right;
+    cmd.buttons = s.buttons;
+    if (s.impulse >= 0) {
+        cmd.impulse = (byte)s.impulse;
+    }
+    cmd.impulseSequence = vitaTestImpulseSeq;
+}
+#endif
+
 void idGameLocal::RunSingleUserCmd(usercmd_t& cmd, idPlayer& player)
 {
+#if defined(ID_VITA_PHYSCHECK) && !defined(__vita__)
+    Vita_TestDriver(cmd);
+#endif
     player.HandleUserCmds(cmd);
 
     // To fix the stupid chaingun script that depends on frame counts instead of
@@ -2600,6 +2911,17 @@ void idGameLocal::RunAllUserCmdsForPlayer(idUserCmdMgr& cmdMgr, const int player
     }
 
     idPlayer& player = static_cast<idPlayer&>(*entities[playerNumber]);
+
+    // a bot (VitaBots.cpp): its brain's command, made here on the host
+    extern bool VitaBot_IsBot(int clientNum);
+    extern void VitaBot_Think(idPlayer * self, usercmd_t & cmd);
+    if (VitaBot_IsBot(playerNumber)) {
+        usercmd_t botCmd;
+        VitaBot_Think(&player, botCmd);
+        RunSingleUserCmd(botCmd, player);
+        lastCmdRunTimeOnServer[playerNumber] = gameLocal.serverTime;
+        return;
+    }
 
     // Only run a single userCmd each game frame for local players, otherwise when
     // we are running < 60fps things like footstep sounds may get started right on top
@@ -3357,7 +3679,11 @@ bool idGameLocal::SpawnEntityDef(const idDict& args, idEntity** ent, bool setDef
 
     spawnArgs.GetString("classname", NULL, &classname);
 
-    const idDeclEntityDef* def = FindEntityDef(classname, false);
+    const idDeclEntityDef* def;
+    {
+        VITA_ZONE("spawn: find entity def");
+        def = FindEntityDef(classname, false);
+    }
 
     if (!def) {
         Warning("Unknown classname '%s'%s.", classname, error.c_str());
@@ -3391,6 +3717,7 @@ bool idGameLocal::SpawnEntityDef(const idDict& args, idEntity** ent, bool setDef
             return false;
         }
 
+        VITA_ZONE("spawn: create + Spawn()");
         obj = cls->CreateInstance();
         if (!obj) {
             Warning("Could not spawn '%s'. Instance could not be created%s.", classname, error.c_str());
@@ -4157,8 +4484,25 @@ void idGameLocal::RadiusPushClipModel(const idVec3& origin, const float push, co
 idGameLocal::ProjectDecal
 ===============
 */
+#if defined(__vita__)
+// summed for the perf log (common_frame.cpp): {us, calls}
+struct vitaGameTimer_t {
+    volatile int* sum;
+    uint64 t0;
+    vitaGameTimer_t(volatile int* s, volatile int* calls) : sum(s), t0(Sys_Microseconds()) { __sync_fetch_and_add(calls, 1); }
+    ~vitaGameTimer_t() { __sync_fetch_and_add(sum, (int)(Sys_Microseconds() - t0)); }
+};
+#endif
+#if defined(__vita__)
+volatile int vita_decalUs = 0, vita_decalCalls = 0;
+#endif
+
 void idGameLocal::ProjectDecal(const idVec3& origin, const idVec3& dir, float depth, bool parallel, float size, const char* material, float angle)
 {
+#if defined(__vita__)
+    vitaGameTimer_t vitaTimer(&vita_decalUs, &vita_decalCalls);
+#endif
+    VITA_ZONE("decal projection");
     float s, c;
     idMat3 axis, axistemp;
     idFixedWinding winding;
@@ -5209,3 +5553,458 @@ bool idGameLocal::SimulateProjectiles()
 
     return moreProjectiles;
 }
+
+#if defined(VITA_PHYSCHECK)
+/*
+================================================================================
+
+Gameplay checks for the game tick rate (VitaPhysCheck.h)
+
+All of these run on the game thread. Vita_PhysCheck_Report() prints a window's
+worth and clears it (Vita: once per perf line; PC: console command
+vitaPhysReport).
+
+================================================================================
+*/
+struct vitaPcSpeed_t {
+    double sum;
+    int tics;
+    void Add(float v) { sum += v; tics++; }
+    float Avg() const { return tics ? (float)(sum / tics) : 0.0f; }
+};
+
+static struct {
+    // player
+    vitaPcSpeed_t run, walk, crouch;
+    int steadyBucket;      // 0 none, 1 run, 2 walk, 3 crouch
+    int steadySince;
+    bool wasOnGround;
+    float groundZ;         // height on the last tic on the ground
+    bool jumping;
+    float jumpZ0, jumpZMax;
+    int jumps;
+    float jumpSum, jumpMax, jumpMin;
+    // weapons
+    struct {
+        const char* name;
+        int lastShot, burstStart, burstShots;
+        int bursts, shots, firingMs;
+    } weapons[16];
+    int numWeapons;
+    // ragdolls
+    int ragdollActivations, ragdollRests, ragdollForced, ragdollStuck, ragdollLong;
+    float ragdollRestSum, ragdollRestMax, ragdollTopSpeed;
+    // objects
+    int objectRests, objectOut;
+    float objectRestSum, objectRestMax, objectTopSpeed;
+    // doors
+    int doorMoves, doorWorstDeviation;
+} vpc;
+
+static int vitaPcRagdollLines = 0, vitaPcObjectLines = 0, vitaPcDoorLines = 0, vitaPcJumpLines = 0;
+
+#if defined(__vita__)
+extern void Vita_Log(const char* text); // sys/vita/vita_main.cpp
+#endif
+
+#if !defined(__vita__)
+// the PC test build's checks outside the game code (idlib's RenderMatrix.cpp)
+void Vita_PcLog(const char* fmt, ...)
+{
+    char text[512];
+    va_list argptr;
+    va_start(argptr, fmt);
+    idStr::vsnPrintf(text, sizeof(text), fmt, argptr);
+    va_end(argptr);
+    text[sizeof(text) - 1] = '\0';
+    common->Printf("%s", text);
+}
+#endif
+
+// the per-event lines come from the game thread: on the Vita they go straight
+// to the log (thread safe, and not counted against the cap on what the game
+// thread may print); the PC test runs with com_smp 0
+static void Vita_PcPrintf(VERIFY_FORMAT_STRING const char* fmt, ...)
+{
+    char text[512];
+    va_list argptr;
+    va_start(argptr, fmt);
+    idStr::vsnPrintf(text, sizeof(text), fmt, argptr);
+    va_end(argptr);
+    text[sizeof(text) - 1] = '\0';
+#if defined(__vita__)
+    Vita_Log(text);
+#else
+    gameLocal.Printf("%s", text);
+#endif
+}
+
+void Vita_PhysCheck_Player(bool onGround, bool crouched, bool running, int forwardmove, int rightmove, bool jumpHeld, const idVec3& velocity, float z)
+{
+    const int now = gameLocal.time;
+    const float hspeed = idMath::Sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+    const bool fullStick = Max(abs(forwardmove), abs(rightmove)) >= 120;
+
+    // ground speed at full stick, after half a second in the same gait (past
+    // the acceleration)
+    int bucket = 0;
+    if (onGround && fullStick && hspeed > 10.0f) {
+        bucket = crouched ? 3 : (running ? 1 : 2);
+    }
+    if (bucket != vpc.steadyBucket) {
+        vpc.steadyBucket = bucket;
+        vpc.steadySince = now;
+    } else if (bucket != 0 && now - vpc.steadySince >= 500) {
+        (bucket == 1 ? vpc.run : (bucket == 2 ? vpc.walk : vpc.crouch)).Add(hspeed);
+    }
+
+    // jumps: take-off with the jump button and upward speed, to landing. The
+    // height counts from the last tic on the ground: the first tic in the air
+    // is already a tic's worth up (10 units at 30 Hz, 5 at 60)
+    if (vpc.wasOnGround && !onGround && jumpHeld && velocity.z > 50.0f) {
+        vpc.jumping = true;
+        vpc.jumpZ0 = vpc.groundZ;
+        vpc.jumpZMax = z;
+    }
+    if (onGround) {
+        vpc.groundZ = z;
+    }
+    if (vpc.jumping) {
+        vpc.jumpZMax = Max(vpc.jumpZMax, z);
+        if (onGround) {
+            vpc.jumping = false;
+            const float h = vpc.jumpZMax - vpc.jumpZ0;
+            if (h > 4.0f) {
+                vpc.jumps++;
+                vpc.jumpSum += h;
+                vpc.jumpMax = Max(vpc.jumpMax, h);
+                vpc.jumpMin = (vpc.jumps == 1) ? h : Min(vpc.jumpMin, h);
+                if (vitaPcJumpLines < 6) {
+                    vitaPcJumpLines++;
+                    Vita_PcPrintf("physcheck: jump %.1f units high (pm_jumpheight %.0f)\n", h, pm_jumpheight.GetFloat());
+                }
+            }
+        }
+    }
+    vpc.wasOnGround = onGround;
+}
+
+void Vita_PhysCheck_Shot(const char* weaponName)
+{
+    const int now = gameLocal.time;
+    int w = 0;
+    for (; w < vpc.numWeapons; w++) {
+        if (vpc.weapons[w].name == weaponName || idStr::Cmp(vpc.weapons[w].name, weaponName) == 0) {
+            break;
+        }
+    }
+    if (w == vpc.numWeapons) {
+        if (vpc.numWeapons >= 16) {
+            return;
+        }
+        memset(&vpc.weapons[w], 0, sizeof(vpc.weapons[w]));
+        vpc.weapons[w].name = weaponName;
+        vpc.weapons[w].lastShot = -100000;
+        vpc.numWeapons++;
+    }
+    auto& wp = vpc.weapons[w];
+    if (now - wp.lastShot <= 1600) {
+        wp.burstShots++;
+    } else {
+        // a burst of 3+ shots held down counts towards the rate (the
+        // shotgun's 1.33 s between shots fits in the 1.6 s gap)
+        if (wp.burstShots >= 3) {
+            wp.bursts++;
+            wp.shots += wp.burstShots - 1;
+            wp.firingMs += wp.lastShot - wp.burstStart;
+        }
+        wp.burstStart = now;
+        wp.burstShots = 1;
+    }
+    wp.lastShot = now;
+}
+
+void Vita_PhysCheck_RagdollActive()
+{
+    vpc.ragdollActivations++;
+}
+
+void Vita_PhysCheck_RagdollRest(const char* name, float seconds, bool forced, float distance, float topSpeed)
+{
+    vpc.ragdollRests++;
+    vpc.ragdollRestSum += seconds;
+    vpc.ragdollRestMax = Max(vpc.ragdollRestMax, seconds);
+    vpc.ragdollTopSpeed = Max(vpc.ragdollTopSpeed, topSpeed);
+    if (forced) {
+        vpc.ragdollForced++;
+    }
+    // the ones that moved (not the corpses a map sets down at its start)
+    if (seconds >= 0.05f && vitaPcRagdollLines < 12) {
+        vitaPcRagdollLines++;
+        Vita_PcPrintf("physcheck: ragdoll '%s' at rest after %.2f s, moved %.0f units, top speed %.0f u/s%s\n", name, seconds, distance, topSpeed,
+            forced ? " - stopped by vita_afMaxMoveTime" : "");
+    }
+}
+
+void Vita_PhysCheck_RagdollStuck()
+{
+    vpc.ragdollStuck++;
+}
+
+void Vita_PhysCheck_RagdollLong(const char* name, float seconds, float linSpeed, float angSpeed, float linAcc, float angAcc, int contacts, const char* touching)
+{
+    vpc.ragdollLong++;
+    Vita_PcPrintf("physcheck: ragdoll '%s' STILL MOVING after %.1f s: fastest body %.1f u/s, %.2f rad/s, acceleration %.1f u/s2, %.2f rad/s2 (id rests it below 10, 15, 20, 20); %d contacts with %s\n",
+        name, seconds, linSpeed, angSpeed, linAcc, angAcc, contacts, touching[0] ? touching : "nothing");
+}
+
+void Vita_PhysCheck_ObjectRest(const char* name, float seconds, float distance, float topSpeed)
+{
+    vpc.objectRests++;
+    vpc.objectRestSum += seconds;
+    vpc.objectRestMax = Max(vpc.objectRestMax, seconds);
+    vpc.objectTopSpeed = Max(vpc.objectTopSpeed, topSpeed);
+    if ((seconds >= 0.05f || distance >= 2.0f) && vitaPcObjectLines < 8) {
+        vitaPcObjectLines++;
+        Vita_PcPrintf("physcheck: object '%s' at rest after %.2f s, moved %.0f units, top speed %.0f u/s\n", name, seconds, distance, topSpeed);
+    }
+}
+
+void Vita_PhysCheck_ObjectOutOfWorld(const char* name, const idVec3& origin)
+{
+    vpc.objectOut++;
+    Vita_PcPrintf("physcheck: OBJECT LEFT THE WORLD: '%s' at (%.0f %.0f %.0f)\n", name, origin.x, origin.y, origin.z);
+}
+
+void Vita_PhysCheck_Door(const char* name, int elapsedMs, int expectedMs)
+{
+    vpc.doorMoves++;
+    vpc.doorWorstDeviation = Max(vpc.doorWorstDeviation, abs(elapsedMs - expectedMs));
+    if (vitaPcDoorLines < 8) {
+        vitaPcDoorLines++;
+        Vita_PcPrintf("physcheck: mover '%s' travelled in %d ms (set to %d ms)\n", name, elapsedMs, expectedMs);
+    }
+}
+
+void Vita_PhysCheck_Report()
+{
+    const float hz = com_engineHz_latched;
+    gameLocal.Printf("physcheck [game at %.0f Hz]: player run %.1f u/s (%d tics, pm_runspeed %.0f) | walk %.1f (%d, pm_walkspeed %.0f) | crouch %.1f (%d, pm_crouchspeed %.0f) | jumps %d, height avg %.1f min %.1f max %.1f (pm_jumpheight %.0f)\n",
+        hz, vpc.run.Avg(), vpc.run.tics, pm_runspeed.GetFloat(), vpc.walk.Avg(), vpc.walk.tics, pm_walkspeed.GetFloat(),
+        vpc.crouch.Avg(), vpc.crouch.tics, pm_crouchspeed.GetFloat(),
+        vpc.jumps, vpc.jumps ? vpc.jumpSum / vpc.jumps : 0.0f, vpc.jumpMin, vpc.jumpMax, pm_jumpheight.GetFloat());
+    char line[768];
+    int len = idStr::snPrintf(line, sizeof(line), "physcheck [game at %.0f Hz]: weapon fire rates (held down):", hz);
+    for (int w = 0; w < vpc.numWeapons; w++) {
+        auto& wp = vpc.weapons[w];
+        if (wp.burstShots >= 3) { // close the burst in progress
+            wp.bursts++;
+            wp.shots += wp.burstShots - 1;
+            wp.firingMs += wp.lastShot - wp.burstStart;
+            wp.burstShots = 0;
+        }
+        if (wp.firingMs > 0 && len < (int)sizeof(line) - 80) {
+            len += idStr::snPrintf(line + len, sizeof(line) - len, " %s %.2f/s (%d shots, %d bursts) |", wp.name, wp.shots * 1000.0f / wp.firingMs, wp.shots, wp.bursts);
+        }
+    }
+    gameLocal.Printf("%s\n", line);
+    gameLocal.Printf("physcheck [game at %.0f Hz]: ragdolls %d activated, %d at rest (avg %.2f s, longest %.2f s, top speed %.0f u/s, %d stopped by the cap), %d still moving after 5 s, %d stuck corrections | objects %d at rest (avg %.2f s, longest %.2f s, top speed %.0f u/s), %d left the world | doors %d moves, worst timing error %d ms\n",
+        hz, vpc.ragdollActivations, vpc.ragdollRests, vpc.ragdollRests ? vpc.ragdollRestSum / vpc.ragdollRests : 0.0f, vpc.ragdollRestMax, vpc.ragdollTopSpeed, vpc.ragdollForced, vpc.ragdollLong, vpc.ragdollStuck,
+        vpc.objectRests, vpc.objectRests ? vpc.objectRestSum / vpc.objectRests : 0.0f, vpc.objectRestMax, vpc.objectTopSpeed, vpc.objectOut,
+        vpc.doorMoves, vpc.doorWorstDeviation);
+
+    // a new window, with new caps for the per-event lines
+    vitaPcRagdollLines = vitaPcObjectLines = vitaPcDoorLines = vitaPcJumpLines = 0;
+    const auto weaponsKept = vpc.numWeapons;
+    vpc.run = vpc.walk = vpc.crouch = vitaPcSpeed_t();
+    vpc.jumps = 0;
+    vpc.jumpSum = vpc.jumpMax = vpc.jumpMin = 0.0f;
+    for (int w = 0; w < weaponsKept; w++) {
+        vpc.weapons[w].bursts = vpc.weapons[w].shots = vpc.weapons[w].firingMs = 0;
+    }
+    vpc.ragdollActivations = vpc.ragdollRests = vpc.ragdollForced = vpc.ragdollStuck = vpc.ragdollLong = 0;
+    vpc.ragdollRestSum = vpc.ragdollRestMax = vpc.ragdollTopSpeed = 0.0f;
+    vpc.objectRests = vpc.objectOut = 0;
+    vpc.objectRestSum = vpc.objectRestMax = vpc.objectTopSpeed = 0.0f;
+    vpc.doorMoves = vpc.doorWorstDeviation = 0;
+}
+
+CONSOLE_COMMAND(vitaPhysReport, "print the tick-rate gameplay checks (VitaPhysCheck.h) and start a new window", 0)
+{
+    Vita_PhysCheck_Report();
+}
+#endif
+
+
+/*
+================================================================================
+
+The benchmark's view of the game (framework/VitaBench.cpp). Called on the main
+thread between frames, while the game/draw thread is idle.
+
+================================================================================
+*/
+bool Vita_BenchGameReady(idStr& why)
+{
+    idPlayer* player = gameLocal.GetLocalPlayer();
+    why.Clear();
+    if (player == NULL) {
+        why = "no player yet";
+        return false;
+    }
+    if (gameLocal.inCinematic) {
+        why = "in a cinematic (waiting for it to end)";
+        return false;
+    }
+    if (player->health <= 0) {
+        why = "the player is dead";
+        return false;
+    }
+    if (player->IsHidden()) {
+        why = "the player is hidden";
+        return false;
+    }
+    return true;
+}
+
+void Vita_BenchPlayerSetup(bool god, bool noclip, bool notarget)
+{
+    idPlayer* player = gameLocal.GetLocalPlayer();
+    if (player != NULL) {
+        player->godmode = god;
+        player->noclip = noclip;
+        player->fl.notarget = notarget;
+    }
+}
+
+int Vita_BenchKill(const char* name)
+{
+    idEntity* ent = gameLocal.FindEntity(name);
+    if (ent == NULL) {
+        return -1;
+    }
+    if (ent->health <= 0) {
+        return 0;
+    }
+    ent->Damage(gameLocal.world, gameLocal.world, idVec3(0.0f, 0.0f, 1.0f), "damage_moverCrush", 1000.0f, INVALID_JOINT);
+    return 1;
+}
+
+bool Vita_BenchRemove(const char* name)
+{
+    idEntity* ent = gameLocal.FindEntity(name);
+    if (ent == NULL) {
+        return false;
+    }
+    ent->PostEventMS(&EV_Remove, 0);
+    return true;
+}
+
+void Vita_BenchGameStats(idStr& out)
+{
+    int entities = 0, thinking = 0, monsters = 0, awake = 0, projectiles = 0, ragdolls = 0, ragdollsMoving = 0, moveablesMoving = 0, lights = 0, emitters = 0;
+    for (idEntity* ent = gameLocal.spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next()) {
+        entities++;
+        if (ent->IsType(idAI::Type) && ent->health > 0 && !ent->IsHidden()) {
+            monsters++;
+            if (ent->IsActive()) {
+                awake++;
+            }
+        }
+        if (ent->IsType(idProjectile::Type)) {
+            projectiles++;
+        }
+        if (ent->IsType(idAFEntity_Base::Type) && static_cast<idAFEntity_Base*>(ent)->IsActiveAF()) {
+            ragdolls++;
+            if (!ent->GetPhysics()->IsAtRest()) {
+                ragdollsMoving++;
+            }
+        }
+        if (ent->IsType(idMoveable::Type) && !ent->GetPhysics()->IsAtRest()) {
+            moveablesMoving++;
+        }
+        if (ent->IsType(idLight::Type)) {
+            lights++;
+        }
+        if (ent->IsType(idFuncEmitter::Type)) {
+            emitters++;
+        }
+    }
+    for (idEntity* ent = gameLocal.activeEntities.Next(); ent != NULL; ent = ent->activeNode.Next()) {
+        thinking++;
+    }
+    out = va("%d entities (%d thinking), %d monsters alive (%d awake), %d projectiles in flight, %d ragdolls (%d moving), %d moveables moving, %d light entities, %d particle emitters, game time %d ms",
+        entities, thinking, monsters, awake, projectiles, ragdolls, ragdollsMoving, moveablesMoving, lights, emitters, gameLocal.time);
+}
+
+#if !defined(__vita__)
+// every walkable spot of the map (AAS areas dropped to the floor), one per
+// cell; and the classes of the map's monsters with their counts
+int Vita_BenchScanSpots(idList<idVec3>& spots, idStrList& classes, idList<int>& classCounts, float cell)
+{
+    idPlayer* player = gameLocal.GetLocalPlayer();
+    idAAS* aas = gameLocal.GetAAS("aas48");
+    if (aas == NULL) {
+        for (int i = 0; i < gameLocal.NumAAS() && aas == NULL; i++) {
+            aas = gameLocal.GetAAS(i);
+        }
+    }
+    if (player == NULL || aas == NULL) {
+        gameLocal.Printf("benchScan: no player or no AAS\n");
+        return 0;
+    }
+    const idBounds bounds = player->GetPhysics()->GetBounds();
+    idHashIndex used;
+    idList<idVec3> keys;
+    for (int a = 1; a < aas->NumAreas(); a++) {
+        if ((aas->AreaFlags(a) & AREA_REACHABLE_WALK) == 0) {
+            continue;
+        }
+        const idVec3 c = aas->AreaCenter(a);
+        trace_t tr;
+        gameLocal.clip.TraceBounds(tr, c + idVec3(0.0f, 0.0f, 16.0f), c - idVec3(0.0f, 0.0f, 256.0f), bounds, MASK_PLAYERSOLID, player);
+        if (tr.fraction >= 1.0f || tr.fraction <= 0.0f) {
+            continue; // no floor below, or started in solid
+        }
+        const idVec3 feet = tr.endpos + idVec3(0.0f, 0.0f, 1.0f);
+        if (gameLocal.clip.Contents(feet, player->GetPhysics()->GetClipModel(), mat3_identity, MASK_PLAYERSOLID, player) != 0) {
+            continue; // the player would not fit
+        }
+        const idVec3 key(idMath::Floor(feet.x / cell), idMath::Floor(feet.y / cell), idMath::Floor(feet.z / cell));
+        const int h = used.GenerateKey((int)key.x * 73856093 ^ (int)key.y * 19349663 ^ (int)key.z * 83492791);
+        bool dup = false;
+        for (int i = used.First(h); i != -1; i = used.Next(i)) {
+            if (keys[i] == key) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        used.Add(h, keys.Append(key));
+        spots.Append(feet);
+    }
+    for (idEntity* ent = gameLocal.spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next()) {
+        if (!ent->IsType(idAI::Type)) {
+            continue;
+        }
+        const char* cls = ent->spawnArgs.GetString("classname");
+        const int k = classes.FindIndex(cls);
+        if (k < 0) {
+            classes.Append(cls);
+            classCounts.Append(1);
+        } else {
+            classCounts[k]++;
+        }
+    }
+    return spots.Num();
+}
+
+bool Vita_BenchClearLine(const idVec3& a, const idVec3& b)
+{
+    trace_t tr;
+    gameLocal.clip.TracePoint(tr, a, b, MASK_SOLID, gameLocal.GetLocalPlayer());
+    return tr.fraction >= 1.0f;
+}
+#endif

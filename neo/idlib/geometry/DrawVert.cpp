@@ -28,6 +28,9 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#if defined(__vita__) && defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 /*
 ============
@@ -36,6 +39,20 @@ idShadowVert::CreateShadowCache
 */
 int idShadowVert::CreateShadowCache(idShadowVert* vertexCache, const idDrawVert* verts, const int numVerts)
 {
+#if defined(__vita__) && defined(__ARM_NEON__)
+    // vertexCache is GPU memory the CPU writes uncached: two 16-byte stores a
+    // vertex instead of eight 4-byte ones (the same floats)
+    const uint32x4_t xyzLanes = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0u };
+    const float32x4_t w1 = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const float32x4_t w0 = vdupq_n_f32(0.0f);
+    float* out = vertexCache[0].xyzw.ToFloatPtr();
+    for (int i = 0; i < numVerts; i++, out += 8) {
+        const float32x4_t v = vld1q_f32(verts[i].xyz.ToFloatPtr()); // x y z, then st (dropped)
+        vst1q_f32(out + 0, vbslq_f32(xyzLanes, v, w1));
+        vst1q_f32(out + 4, vbslq_f32(xyzLanes, v, w0));
+    }
+    return numVerts * 2;
+#endif
     for (int i = 0; i < numVerts; i++) {
         vertexCache[i * 2 + 0].xyzw[0] = verts[i].xyz[0];
         vertexCache[i * 2 + 0].xyzw[1] = verts[i].xyz[1];

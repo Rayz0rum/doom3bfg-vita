@@ -36,6 +36,36 @@ struct guiModelSurface_t {
 
 class idRenderMatrix;
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// Vita: a GUI's drawing recorded once and played back on the next frame (the
+// HUD and distant world screens at 15 Hz). Every AllocTris call of the draw,
+// in order - vertices, indexes, material, state - so the playback builds the
+// very surfaces and buffers the draw did.
+struct vitaGuiCall_t {
+    int firstVert, numVerts;
+    int firstIndex, numIndexes;
+    const idMaterial* material;
+    uint64 glState;
+    stereoDepthType_t stereoType;
+};
+struct vitaGuiCapture_t {
+    const void* key;  // what was drawn (an idUserInterface, the HUD...)
+    int frame;        // tr.frameCount it was drawn in, -1 none
+    bool valid;
+    idList<idDrawVert, TAG_MODEL> verts;
+    idList<triIndex_t, TAG_MODEL> indexes; // relative to their call's first vertex
+    idList<vitaGuiCall_t, TAG_MODEL> calls;
+#if !defined(__vita__)
+    // PC test build, vita_guiLODMeasure: the recording before, to compare
+    int kind; // 0 world screen, 1 HUD
+    bool prevValid;
+    idList<idDrawVert, TAG_MODEL> prevVerts;
+    idList<triIndex_t, TAG_MODEL> prevIndexes;
+    idList<vitaGuiCall_t, TAG_MODEL> prevCalls;
+#endif
+};
+#endif
+
 class idGuiModel {
 public:
     idGuiModel();
@@ -56,8 +86,22 @@ public:
     idDrawVert* AllocTris(int numVerts, const triIndex_t* indexes, int numIndexes, const idMaterial* material,
         const uint64 glState, const stereoDepthType_t stereoType);
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // the AllocTris calls until VitaEndCapture go to 'cap' (and are played
+    // back into this model by VitaEndCapture); anything that empties or
+    // emits the model in between plays back what was recorded so far and
+    // leaves the capture invalid
+    void VitaBeginCapture(vitaGuiCapture_t* cap);
+    void VitaEndCapture();
+    void VitaReplay(const vitaGuiCapture_t* cap);
+#endif
+
     //---------------------------
 private:
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaGuiCapture_t* vitaCapture;
+    void VitaInterruptCapture();
+#endif
     void AdvanceSurf();
     void EmitSurfaces(float modelMatrix[16], float modelViewMatrix[16],
         bool depthHack, bool allowFullScreenStereoDepth, bool linkAsEntity);

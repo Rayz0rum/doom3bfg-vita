@@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT (vita_overlaysPerFrame)
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_overlaysPerFrame("vita_overlaysPerFrame", "2", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: at most this many wound overlays are projected onto a model each frame (the rest wait, up to the stock 200 ms); 0 = all at once");
+#endif
 #include "Model_local.h"
 
 #include "../idlib/geometry/DrawVert_intrinsics.h"
@@ -488,6 +492,31 @@ idRenderModelOverlay::CreateDeferredOverlays
 */
 void idRenderModelOverlay::CreateDeferredOverlays(const idRenderModel* model)
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): at most vita_overlaysPerFrame wound overlays are
+    // projected onto a model a frame (each walks the whole model - ~1.4 ms;
+    // a shotgun blast queued 8 at once: 11.7 ms in one model job, enpro
+    // fight 1); the rest wait for the next frames, and those older than
+    // the stock 200 ms timeout are dropped as before
+    extern idCVar vita_overlaysPerFrame;
+    const int vitaMax = vita_overlaysPerFrame.GetInteger();
+    if (vitaMax > 0 && nextDeferredOverlay - firstDeferredOverlay > (unsigned int)vitaMax) {
+        unsigned int made = 0;
+        unsigned int i = firstDeferredOverlay;
+        for (; i < nextDeferredOverlay && made < (unsigned int)vitaMax; i++) {
+            const overlayProjectionParms_t& parms = deferredOverlays[i & (MAX_DEFERRED_OVERLAYS - 1)];
+            if (parms.startTime > tr.viewDef->renderView.time[0] - DEFFERED_OVERLAY_TIMEOUT) {
+                CreateOverlay(model, parms.localTextureAxis, parms.material);
+                made++;
+            } else {
+                VITA_ZONE_COUNT("wound overlays dropped (waited past the 200 ms timeout)");
+            }
+        }
+        firstDeferredOverlay = i;
+        VITA_ZONE_ADD("wound overlays left for the next frame (vita_overlaysPerFrame)", nextDeferredOverlay - firstDeferredOverlay);
+        return;
+    }
+#endif
     for (unsigned int i = firstDeferredOverlay; i < nextDeferredOverlay; i++) {
         const overlayProjectionParms_t& parms = deferredOverlays[i & (MAX_DEFERRED_OVERLAYS - 1)];
         if (parms.startTime > tr.viewDef->renderView.time[0] - DEFFERED_OVERLAY_TIMEOUT) {

@@ -65,9 +65,17 @@ If you have questions concerning this license or the applicable additional terms
 
 #define MIDI_CHANNELS		2
 #define MIDI_RATE		22050
+#if defined(__vita__)
+// 16-bit: the music is synthesised (Timidity), not a recording, and at 8 bits
+// its quantisation noise was the faint "bitty", crunchy sound under it
+#define MIDI_SAMPLETYPE		AL_FORMAT_STEREO16
+#define MIDI_FORMAT		AUDIO_S16
+#define MIDI_FORMAT_BYTES	2
+#else
 #define MIDI_SAMPLETYPE		AL_FORMAT_STEREO8
 #define MIDI_FORMAT		AUDIO_U8
 #define MIDI_FORMAT_BYTES	1
+#endif
 
 ALuint		alMusicSourceVoice;
 ALuint		alMusicBuffer;
@@ -709,11 +717,59 @@ void I_ShutdownSoundHardware()
 I_InitSoundChannel
 ======================
 */
+#if defined(__vita__)
+/*
+======================
+I_VitaSmoothResampler
+
+The effects are DOOM's own 8-bit 11 kHz samples, played at the 48 kHz output
+rate. With OpenAL Soft's point or linear resampling the images of the 11 kHz
+spectrum stay in - a gritty edge on every sound; cubic interpolation filters
+them, for a handful of voices at most. Returns -1 to leave the default.
+======================
+*/
+static int I_VitaSmoothResampler()
+{
+	static int chosen = -2;
+	if( chosen != -2 )
+	{
+		return chosen;
+	}
+	chosen = -1;
+	if( !alIsExtensionPresent( "AL_SOFT_source_resampler" ) )
+	{
+		idLib::Printf( "vita: classic sound - no AL_SOFT_source_resampler, default resampling\n" );
+		return chosen;
+	}
+	LPALGETSTRINGISOFT getStringi = ( LPALGETSTRINGISOFT )alGetProcAddress( "alGetStringiSOFT" );
+	const ALint count = alGetInteger( AL_NUM_RESAMPLERS_SOFT );
+	const ALint def = alGetInteger( AL_DEFAULT_RESAMPLER_SOFT );
+	for( ALint i = 0; getStringi != NULL && i < count; i++ )
+	{
+		const char* name = getStringi( AL_RESAMPLER_NAME_SOFT, i );
+		if( name != NULL && ( idStr::FindText( name, "ubic", false ) >= 0 ) )
+		{
+			chosen = i;
+		}
+	}
+	idLib::Printf( "vita: classic sound effects resampled with '%s' (default '%s')\n",
+				   ( chosen >= 0 && getStringi ) ? getStringi( AL_RESAMPLER_NAME_SOFT, chosen ) : "default",
+				   ( def >= 0 && getStringi ) ? getStringi( AL_RESAMPLER_NAME_SOFT, def ) : "?" );
+	return chosen;
+}
+#endif
+
 void I_InitSoundChannel( int channel, int numOutputChannels_ )
 {
 	activeSound_t* soundchannel = &activeSounds[ channel ];
 
 	alGenSources( ( ALuint )1, &soundchannel->alSourceVoice );
+#if defined(__vita__)
+	if( I_VitaSmoothResampler() >= 0 )
+	{
+		alSourcei( soundchannel->alSourceVoice, AL_SOURCE_RESAMPLER_SOFT, I_VitaSmoothResampler() );
+	}
+#endif
 
 	alSource3f( soundchannel->alSourceVoice, AL_VELOCITY, 0.f, 0.f, 0.f );
 	alSourcei( soundchannel->alSourceVoice, AL_LOOPING, AL_FALSE );
@@ -806,6 +862,213 @@ void I_SetMusicVolume( int volume )
 }
 
 /*
+================================================================================
+
+The music, streamed
+
+Stock BFG rendered a whole song with Timidity into one buffer (22 kHz 16-bit
+stereo: ~16 MB for a three-minute track), then alBufferData copied it again.
+On the Vita, after hours of DOOM 3, that malloc returned NULL and Timidity
+wrote the song to address 0 (the full verification's crash, 2026-10-19). Now
+the song is synthesised as it plays: MUSIC_BUFFERS small buffers queued on
+the music source, refilled by a worker thread (core 3 on the Vita - nothing
+waits on it, the queue holds MUSIC_BUFFERS * MUSIC_BUFFER_MS of sound). The
+song loops by restarting Timidity at its end, as the stock AL_LOOPING did.
+Stats per song (synthesis cost, underruns) go to the log and to
+I_MusicStats() for the verification.
+
+================================================================================
+*/
+uint64 Sys_Microseconds();
+void Sys_Sleep( int msec );
+
+#define MUSIC_BUFFERS		6
+#define MUSIC_BUFFER_MS		350
+#define MUSIC_BUFFER_SAMPLES	( MIDI_RATE * MUSIC_BUFFER_MS / 1000 )
+#define MUSIC_BUFFER_BYTES	( MUSIC_BUFFER_SAMPLES * MIDI_CHANNELS * MIDI_FORMAT_BYTES )
+
+static ALuint		musicStreamBuffers[MUSIC_BUFFERS];
+// Timidity's block is MUSIC_BUFFER_SAMPLES (Timidity_Init's last size) and
+// one call may finish a block and flush the song's end: room for two
+static byte		musicChunk[MUSIC_BUFFER_BYTES * 2];
+static idSysMutex	musicLock;		// Timidity and the music source's queue
+static uintptr_t	musicThread = 0;
+static volatile bool	musicThreadQuit = false;
+static bool		musicStreaming = false;	// a song is loaded and being fed
+static bool		musicPaused = false;
+static bool		musicLooping = true;
+static bool		musicEnded = false;		// not looping: the song's end was fed
+static idStr		musicName;
+// this song's figures
+static int			musicChunks = 0;
+static int			musicUnderruns = 0;
+static uint64		musicStartUs = 0;		// when the song was queued
+static uint64		musicFirstUnderrunUs = 0;	// the first gap, from the song's start (0 none)
+static int			musicUnderrunQueued = 0;	// buffers still queued when it was found
+static int			musicLoops = 0;
+static uint64		musicSynthUs = 0;
+static uint64		musicWorstChunkUs = 0;
+static int			musicPeak = 0;		// the loudest sample (0..32767), to tell sound from silence or garbage
+static double		musicSumSquares = 0.0;
+static int64		musicSamplesMeasured = 0;
+// the session's, for the verification
+static int			musicSongsTotal = 0;
+static int			musicUnderrunsTotal = 0;
+static int			musicChunksTotal = 0;
+static uint64		musicSynthUsTotal = 0;
+
+// one buffer's worth of the song (musicLock held); false once a song that
+// does not loop has ended
+static bool I_MusicFillChunk( ALuint buffer )
+{
+	if( musicEnded )
+	{
+		return false;
+	}
+	const uint64 t0 = Sys_Microseconds();
+	// One block per call, exactly Timidity's block size: a call asked for
+	// less still writes a whole block once its buffer fills (that overran
+	// this buffer in the first version - the PC test caught it), and one
+	// asked for exactly a block writes at most a block plus the song's end.
+	// A call that only fills Timidity's own buffer writes nothing: again.
+	int filled = 0;
+	int guard = 0;
+	while( filled == 0 && guard++ < 8 )
+	{
+		int written = 0;
+		const int rc = Timidity_PlaySome( musicChunk, MUSIC_BUFFER_SAMPLES, &written );
+		filled = written;
+		if( filled > ( int )sizeof( musicChunk ) )
+		{
+			I_Error( "classic music: Timidity wrote %d bytes into a %d byte buffer", filled, ( int )sizeof( musicChunk ) );
+		}
+		if( rc == RC_TUNE_END || ( written == 0 && !Timidity_Active() ) )
+		{
+			if( !musicLooping )
+			{
+				musicEnded = true;
+				break;
+			}
+			// the stock source looped the whole buffer: start the song over
+			Timidity_Start( doomMusic );
+			musicLoops++;
+		}
+	}
+	if( filled <= 0 )
+	{
+		return false;
+	}
+	// its level: one sample in 8 (the log's peak and RMS per song)
+#if MIDI_FORMAT_BYTES == 2
+	const short* pcm = ( const short* )musicChunk;
+	const int count = filled / 2;
+	for( int i = 0; i < count; i += 8 )
+	{
+		const int v = pcm[i];
+#else
+	const int count = filled;
+	for( int i = 0; i < count; i += 8 )
+	{
+		const int v = ( ( int )musicChunk[i] - 128 ) * 256;
+#endif
+		musicPeak = Max( musicPeak, abs( v ) );
+		musicSumSquares += ( double )v * v;
+		musicSamplesMeasured++;
+	}
+	alBufferData( buffer, MIDI_SAMPLETYPE, musicChunk, filled, MIDI_RATE );
+	const uint64 us = Sys_Microseconds() - t0;
+	musicSynthUs += us;
+	musicWorstChunkUs = Max( musicWorstChunkUs, us );
+	musicChunks++;
+	return true;
+}
+
+// the log line for the song that ends (musicLock held)
+static void I_MusicReport( const char* why )
+{
+	if( musicName.IsEmpty() || musicChunks == 0 )
+	{
+		return;
+	}
+	const double audioMs = ( double )musicChunks * MUSIC_BUFFER_MS;
+	idLib::Printf( "classic music: %s %s after %.1f s - %d chunks of %d ms synthesised, %.1f%% of a core (worst chunk %.1f ms), %d loops, %d underruns (the queue ran dry), level peak %.0f%% RMS %.1f%% of full scale\n",
+			  musicName.c_str(), why, audioMs / 1000.0, musicChunks, MUSIC_BUFFER_MS, 100.0 * ( musicSynthUs / 1000.0 ) / audioMs, musicWorstChunkUs / 1000.0, musicLoops, musicUnderruns,
+			  100.0 * musicPeak / 32768.0, musicSamplesMeasured ? 100.0 * sqrt( musicSumSquares / musicSamplesMeasured ) / 32768.0 : 0.0 );
+	if( musicFirstUnderrunUs != 0 )
+	{
+		idLib::Printf( "classic music: %s - its first underrun %.2f s after the song was queued (%d buffers queued then, %s)\n", musicName.c_str(), musicFirstUnderrunUs / 1000000.0,
+					   musicUnderrunQueued, musicPaused ? "paused" : "playing" );
+	}
+	if( musicSamplesMeasured > 0 && musicPeak < 64 )
+	{
+		idLib::Warning( "classic music: %s was silent (peak %d)", musicName.c_str(), musicPeak );
+	}
+	musicPeak = 0;
+	musicSumSquares = 0.0;
+	musicSamplesMeasured = 0;
+	musicChunksTotal += musicChunks;
+	musicUnderrunsTotal += musicUnderruns;
+	musicSynthUsTotal += musicSynthUs;
+	musicChunks = 0;
+}
+
+// stop feeding and empty the queue (musicLock held)
+static void I_MusicStopLocked()
+{
+	alSourceStop( alMusicSourceVoice );
+	alSourcei( alMusicSourceVoice, AL_BUFFER, 0 ); // unqueues every buffer
+	alSourceRewind( alMusicSourceVoice ); // back to AL_INITIAL: a stopped source with the next song queued read as a queue that ran dry
+	if( musicStreaming )
+	{
+		Timidity_Stop();
+		Timidity_FreeSong( doomMusic );
+		doomMusic = NULL;
+		musicStreaming = false;
+	}
+	musicEnded = false;
+}
+
+// the worker: refills the buffers the source has played
+static unsigned int I_MusicThread( void* )
+{
+	while( !musicThreadQuit )
+	{
+		Sys_Sleep( 30 );
+		idScopedCriticalSection lock( musicLock );
+		if( !musicStreaming || musicThreadQuit )
+		{
+			continue;
+		}
+		ALint processed = 0;
+		alGetSourcei( alMusicSourceVoice, AL_BUFFERS_PROCESSED, &processed );
+		while( processed-- > 0 )
+		{
+			ALuint buffer = 0;
+			alSourceUnqueueBuffers( alMusicSourceVoice, 1, &buffer );
+			if( buffer != 0 && I_MusicFillChunk( buffer ) )
+			{
+				alSourceQueueBuffers( alMusicSourceVoice, 1, &buffer );
+			}
+		}
+		ALint state = 0, queued = 0;
+		alGetSourcei( alMusicSourceVoice, AL_SOURCE_STATE, &state );
+		alGetSourcei( alMusicSourceVoice, AL_BUFFERS_QUEUED, &queued );
+		if( state == AL_STOPPED && !musicPaused && queued > 0 ) // (AL_INITIAL: queued, I_UpdateMusic has not started it yet)
+		{
+			// it played everything before the next chunk came: start it again
+			musicUnderruns++;
+			if( musicFirstUnderrunUs == 0 )
+			{
+				musicFirstUnderrunUs = Max( ( uint64 )1, Sys_Microseconds() - musicStartUs );
+				musicUnderrunQueued = queued;
+			}
+			alSourcePlay( alMusicSourceVoice );
+		}
+	}
+	return 0;
+}
+
+/*
 ======================
 I_InitMusic
 ======================
@@ -815,7 +1078,8 @@ void I_InitMusic( void )
 	if( !Music_initialized )
 	{
 		// Initialize Timidity
-		Timidity_Init( MIDI_RATE, MIDI_FORMAT, MIDI_CHANNELS, MIDI_RATE, "classicmusic/gravis.cfg" );
+		// its output block = one streamed chunk (I_MusicFillChunk)
+		Timidity_Init( MIDI_RATE, MIDI_FORMAT, MIDI_CHANNELS, MUSIC_BUFFER_SAMPLES, "classicmusic/gravis.cfg" );
 
 		musicBuffer = NULL;
 		totalBufferSize = 0;
@@ -825,9 +1089,16 @@ void I_InitMusic( void )
 		alGenSources( ( ALuint )1, &alMusicSourceVoice );
 
 		alSourcef( alMusicSourceVoice, AL_PITCH, 1.f );
-		alSourcei( alMusicSourceVoice, AL_LOOPING, AL_TRUE );
+		alSourcei( alMusicSourceVoice, AL_LOOPING, AL_FALSE ); // a queue: the song loops in I_MusicFillChunk
 
 		alGenBuffers( ( ALuint )1, &alMusicBuffer );
+		alGenBuffers( MUSIC_BUFFERS, musicStreamBuffers );
+
+		musicThreadQuit = false;
+		// core 3 on the Vita when it can be had (idlib/Thread.cpp: core 6)
+		musicThread = Sys_CreateThread( I_MusicThread, NULL, THREAD_NORMAL, "ClassicMusic", ( core_t )6, 64 * 1024 );
+		idLib::Printf( "classic music: streamed - %d buffers of %d ms (%d KB of sound in flight instead of the whole song)\n",
+				  MUSIC_BUFFERS, MUSIC_BUFFER_MS, MUSIC_BUFFERS * MUSIC_BUFFER_BYTES / 1024 );
 
 		Music_initialized = true;
 	}
@@ -842,13 +1113,23 @@ void I_ShutdownMusic( void )
 {
 	if( Music_initialized )
 	{
-		if( alIsSource( alMusicSourceVoice ) )
+		musicThreadQuit = true;
+		if( musicThread != 0 )
 		{
-			I_StopSong( 0 );
-			alSourcei( alMusicSourceVoice, AL_BUFFER, 0 );
-			alDeleteSources( 1, &alMusicSourceVoice );
+			Sys_DestroyThread( musicThread ); // joined
+			musicThread = 0;
+		}
+		{
+			idScopedCriticalSection lock( musicLock );
+			I_MusicReport( "shut down" );
+			if( alIsSource( alMusicSourceVoice ) )
+			{
+				I_MusicStopLocked();
+				alDeleteSources( 1, &alMusicSourceVoice );
+			}
 		}
 
+		alDeleteBuffers( MUSIC_BUFFERS, musicStreamBuffers );
 		if( alIsBuffer( alMusicBuffer ) )
 		{
 			alDeleteBuffers( 1, &alMusicBuffer );
@@ -881,6 +1162,9 @@ unsigned char midiConversionBuffer[MaxMidiConversionSize];
 /*
 ======================
 I_LoadSong
+
+The song is converted and started; the first buffers are synthesised here
+and queued (musicLock held).
 ======================
 */
 void I_LoadSong( const char* songname )
@@ -893,27 +1177,35 @@ void I_LoadSong( const char* songname )
 	int length = 0;
 	Mus2Midi( musFile, midiConversionBuffer, &length );
 
+	const uint64 t0 = Sys_Microseconds();
 	doomMusic = Timidity_LoadSongMem( midiConversionBuffer, length );
+	musicName = lumpName;
+	musicChunks = musicUnderruns = musicLoops = 0;
+	musicStartUs = Sys_Microseconds();
+	musicFirstUnderrunUs = 0;
+	musicSynthUs = musicWorstChunkUs = 0;
 
 	if( doomMusic )
 	{
-		musicBuffer = ( byte* )malloc( MIDI_CHANNELS * MIDI_FORMAT_BYTES * doomMusic->samples );
-		totalBufferSize = doomMusic->samples * MIDI_CHANNELS * MIDI_FORMAT_BYTES;
 		Timidity_Start( doomMusic );
-
-		int rc = RC_NO_RETURN_VALUE;
-		int num_bytes = 0;
-		int offset = 0;
-
-		do
+		musicStreaming = true;
+		musicEnded = false;
+		int queued = 0;
+		for( int i = 0; i < MUSIC_BUFFERS; i++ )
 		{
-			rc = Timidity_PlaySome( musicBuffer + offset, MIDI_RATE, &num_bytes );
-			offset += num_bytes;
+			if( I_MusicFillChunk( musicStreamBuffers[i] ) )
+			{
+				alSourceQueueBuffers( alMusicSourceVoice, 1, &musicStreamBuffers[i] );
+				queued++;
+			}
 		}
-		while( rc != RC_TUNE_END );
-
-		Timidity_Stop();
-		Timidity_FreeSong( doomMusic );
+		musicSongsTotal++;
+		idLib::Printf( "classic music: %s started (%.1f s long, %d buffers queued, %.1f ms to load and synthesise the first %d ms)\n",
+				  lumpName.c_str(), doomMusic->samples / ( double )MIDI_RATE, queued, ( Sys_Microseconds() - t0 ) / 1000.0, queued * MUSIC_BUFFER_MS );
+	}
+	else
+	{
+		idLib::Printf( "classic music: %s could not be loaded by Timidity\n", lumpName.c_str() );
 	}
 
 	musicReady = true;
@@ -931,17 +1223,18 @@ void I_PlaySong( const char* songname, int looping )
 		return;
 	}
 
-	I_StopSong( 0 );
-
-	// Clear old state
-	if( musicBuffer )
 	{
-		free( musicBuffer );
-		musicBuffer = 0;
-	}
+		idScopedCriticalSection lock( musicLock );
+		I_MusicReport( "replaced" );
+		I_MusicStopLocked();
 
-	musicReady = false;
-	I_LoadSong( songname );
+		musicReady = false;
+		musicPaused = false;
+		// the stock source always looped (AL_LOOPING); the game asks for it
+		// on everything but the finale's and intermission's one-shots
+		musicLooping = looping != 0;
+		I_LoadSong( songname );
+	}
 	waitingForMusic = true;
 
 	if( DoomLib::GetPlayer() >= 0 )
@@ -972,14 +1265,11 @@ void I_UpdateMusic( void )
 	{
 		if( musicReady && alMusicSourceVoice )
 		{
-			if( musicBuffer )
+			idScopedCriticalSection lock( musicLock );
+			if( musicStreaming && !musicPaused )
 			{
-				alSourcei( alMusicSourceVoice, AL_BUFFER, 0 );
-				alBufferData( alMusicBuffer, MIDI_SAMPLETYPE, musicBuffer, totalBufferSize, MIDI_RATE );
-				alSourcei( alMusicSourceVoice, AL_BUFFER, alMusicBuffer );
 				alSourcePlay( alMusicSourceVoice );
 			}
-
 			waitingForMusic = false;
 		}
 	}
@@ -997,6 +1287,8 @@ void I_PauseSong( int handle )
 		return;
 	}
 
+	idScopedCriticalSection lock( musicLock );
+	musicPaused = true;
 	alSourcePause( alMusicSourceVoice );
 }
 
@@ -1012,7 +1304,12 @@ void I_ResumeSong( int handle )
 		return;
 	}
 
-	alSourcePlay( alMusicSourceVoice );
+	idScopedCriticalSection lock( musicLock );
+	musicPaused = false;
+	if( musicStreaming )
+	{
+		alSourcePlay( alMusicSourceVoice );
+	}
 }
 
 /*
@@ -1027,7 +1324,27 @@ void I_StopSong( int handle )
 		return;
 	}
 
-	alSourceStop( alMusicSourceVoice );
+	idScopedCriticalSection lock( musicLock );
+	I_MusicReport( "stopped" );
+	I_MusicStopLocked();
+}
+
+/*
+======================
+I_MusicStats
+
+The verification (vita_verify_classic.cpp): songs started, underruns, the
+synthesis cost - the current song included.
+======================
+*/
+void I_MusicStats( int* songs, int* underruns, int* chunks, double* synthMsPerSecond )
+{
+	idScopedCriticalSection lock( musicLock );
+	*songs = musicSongsTotal;
+	*underruns = musicUnderrunsTotal + musicUnderruns;
+	*chunks = musicChunksTotal + musicChunks;
+	const double audioS = ( double )( *chunks ) * MUSIC_BUFFER_MS / 1000.0;
+	*synthMsPerSecond = audioS > 0.0 ? ( ( musicSynthUsTotal + musicSynthUs ) / 1000.0 ) / audioS : 0.0;
 }
 
 /*

@@ -3224,7 +3224,10 @@ void idWindow::ReadFromDemoFile(class idDemoFile* f, bool rebuild)
         f->ReadInt(c);
         for (i = 0; i < c; i++) {
             wexpOp_t w;
-            f->ReadInt((int&)w.opType);
+            // wexpOpType_t is a one byte enum on ARM; read through an int.
+            int opType;
+            f->ReadInt(opType);
+            w.opType = (wexpOpType_t)opType;
             f->ReadInt(w.a);
             f->ReadInt(w.b);
             f->ReadInt(w.c);

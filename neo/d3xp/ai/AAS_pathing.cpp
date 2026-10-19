@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "AAS_local.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #define SUBSAMPLE_WALK_PATH 1
 #define SUBSAMPLE_FLY_PATH 0
@@ -78,6 +79,89 @@ idAASLocal::FloorEdgeSplitPoint
   the point has to be on the front side of the frontPlane to be valid
 ============
 */
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+============
+Vita: the floor edges of an area, cached
+
+FloorEdgeSplitPoint runs for every area a walk path crosses and for every
+neighbour it might step into - WalkPathValid, ~150 calls a frame in a fight,
+5 ms of the game/draw thread - and each time walked the area's faces, picked
+the floor ones and fetched every edge and its two vertices from the AAS file:
+mostly cache misses. The vertices of an area's floor edges, in that same
+order, are kept here instead (the AAS geometry never changes during a map;
+only area flags do). Direct-mapped by area, a bump-allocated pool, all of it
+dropped when the pool fills or an AAS file is loaded or freed. Game thread
+only, like the pathing.
+============
+*/
+idCVar vita_floorEdgeVerify("vita_floorEdgeVerify", "0", CVAR_BOOL | CVAR_GAME, "test: run FloorEdgeSplitPoint both ways (cached floor edges and the AAS file walk) and report differences");
+static int vitaFloorChecks, vitaFloorMismatches;
+static const int VITA_FLOOR_SLOTS = 2048;
+static const int VITA_FLOOR_POOL = 12288; // vertices (two per edge)
+struct vitaFloorSlot_t {
+    const idAASFile* file;
+    int area;
+    int first;
+    int count; // edges
+};
+static vitaFloorSlot_t vitaFloorSlots[VITA_FLOOR_SLOTS];
+static idVec3 vitaFloorPool[VITA_FLOOR_POOL];
+static int vitaFloorPoolUsed = 0;
+
+void Vita_FloorEdgeCacheClear()
+{
+    memset(vitaFloorSlots, 0, sizeof(vitaFloorSlots));
+    vitaFloorPoolUsed = 0;
+}
+
+// the vertices (v1, v2 per edge) of the area's floor edges, in the order
+// FloorEdgeSplitPoint visits them; NULL when they do not fit
+static const idVec3* Vita_AreaFloorEdges(idAASFile* file, int areaNum, int& numEdges)
+{
+    vitaFloorSlot_t& slot = vitaFloorSlots[areaNum & (VITA_FLOOR_SLOTS - 1)];
+    if (slot.file == file && slot.area == areaNum) {
+        numEdges = slot.count;
+        return vitaFloorPool + slot.first;
+    }
+    const aasArea_t* area = &file->GetArea(areaNum);
+    int count = 0;
+    for (int i = 0; i < area->numFaces; i++) {
+        const aasFace_t* face = &file->GetFace(abs(file->GetFaceIndex(area->firstFace + i)));
+        if (face->flags & FACE_FLOOR) {
+            count += face->numEdges;
+        }
+    }
+    if (count * 2 > VITA_FLOOR_POOL) {
+        return NULL;
+    }
+    if (vitaFloorPoolUsed + count * 2 > VITA_FLOOR_POOL) {
+        Vita_FloorEdgeCacheClear();
+    }
+    idVec3* out = vitaFloorPool + vitaFloorPoolUsed;
+    int n = 0;
+    for (int i = 0; i < area->numFaces; i++) {
+        const aasFace_t* face = &file->GetFace(abs(file->GetFaceIndex(area->firstFace + i)));
+        if (!(face->flags & FACE_FLOOR)) {
+            continue;
+        }
+        for (int j = 0; j < face->numEdges; j++) {
+            const aasEdge_t* edge = &file->GetEdge(abs(file->GetEdgeIndex(face->firstEdge + j)));
+            out[n * 2 + 0] = file->GetVertex(edge->vertexNum[0]);
+            out[n * 2 + 1] = file->GetVertex(edge->vertexNum[1]);
+            n++;
+        }
+    }
+    slot.file = file;
+    slot.area = areaNum;
+    slot.first = vitaFloorPoolUsed;
+    slot.count = n;
+    vitaFloorPoolUsed += n * 2;
+    numEdges = n;
+    return out;
+}
+#endif
+
 bool idAASLocal::FloorEdgeSplitPoint(idVec3& bestSplit, int areaNum, const idPlane& pathPlane, const idPlane& frontPlane, bool closest) const
 {
     int i, j, faceNum, edgeNum;
@@ -91,6 +175,65 @@ bool idAASLocal::FloorEdgeSplitPoint(idVec3& bestSplit, int areaNum, const idPla
     } else {
         bestDist = -0.1f;
     }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    int numEdges;
+    const idVec3* ev = Vita_AreaFloorEdges(file, areaNum, numEdges);
+    static bool vitaVerifying = false;
+    if (ev != NULL && vita_floorEdgeVerify.GetBool() && !vitaVerifying) {
+        // the file walk below, then the cached path, compared
+        idVec3 walkSplit = bestSplit;
+        idVec3 cachedSplit = bestSplit;
+        vitaVerifying = true;
+        const bool walk = FloorEdgeSplitPoint(walkSplit, areaNum, pathPlane, frontPlane, closest);
+        vitaVerifying = false;
+        vita_floorEdgeVerify.SetBool(false);
+        const bool cached = FloorEdgeSplitPoint(cachedSplit, areaNum, pathPlane, frontPlane, closest);
+        vita_floorEdgeVerify.SetBool(true);
+        vitaFloorChecks++;
+        if (walk != cached || (walk && walkSplit != cachedSplit)) {
+            vitaFloorMismatches++;
+        }
+        if ((vitaFloorChecks % 20000) == 0) {
+            common->Printf("vita_floorEdgeVerify: %d checks, %d mismatches\n", vitaFloorChecks, vitaFloorMismatches);
+        }
+        bestSplit = cachedSplit;
+        return cached;
+    }
+    if (vitaVerifying) {
+        ev = NULL; // the stock walk below
+    }
+    if (ev != NULL) {
+        // EdgeSplitPoint and the selection below, on the cached vertices
+        for (i = 0; i < numEdges; i++) {
+            const idVec3 v1 = ev[i * 2 + 0];
+            const idVec3 v2 = ev[i * 2 + 1];
+            const float d1 = v1 * pathPlane.Normal() - pathPlane.Dist();
+            const float d2 = v2 * pathPlane.Normal() - pathPlane.Dist();
+            if (IEEE_FLT_SIGNBITSET(d1) == IEEE_FLT_SIGNBITSET(d2)) {
+                continue;
+            }
+            split = v1 + (d1 / (d1 - d2)) * (v2 - v1);
+            dist = frontPlane.Distance(split);
+            if (closest) {
+                if (dist >= -0.1f && dist < bestDist) {
+                    bestDist = dist;
+                    bestSplit = split;
+                }
+            } else {
+                if (dist > bestDist) {
+                    bestDist = dist;
+                    bestSplit = split;
+                }
+            }
+        }
+        if (closest) {
+            return (bestDist < maxWalkPathDistance);
+        } else {
+            return (bestDist > -0.1f);
+        }
+    }
+#endif
 
     area = &file->GetArea(areaNum);
 
@@ -139,6 +282,7 @@ idAASLocal::WalkPathValid
 */
 bool idAASLocal::WalkPathValid(int areaNum, const idVec3& origin, int goalAreaNum, const idVec3& goalOrigin, int travelFlags, idVec3& endPos, int& endAreaNum) const
 {
+    VITA_ZONE("aas walk path valid");
     int curAreaNum, lastAreaNum, lastAreas[4], lastAreaIndex;
     idPlane pathPlane, frontPlane, farPlane;
     idReachability* reach;
@@ -251,6 +395,7 @@ idAASLocal::SubSampleWalkPath
 */
 idVec3 idAASLocal::SubSampleWalkPath(int areaNum, const idVec3& origin, const idVec3& start, const idVec3& end, int travelFlags, int& endAreaNum) const
 {
+    VITA_ZONE("aas subsample walk path");
     int i, numSamples, curAreaNum;
     idVec3 dir, point, nextPoint, endPos;
 
@@ -552,6 +697,81 @@ typedef struct wallEdge_s {
     struct wallEdge_s* next;
 } wallEdge_t;
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// VITA_SORT_WALL_EDGES_BEGIN (tools/vita/sortwalledges_test.py cuts this out)
+/*
+============
+Vita_MergeWallEdgeSequences
+
+SortWallEdges' merge loop - the same merges, in the same order, with the same
+result - without its restart. The stock loop starts over from the first
+sequence after every merge: with the 256 wall edges an obstacle search can
+gather, that is millions of comparisons (3.7 ms a frame, 15 ms at worst, in
+the benchmark's Alpha Labs views with soldiers walking around).
+
+Why the restart can go: the stock loop only ever changes a sequence's first
+edge (when it prepends another sequence) - never a last edge, not even when it
+appends, which leaves sequenceLast stale; kept as is. So when the scan reaches
+sequence i, no pair among the earlier ones matches, and after a merge at i the
+only pairs that can have changed are an earlier sequence k against i, and only
+when i got a new first edge: "k's last meets i's first". The restart's scan
+would then stop at the first such k (all of k's other pairs still fail) and
+append i to it. Otherwise it would find nothing before i and rescan i. Both
+are done here directly. tools/vita/sortwalledges_test.py checks it against
+the stock loop on random edge sets, every output entry.
+============
+*/
+static int Vita_MergeWallEdgeSequences(wallEdge_t** sequenceFirst, wallEdge_t** sequenceLast, int numSequences)
+{
+    int i = 0;
+    while (i < numSequences) {
+        int j;
+        bool prepended = false;
+        for (j = i + 1; j < numSequences; j++) {
+            if (sequenceFirst[i]->verts[0] == sequenceLast[j]->verts[1]) {
+                sequenceLast[j]->next = sequenceFirst[i];
+                sequenceFirst[i] = sequenceFirst[j];
+                prepended = true;
+                break;
+            }
+            if (sequenceLast[i]->verts[1] == sequenceFirst[j]->verts[0]) {
+                sequenceLast[i]->next = sequenceFirst[j];
+                break;
+            }
+        }
+        if (j == numSequences) {
+            i++;
+            continue;
+        }
+        numSequences--;
+        for (int k = j; k < numSequences; k++) {
+            sequenceFirst[k] = sequenceFirst[k + 1];
+            sequenceLast[k] = sequenceLast[k + 1];
+        }
+        if (!prepended) {
+            continue; // the stock restart finds nothing before i, then scans i again
+        }
+        // i starts somewhere new: the first earlier sequence ending there takes it
+        int k;
+        for (k = 0; k < i; k++) {
+            if (sequenceLast[k]->verts[1] == sequenceFirst[i]->verts[0]) {
+                break;
+            }
+        }
+        if (k < i) {
+            sequenceLast[k]->next = sequenceFirst[i];
+            numSequences--;
+            for (int m = i; m < numSequences; m++) {
+                sequenceFirst[m] = sequenceFirst[m + 1];
+                sequenceLast[m] = sequenceLast[m + 1];
+            }
+        }
+    }
+    return numSequences;
+}
+// VITA_SORT_WALL_EDGES_END
+#endif
+
 /*
 ============
 idAASLocal::SortWallEdges
@@ -575,6 +795,11 @@ void idAASLocal::SortWallEdges(int* edges, int numEdges) const
     }
     numSequences = numEdges;
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    VITA_ZONE("aas sort wall edges");
+    numSequences = Vita_MergeWallEdgeSequences(sequenceFirst, sequenceLast, numSequences);
+    (void)j;
+#else
     for (i = 0; i < numSequences; i++) {
         for (j = i + 1; j < numSequences; j++) {
             if (sequenceFirst[i]->verts[0] == sequenceLast[j]->verts[1]) {
@@ -596,6 +821,7 @@ void idAASLocal::SortWallEdges(int* edges, int numEdges) const
             i = -1;
         }
     }
+#endif
 
     k = 0;
     for (i = 0; i < numSequences; i++) {
@@ -612,6 +838,7 @@ idAASLocal::GetWallEdges
 */
 int idAASLocal::GetWallEdges(int areaNum, const idBounds& bounds, int travelFlags, int* edges, int maxEdges) const
 {
+    VITA_ZONE("aas wall edges (GetWallEdges)");
     int i, j, k, l, face1Num, face2Num, edge1Num, edge2Num, numEdges, absEdge1Num;
     int *areaQueue, curArea, queueStart, queueEnd;
     byte* areasVisited;

@@ -29,6 +29,9 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "Simd_Generic.h"
+#if defined(__vita__) && defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 //===============================================================
 //
@@ -283,12 +286,61 @@ idSIMD_Generic::BlendJoints
 */
 void VPCALL idSIMD_Generic::BlendJoints(idJointQuat* joints, const idJointQuat* blendJoints, const float lerp, const int* index, const int numJoints)
 {
+#if defined(__vita__)
+    // idQuat::Slerp calls libm's acos and sin three times per joint - every
+    // animation blend of every animated entity, every game tic (5 ms a frame
+    // in a fight). The same slerp as the PC's SSE path instead (its scalar
+    // tail, idSIMD_SSE::BlendJoints): the polynomial ATan16 / Sin16.
+    if (lerp <= 0.0f) {
+        return;
+    } else if (lerp >= 1.0f) {
+        for (int i = 0; i < numJoints; i++) {
+            const int j = index[i];
+            joints[j] = blendJoints[j];
+        }
+        return;
+    }
+    for (int i = 0; i < numJoints; i++) {
+        const int n = index[i];
+
+        idVec3& jointVert = joints[n].t;
+        const idVec3& blendVert = blendJoints[n].t;
+        jointVert[0] += lerp * (blendVert[0] - jointVert[0]);
+        jointVert[1] += lerp * (blendVert[1] - jointVert[1]);
+        jointVert[2] += lerp * (blendVert[2] - jointVert[2]);
+        joints[n].w = 0.0f;
+
+        idQuat& jointQuat = joints[n].q;
+        const idQuat& blendQuat = blendJoints[n].q;
+
+        float cosom = jointQuat.x * blendQuat.x + jointQuat.y * blendQuat.y + jointQuat.z * blendQuat.z + jointQuat.w * blendQuat.w;
+        const bool negative = cosom < 0.0f;
+        if (negative) {
+            cosom = -cosom;
+        }
+        float scale0 = 1.0f - cosom * cosom;
+        scale0 = (scale0 <= 0.0f) ? 1e-10f : scale0;
+        const float sinom = idMath::InvSqrt(scale0);
+        const float omega = idMath::ATan16(scale0 * sinom, cosom);
+        scale0 = idMath::Sin16((1.0f - lerp) * omega) * sinom;
+        float scale1 = idMath::Sin16(lerp * omega) * sinom;
+        if (negative) {
+            scale1 = -scale1;
+        }
+
+        jointQuat.x = scale0 * jointQuat.x + scale1 * blendQuat.x;
+        jointQuat.y = scale0 * jointQuat.y + scale1 * blendQuat.y;
+        jointQuat.z = scale0 * jointQuat.z + scale1 * blendQuat.z;
+        jointQuat.w = scale0 * jointQuat.w + scale1 * blendQuat.w;
+    }
+#else
     for (int i = 0; i < numJoints; i++) {
         int j = index[i];
         joints[j].q.Slerp(joints[j].q, blendJoints[j].q, lerp);
         joints[j].t.Lerp(joints[j].t, blendJoints[j].t, lerp);
         joints[j].w = 0.0f;
     }
+#endif
 }
 
 /*
@@ -338,6 +390,40 @@ idSIMD_Generic::TransformJoints
 */
 void VPCALL idSIMD_Generic::TransformJoints(idJointMat* jointMats, const int* parents, const int firstJoint, const int lastJoint)
 {
+#if defined(__vita__) && defined(__ARM_NEON__)
+    // Every animated entity's skeleton, every frame it is built (idAnimator::
+    // CreateFrame, ~140 times a frame in a fight). idJointMat::operator*= in
+    // NEON, a row at a time: lane c of new row r is m[0][c] * a[r][0] +
+    // m[1][c] * a[r][1] + m[2][c] * a[r][2], in that order, as the scalar
+    // code sums it (VMLA rounds the product before the add, as it does), and
+    // the translation lane then gets a[r][3]; the other lanes get -0, which
+    // changes nothing, signed zeros included (tools/vita/neontest).
+    for (int i = firstJoint; i <= lastJoint; i++) {
+        assert(parents[i] < i);
+        float* m = jointMats[i].ToFloatPtr();
+        const float* a = jointMats[parents[i]].ToFloatPtr();
+        const float32x4_t m0 = vld1q_f32(m + 0);
+        const float32x4_t m1 = vld1q_f32(m + 4);
+        const float32x4_t m2 = vld1q_f32(m + 8);
+        const float32x4_t negZero = vdupq_n_f32(-0.0f);
+        // the parent's rows loaded as vectors and multiplied by lane (as float
+        // scalars, GCC built them through the stack every joint); the
+        // translation is the parent row's lane 3 over -0 elsewhere, selected
+        // bit for bit. The same arithmetic.
+        const uint32x4_t lane3 = vcombine_u32(vdup_n_u32(0), vcreate_u32(0xFFFFFFFF00000000ULL));
+        for (int r = 0; r < 3; r++) {
+            const float32x4_t ar = vld1q_f32(a + r * 4);
+            const float32x2_t a01 = vget_low_f32(ar);
+            const float32x2_t a23 = vget_high_f32(ar);
+            float32x4_t row = vmulq_lane_f32(m0, a01, 0);
+            row = vmlaq_lane_f32(row, m1, a01, 1);
+            row = vmlaq_lane_f32(row, m2, a23, 0);
+            row = vaddq_f32(row, vbslq_f32(lane3, ar, negZero));
+            vst1q_f32(m + r * 4, row);
+        }
+    }
+    return;
+#endif
     for (int i = firstJoint; i <= lastJoint; i++) {
         assert(parents[i] < i);
         jointMats[i] *= jointMats[parents[i]];

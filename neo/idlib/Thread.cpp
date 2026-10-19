@@ -27,6 +27,15 @@ If you have questions concerning this license or the applicable additional terms
 */
 #pragma hdrstop
 #include "precompiled.h"
+#if defined(ID_TEST_MATH_NEON) && !defined(__vita__)
+#include <xmmintrin.h>
+#endif
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
+bool Vita_Core3Available(); // vita_main.cpp
+extern "C" void enable_runfast(); // math-neon: VFP flush-to-zero + default NaN for this thread
+#endif
 
 /*
 ================================================================================================
@@ -49,6 +58,7 @@ idSysThread::idSysThread
 */
 idSysThread::idSysThread()
     : threadHandle(0)
+    , startCore(CORE_ANY)
     , isWorker(false)
     , isRunning(false)
     , isTerminating(false)
@@ -82,6 +92,7 @@ bool idSysThread::StartThread(const char* name_, core_t core, xthreadPriority pr
     }
 
     name = name_;
+    startCore = core;
 
     isTerminating = false;
 
@@ -192,9 +203,91 @@ bool idSysThread::IsWorkDone()
 idSysThread::ThreadProc
 ========================
 */
+#if defined(__vita__)
+// An error raised on a worker (the game/draw thread) is handed to the main
+// thread, which raises it again in its own context (common_frame.cpp): the
+// stock exit(0) below runs the global destructors from this thread, and the
+// game thread's own destructor then waits for itself - a silent freeze.
+char vita_threadError[MAX_PRINT_MSG];
+volatile bool vita_threadErrorPending = false;
+#endif
+
+#if defined(__vita__)
+/*
+========================
+Vita_PlaceThread
+
+The Vita has three cores for games (and a fourth that the system keeps,
+unless a plugin such as CapUnlocker lifts the affinity check). BFG's core
+hints come from the Xbox 360; here CORE_0x/1x/2x pin to cores 0/1/2 and the
+Vita-only value 6 to core 3. The main thread (back end) is pinned to core 0
+at creation (vita_main.cpp) and Game/Draw asks for CORE_1B, so the two
+busiest threads never share a core.
+========================
+*/
+void Vita_RegisterThread(int sceUid); // vita_main.cpp
+void Vita_NameThread(int sceUid, const char* name, int core); // vita_main.cpp: the name and core in the CPU log
+
+static void Vita_PlaceThread(const char* name, core_t core)
+{
+    Vita_RegisterThread(sceKernelGetThreadId());
+#if defined(ID_VITA_NEON_MATH)
+    // the FPSCR is per thread: flush-to-zero + default NaN (off by default,
+    // see the note in idlib/math/Math.h)
+    enable_runfast();
+#endif
+    int mask = 0;
+    switch ((int)core) {
+    case CORE_0A:
+    case CORE_0B:
+        mask = SCE_KERNEL_CPU_MASK_USER_0;
+        break;
+    case CORE_1A:
+    case CORE_1B:
+        mask = SCE_KERNEL_CPU_MASK_USER_1;
+        break;
+    case CORE_2A:
+    case CORE_2B:
+        mask = SCE_KERNEL_CPU_MASK_USER_2;
+        break;
+    case 6:
+        if (Vita_Core3Available()) {
+            mask = SCE_KERNEL_CPU_MASK_SYSTEM; // core 3
+        }
+        break;
+    case 7:
+        // the job workers: cores 1 and 2 (see VITA_JOB_THREAD_CORES)
+        mask = SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2;
+        break;
+    case 8:
+        // the sound worker (AL_SoundStream.cpp): cores 0 and 2, off Game/Draw's
+        mask = SCE_KERNEL_CPU_MASK_USER_0 | SCE_KERNEL_CPU_MASK_USER_2;
+        break;
+    default:
+        // CORE_ANY: any of the game's cores 0-2, never core 3 (which the OS
+        // takes when it wants - only work nothing waits for goes there)
+        mask = SCE_KERNEL_CPU_MASK_USER_ALL;
+        break;
+    }
+    Vita_NameThread(sceKernelGetThreadId(), name, mask == SCE_KERNEL_CPU_MASK_SYSTEM ? 3 : (mask == SCE_KERNEL_CPU_MASK_USER_2 ? 2 : (mask == SCE_KERNEL_CPU_MASK_USER_1 ? 1 : (mask == SCE_KERNEL_CPU_MASK_USER_0 ? 0 : -1))));
+    if (mask == 0) {
+        return;
+    }
+    const int r = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), mask);
+    idLib::Printf("vita: thread '%s' pinned to %s%s\n", name,
+        mask == SCE_KERNEL_CPU_MASK_SYSTEM ? "core 3" : (mask == SCE_KERNEL_CPU_MASK_USER_2 ? "core 2" : (mask == SCE_KERNEL_CPU_MASK_USER_1 ? "core 1" : (mask == SCE_KERNEL_CPU_MASK_USER_0 ? "core 0" : (mask == (SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2) ? "cores 1-2" : (mask == (SCE_KERNEL_CPU_MASK_USER_0 | SCE_KERNEL_CPU_MASK_USER_2) ? "cores 0 and 2" : "cores 0-2"))))),
+        r < 0 ? va(" - refused (0x%08X), left to the scheduler", (unsigned int)r) : "");
+}
+#endif
+
 int idSysThread::ThreadProc(idSysThread* thread)
 {
     int retVal = 0;
+#if defined(__vita__)
+    Vita_PlaceThread(thread->name.c_str(), thread->startCore);
+#elif defined(ID_TEST_MATH_NEON)
+    _mm_setcsr(_mm_getcsr() | 0x8040); // flush-to-zero + denormals-are-zero, like the Vita's RunFast
+#endif
 
     try {
         if (thread->isWorker) {
@@ -215,7 +308,16 @@ int idSysThread::ThreadProc(idSysThread* thread)
                     break;
                 }
 
+#if defined(__vita__)
+                try {
+                    retVal = thread->Run();
+                } catch (idException& ex) {
+                    idStr::Copynz(vita_threadError, ex.GetError(), sizeof(vita_threadError));
+                    vita_threadErrorPending = true;
+                }
+#else
                 retVal = thread->Run();
+#endif
             }
             thread->signalWorkerDone.Raise();
         } else {

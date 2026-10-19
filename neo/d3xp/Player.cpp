@@ -27,6 +27,7 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "precompiled.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 #pragma hdrstop
 
 #include "Game_local.h"
@@ -3217,6 +3218,15 @@ void idPlayer::ClearChatMessage(int index)
 idPlayer::DrawHUD
 ===============
 */
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+bool idPlayer::VitaHudShown() const
+{
+    // DrawHUD's own early outs
+    return weapon.GetEntity() != NULL && influenceActive == INFLUENCE_NONE && privateCameraView == NULL && gameLocal.GetCamera() == NULL
+        && g_showHud.GetBool() && !spectating;
+}
+#endif
+
 void idPlayer::DrawHUD(idMenuHandler_HUD* _hudManager)
 {
     SCOPED_PROFILE_EVENT("idPlayer::DrawHUD");
@@ -3366,6 +3376,7 @@ idPlayer::UpdateConditions
 */
 void idPlayer::UpdateConditions()
 {
+    VITA_ZONE("player conditions");
     idVec3 velocity;
     float fallspeed;
     float forwardspeed;
@@ -4743,6 +4754,27 @@ void idPlayer::SelectWeapon(int num, bool force)
 
 /*
 =================
+idPlayer::VitaBotSelectWeapon
+=================
+*/
+bool idPlayer::VitaBotSelectWeapon(int num)
+{
+    if (!weaponEnabled || spectating || health <= 0 || num < 0 || num >= MAX_WEAPONS || num == weapon_flashlight || num == weapon_pda) {
+        return false;
+    }
+    const char* weap = spawnArgs.GetString(va("def_weapon%d", num));
+    if (!weap[0] || !(inventory.weapons & (1 << num))) {
+        return false;
+    }
+    if (!inventory.HasAmmo(weap, true, this) && !spawnArgs.GetBool(va("weapon%d_allowempty", num))) {
+        return false;
+    }
+    idealWeapon = num;
+    return true;
+}
+
+/*
+=================
 idPlayer::DropWeapon
 =================
 */
@@ -5112,6 +5144,7 @@ idPlayer::UpdateWeapon
 */
 void idPlayer::UpdateWeapon()
 {
+    VITA_ZONE("player weapon");
     if (health <= 0) {
         return;
     }
@@ -5176,6 +5209,7 @@ idPlayer::UpdateFlashLight
 */
 void idPlayer::UpdateFlashlight()
 {
+    VITA_ZONE("player flashlight");
     if (idealWeapon == weapon_flashlight) {
         // force classic flashlight to go away
         NextWeapon();
@@ -5218,6 +5252,7 @@ void idPlayer::UpdateFlashlight()
     }
 
     if (hud) {
+        VITA_ZONE("player flashlight: HUD battery meter");
         hud->UpdateFlashlight(this);
     }
 
@@ -5567,6 +5602,7 @@ Searches nearby locations
 */
 void idPlayer::UpdateLocation()
 {
+    VITA_ZONE("player location");
 
     if (hud) {
         hud->UpdateLocation(this);
@@ -5599,6 +5635,7 @@ the focus and sending it a mouse move event
 */
 void idPlayer::UpdateFocus()
 {
+    VITA_ZONE("player focus");
     idClipModel* clipModelList[MAX_GENTITIES];
     idClipModel* clip;
     int listedClipModels;
@@ -6406,6 +6443,7 @@ void idPlayer::UpdateAir()
 
 void idPlayer::UpdatePowerupHud()
 {
+    VITA_ZONE("player powerup hud");
 
     if (health <= 0) {
         return;
@@ -6722,6 +6760,7 @@ idPlayer::EvaluateControls
 */
 void idPlayer::EvaluateControls()
 {
+    VITA_ZONE("player controls");
     // check for respawning
     if (health <= 0 && !g_testDeath.GetBool()) {
         if (common->IsMultiplayer()) {
@@ -7117,6 +7156,7 @@ idPlayer::Move
 */
 void idPlayer::Move()
 {
+    VITA_ZONE("player move");
     float newEyeOffset;
     idVec3 oldOrigin;
     idVec3 oldVelocity;
@@ -7418,6 +7458,7 @@ idPlayer::UpdateHud
 */
 void idPlayer::UpdateHud()
 {
+    VITA_ZONE("player hud");
     idPlayer* aimed;
 
     if (!hud) {
@@ -7727,6 +7768,12 @@ void idPlayer::Think()
         // ...then correct if needed.
         RunPhysics_RemoteClientCorrection();
     }
+#if defined(VITA_PHYSCHECK)
+    if (IsLocallyControlled() && !noclip && !spectating && health > 0) {
+        Vita_PhysCheck_Player(physicsObj.HasGroundContacts(), physicsObj.IsCrouching(), (usercmd.buttons & BUTTON_RUN) != 0,
+            usercmd.forwardmove, usercmd.rightmove, (usercmd.buttons & BUTTON_JUMP) != 0, physicsObj.GetLinearVelocity(), physicsObj.GetOrigin().z);
+    }
+#endif
 
     if (!g_stopTime.GetBool()) {
 
@@ -9124,6 +9171,7 @@ idPlayer::CalculateFirstPersonView
 */
 void idPlayer::CalculateFirstPersonView()
 {
+    VITA_ZONE("player first-person view");
     if ((pm_modelView.GetInteger() == 1) || ((pm_modelView.GetInteger() == 2) && (health <= 0))) {
         //	Displays the view from the point of view of the "camera" joint in the player model
 
@@ -9169,6 +9217,7 @@ create the renderView for the current tic
 */
 void idPlayer::CalculateRenderView()
 {
+    VITA_ZONE("player render view");
     int i;
     float range;
 

@@ -337,6 +337,9 @@ private:
     const idDeclParticle* smokeFly;
     int smokeFlyTime;
     const idSoundShader* sndBounce;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    int vitaLaunchTime = 0; // vita_debrisMaxMoveMs
+#endif
 
     void Event_Explode();
     void Event_Fizzle();

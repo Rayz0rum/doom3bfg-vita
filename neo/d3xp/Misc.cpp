@@ -227,7 +227,11 @@ void idPlayerStart::Event_TeleportPlayer(idEntity* activator)
 {
     idPlayer* player;
 
-    if (activator->IsType(idPlayer::Type)) {
+    // the activator can be gone: a delayed activation resolves its entity
+    // when it fires, and one removed in between (a monster killed and burned
+    // away - the Vita benchmark's EnPro fight hit it) comes through as NULL.
+    // Treated like any other activator that is not the player.
+    if (activator != NULL && activator->IsType(idPlayer::Type)) {
         player = static_cast<idPlayer*>(activator);
     } else {
         player = gameLocal.GetLocalPlayer();
@@ -2280,7 +2284,7 @@ void idVacuumSeparatorEntity::Restore(idRestoreGame* savefile)
 {
     int state;
 
-    savefile->ReadInt((int&)portal);
+    savefile->ReadEnum(portal);
     savefile->ReadInt(state);
 
     gameLocal.SetPortalState(portal, state);
@@ -3004,7 +3008,7 @@ idFuncPortal::Restore
 */
 void idFuncPortal::Restore(idRestoreGame* savefile)
 {
-    savefile->ReadInt((int&)portal);
+    savefile->ReadEnum(portal);
     savefile->ReadBool(state);
     gameLocal.SetPortalState(portal, state ? PS_BLOCK_ALL : PS_BLOCK_NONE);
 }
@@ -3253,7 +3257,7 @@ idFuncRadioChatter::Event_ResetRadioHud
 */
 void idFuncRadioChatter::Event_ResetRadioHud(idEntity* activator)
 {
-    idPlayer* player = (activator->IsType(idPlayer::Type)) ? static_cast<idPlayer*>(activator) : gameLocal.GetLocalPlayer();
+    idPlayer* player = (activator != NULL && activator->IsType(idPlayer::Type)) ? static_cast<idPlayer*>(activator) : gameLocal.GetLocalPlayer();
 
     if (player != NULL && player->hudManager) {
         player->hudManager->SetRadioMessage(false);
@@ -3880,7 +3884,7 @@ idFuncMountedObject::Event_Activate
 */
 void idFuncMountedObject::Event_Activate(idEntity* activator)
 {
-    if (!isMounted && activator->IsType(idPlayer::Type)) {
+    if (!isMounted && activator != NULL && activator->IsType(idPlayer::Type)) {
         idPlayer* client = (idPlayer*)activator;
 
         mountedPlayer = client;

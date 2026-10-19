@@ -525,6 +525,12 @@ private: // collision map data
     int maxModels;
     int numModels;
     cm_model_t** models;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // names LoadModel found no collision model for, until the map changes
+    // (CollisionModel_load.cpp)
+    idStrList vitaNoModelNames;
+    idHashIndex vitaNoModelHash;
+#endif
     // polygons and brush for trm model
     cm_polygonRef_t* trmPolygons[MAX_TRACEMODEL_POLYS];
     cm_brushRef_t* trmBrushes[1];

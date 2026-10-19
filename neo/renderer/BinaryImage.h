@@ -45,6 +45,16 @@ public:
     {
     }
 
+#if defined(__vita__)
+    // Set before LoadFromGeneratedFile: top mip levels the Vita would drop
+    // (R_VitaSkipLevels for this image, name and usage) are skipped over in
+    // the file instead of read - most of a texture's bytes are in its top level.
+    const char* vitaImageName = NULL;
+    textureUsage_t vitaUsage = TD_DEFAULT;
+    int vitaSkipRequest = 0;
+    int vitaSkipped = 0; // result: levels below this have no data
+#endif
+
     const char* GetName() const
     {
         return imgName.c_str();

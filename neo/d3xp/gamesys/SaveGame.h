@@ -54,6 +54,17 @@ public:
     void Write(const void* buffer, int len);
     void WriteInt(const int value);
     void WriteJoint(const jointHandle_t value);
+
+    // Enums are not ints. ARM EABI defaults to -fshort-enums, so most game enums
+    // are a single byte there; WriteInt( (int&)e ) then reads three bytes past
+    // the object and ReadInt( (int&)e ) writes three bytes past it, which is how
+    // loading a savegame corrupts the heap. These keep the four byte on-disk
+    // format the save files have always used while touching only the enum.
+    template<class T>
+    void WriteEnum(const T value)
+    {
+        WriteInt(static_cast<int>(value));
+    }
     void WriteShort(const short value);
     void WriteByte(const byte value);
     void WriteSignedChar(const signed char value);
@@ -138,6 +149,15 @@ public:
     void Read(void* buffer, int len);
     void ReadInt(int& value);
     void ReadJoint(jointHandle_t& value);
+
+    // See idSaveGame::WriteEnum.
+    template<class T>
+    void ReadEnum(T& value)
+    {
+        int i;
+        ReadInt(i);
+        value = static_cast<T>(i);
+    }
     void ReadShort(short& value);
     void ReadByte(byte& value);
     void ReadSignedChar(signed char& value);

@@ -195,7 +195,72 @@ private:
     float maxJointVertDist;   // maximum distance a vertex is separated from a joint
     deformInfo_t* deformInfo; // used to create srfTriangles_t from base frames and new vertexes
     int surfaceNum;           // number of the static surface created for this mesh
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    mutable float vitaWeightSumMax; // the largest sum of a vertex's skinning weights (bytes / 255, can top 1), < 0 not measured yet
+    // render model traces: the triangles in groups, by the heaviest joint of
+    // their first vertex, each with the joints its vertices hang on and how
+    // far from those joints they reach (VitaBuildTraceGroups)
+    void VitaBuildTraceGroups(const idJointMat* invertedDefaultPose) const;
+    void VitaFreeTraceGroups() const;
+    mutable const deformInfo_t* vitaGroupsOf; // the deformInfo they were built from, NULL not built
+    mutable int vitaNumGroups;
+    mutable struct vitaTraceGroup_t* vitaGroups;
+    mutable byte* vitaGroupJoints;
+    mutable triIndex_t* vitaGroupVerts;
+    mutable triIndex_t* vitaGroupIndexes;
+    mutable int* vitaGroupTriPos;
+#endif
+#if defined(__vita__)
+    // the base vertices' unit normals and tangents for the skin, made the
+    // first time the mesh is skinned (8 floats a vertex; Model_md5.cpp)
+    const float* VitaUnitNormals() const;
+    mutable float* vitaUnitNT;
+#endif
 };
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+struct localTrace_t; // tr_local.h
+struct vitaTraceGroup_t {
+    int firstJoint, numJoints;   // into vitaGroupJoints
+    int firstVert, numVerts;     // into vitaGroupVerts: the mesh vertices its triangles use, each once
+    int firstTri, numTris;       // into vitaGroupIndexes (three each) and vitaGroupTriPos
+    float dist;                  // the farthest any of its vertices is from one of its joints, in the base pose
+};
+#endif
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// Vita: an animated model's posed positions, for render model traces
+// (idRenderModelMD5::VitaPoseForTrace, RenderWorld.cpp)
+static const int VITA_POSED_MAX_MESHES = 32;
+struct vitaPosedMesh_t {
+    const idMaterial* shader;  // the mesh's own material, as the snapshot's surface holds it
+    const triIndex_t* indexes;
+    int numIndexes;
+    int numVerts;
+    int firstVert;             // into vitaPosedModel_t::xyz
+    int mesh;                  // the mesh's index in the model
+    bool reachValid;           // false: no joints to bound it by (never skipped)
+    idBounds reach;            // holds every position the mesh can have in this pose
+    int firstGroup;            // its trace groups, into vitaPosedModel_t::groups
+    int numGroups;
+};
+struct vitaPosedGroup_t {
+    bool posed;                // its vertices' positions are in xyz (VitaTraceMesh)
+    bool reachValid;           // false: no joints to bound it by (never skipped)
+    idBounds reach;           // holds every position its vertices can have in this pose, known before posing them
+    idBounds bounds;           // of its posed positions (once posed)
+};
+struct vitaPosedModel_t {
+    int numMeshes;
+    vitaPosedMesh_t meshes[VITA_POSED_MAX_MESHES];
+    idVec3* xyz;
+    int maxVerts;
+    idJointMat* joints;        // the pose's skinning matrices (the snapshot's jointsInverted)
+    int maxJoints;
+    vitaPosedGroup_t* groups;
+    int maxGroups;
+};
+#endif
 
 class idRenderModelMD5 : public idRenderModelStatic {
 public:
@@ -222,6 +287,12 @@ public:
     {
         return true;
     }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    bool VitaPoseForTrace(const struct renderEntity_s* ent, vitaPosedModel_t& posed) const;
+    localTrace_t VitaTraceMesh(vitaPosedModel_t& posed, int posedMesh, const idVec3& localStart, const idVec3& localEnd, float radius) const;
+    int VitaMeshNearestJoint(int mesh, int a, int b, int c) const;
+#endif
 
 private:
     idList<idMD5Joint, TAG_MODEL> joints;

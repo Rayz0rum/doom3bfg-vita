@@ -32,6 +32,13 @@ If you have questions concerning this license or the applicable additional terms
 #ifndef __QGL_H__
 #define __QGL_H__
 
+#if defined(__vita__)
+
+// The Vita uses vitaGL; <GL/gl.h> here is TinyGL's and glext.h is desktop-only.
+#include "qgl_vita.h"
+
+#else
+
 #include <GL/gl.h>
 
 #ifndef APIENTRY
@@ -49,6 +56,8 @@ If you have questions concerning this license or the applicable additional terms
 
 #endif
 
+#endif // __vita__
+
 typedef void (*GLExtension_t)(void);
 
 #ifdef __cplusplus
@@ -61,6 +70,8 @@ GLExtension_t GLimp_ExtensionPointer(const char* name, bool tryAddingARB = false
 }
 #endif
 
+#if !defined(__vita__)
+// On the Vita these are supplied by qgl_vita.h as direct mappings onto vitaGL.
 // GL_EXT_direct_state_access
 extern PFNGLBINDMULTITEXTUREEXTPROC qglBindMultiTextureEXT;
 
@@ -161,11 +172,12 @@ extern PFNGLDEBUGMESSAGECONTROLARBPROC qglDebugMessageControlARB;
 extern PFNGLDEBUGMESSAGEINSERTARBPROC qglDebugMessageInsertARB;
 extern PFNGLDEBUGMESSAGECALLBACKARBPROC qglDebugMessageCallbackARB;
 extern PFNGLGETDEBUGMESSAGELOGARBPROC qglGetDebugMessageLogARB;
+#endif // !__vita__
 
 //===========================================================================
 
 // non-windows systems will just redefine qgl* to gl*
-#if defined(__APPLE__) || defined(ID_GL_HARDLINK)
+#if defined(__APPLE__) || defined(ID_GL_HARDLINK) || defined(__vita__)
 
 #include "qgl_linked.h"
 

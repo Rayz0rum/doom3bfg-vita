@@ -32,6 +32,12 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "WaveFile.h"
 
+// Compressed, streamed sound playback (OpenAL/AL_SoundStream.h). The Vita
+// cannot afford the stock path, which holds every sample as PCM twice over.
+#if defined(USE_OPENAL) && (defined(__vita__) || defined(ID_SOUND_STREAM_TEST))
+#define ID_SOUND_STREAM 1
+#endif
+
 // Maximum number of voices we can have allocated
 #define MAX_HARDWARE_VOICES 48
 
@@ -100,6 +106,7 @@ typedef enum {
 #include <AL/alc.h>
 #include <AL/alext.h>
 
+#include "OpenAL/AL_SoundStream.h"
 #include "OpenAL/AL_SoundSample.h"
 #include "OpenAL/AL_SoundVoice.h"
 #include "OpenAL/AL_SoundHardware.h"
@@ -348,6 +355,8 @@ public:
     };
 
     void ResolveOrigin(const int stackDepth, const soundPortalTrace_t* prevStack, const int soundArea, const float dist, const idVec3& soundOrigin, idSoundEmitterLocal* def);
+    static int resolveSteps; // portal steps walked (s_occlusionVerify)
+    static bool resolveBound; // s_occlusionBound for the walk in progress
 };
 
 /*
@@ -405,6 +414,12 @@ public:
 
     //----- set by Update -----
     int lastValidPortalArea;
+    // the area its origin was last found in (PointInArea, every frame for
+    // every audible emitter - most never move): asked again only when the
+    // origin or the render world changes
+    idVec3 areaCacheOrigin;
+    int areaCacheArea;
+    const idRenderWorld* areaCacheWorld;
     float directDistance;
     float spatializedDistance;
     idVec3 spatializedOrigin;

@@ -240,13 +240,13 @@ void idMover::Restore(idRestoreGame* savefile)
     savefile->ReadStaticObject(physicsObj);
     RestorePhysics(&physicsObj);
 
-    savefile->ReadInt((int&)move.stage);
+    savefile->ReadEnum(move.stage);
     savefile->ReadInt(move.acceleration);
     savefile->ReadInt(move.movetime);
     savefile->ReadInt(move.deceleration);
     savefile->ReadVec3(move.dir);
 
-    savefile->ReadInt((int&)rot.stage);
+    savefile->ReadEnum(rot.stage);
     savefile->ReadInt(rot.acceleration);
     savefile->ReadInt(rot.movetime);
     savefile->ReadInt(rot.deceleration);
@@ -268,7 +268,7 @@ void idMover::Restore(idRestoreGame* savefile)
     savefile->ReadInt(acceltime);
     savefile->ReadBool(stopRotation);
     savefile->ReadBool(useSplineAngles);
-    savefile->ReadInt((int&)lastCommand);
+    savefile->ReadEnum(lastCommand);
     savefile->ReadFloat(damage);
 
     savefile->ReadInt(areaPortal);
@@ -1721,7 +1721,7 @@ void idElevator::Restore(idRestoreGame* savefile)
 {
     int i, num;
 
-    savefile->ReadInt((int&)state);
+    savefile->ReadEnum(state);
 
     savefile->ReadInt(num);
     for (i = 0; i < num; i++) {
@@ -2334,7 +2334,7 @@ void idMover_Binary::Restore(idRestoreGame* savefile)
 
     savefile->ReadVec3(pos1);
     savefile->ReadVec3(pos2);
-    savefile->ReadInt((int&)moverState);
+    savefile->ReadEnum(moverState);
 
     savefile->ReadObject(reinterpret_cast<idClass*&>(moveMaster));
     savefile->ReadObject(reinterpret_cast<idClass*&>(activateChain));
@@ -2746,6 +2746,11 @@ idMover_Binary::Event_Reached_BinaryMover
 */
 void idMover_Binary::Event_Reached_BinaryMover()
 {
+#if defined(VITA_PHYSCHECK)
+    if (moverState == MOVER_1TO2 || moverState == MOVER_2TO1) {
+        Vita_PhysCheck_Door(name.c_str(), gameLocal.slow.time - stateStartTime, duration);
+    }
+#endif
 
     if (moverState == MOVER_1TO2) {
         // reached pos2
@@ -3729,6 +3734,13 @@ idDoor::Lock
 void idDoor::Lock(int f)
 {
     idMover_Binary* other;
+
+    {
+        extern idCVar vita_logStory;
+        if (vita_logStory.GetBool()) {
+            common->Printf("story [%d ms]: door '%s' %s\n", gameLocal.time, name.c_str(), f ? va("locked (%d)", f) : "unlocked");
+        }
+    }
 
     // lock all the doors on the team
     for (other = moveMaster; other != NULL; other = other->GetActivateChain()) {

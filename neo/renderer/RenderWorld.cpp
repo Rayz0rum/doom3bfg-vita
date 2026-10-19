@@ -30,6 +30,13 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
+#include "Model_local.h"            // idRenderModelMD5::VitaPoseForTrace
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_posedTraces("vita_posedTraces", "1", CVAR_RENDERER | CVAR_BOOL, "render model traces against an animated model without a render snapshot pose its positions alone instead of building the snapshot");
+idCVar vita_posedTracesVerify("vita_posedTracesVerify", "0", CVAR_RENDERER | CVAR_BOOL, "test: also trace each posed trace against a full snapshot built aside, and report any result that differs");
+#endif
 
 /*
 ===================
@@ -195,21 +202,46 @@ void idRenderWorldLocal::ResizeInteractionTable()
 
     const int oldInteractionTableWidth = interactionTableWidth;
     const int oldIinteractionTableHeight = interactionTableHeight;
-    idInteraction** oldInteractionTable = interactionTable;
+    idInteraction*** oldInteractionTable = interactionTable;
 
     // build the interaction table
     // this will be dynamically resized if the entity / light counts grow too much
-    interactionTableWidth = entityDefs.Num() + 100;
-    interactionTableHeight = lightDefs.Num() + 100;
-    const int size = interactionTableWidth * interactionTableHeight * sizeof(*interactionTable);
-    interactionTable = (idInteraction**)R_ClearedStaticAlloc(size);
+    AllocInteractionTable();
     for (int l = 0; l < oldIinteractionTableHeight; l++) {
         for (int e = 0; e < oldInteractionTableWidth; e++) {
-            interactionTable[l * interactionTableWidth + e] = oldInteractionTable[l * oldInteractionTableWidth + e];
+            interactionTable[l][e] = oldInteractionTable[l][e];
         }
     }
 
-    R_StaticFree(oldInteractionTable);
+    FreeInteractionTable(oldInteractionTable, oldIinteractionTableHeight);
+}
+
+/*
+===================
+AllocInteractionTable / FreeInteractionTable
+
+A row per light (see interactionTable in RenderWorld_local.h).
+===================
+*/
+void idRenderWorldLocal::AllocInteractionTable()
+{
+    interactionTableWidth = entityDefs.Num() + 100;
+    interactionTableHeight = lightDefs.Num() + 100;
+    interactionTable = (idInteraction***)R_ClearedStaticAlloc(interactionTableHeight * sizeof(*interactionTable));
+    for (int l = 0; l < interactionTableHeight; l++) {
+        interactionTable[l] = (idInteraction**)R_ClearedStaticAlloc(interactionTableWidth * sizeof(**interactionTable));
+    }
+}
+
+void idRenderWorldLocal::FreeInteractionTable(idInteraction*** table, int height)
+{
+    if (table == NULL) {
+        return;
+    }
+    for (int l = 0; l < height; l++) {
+        R_StaticFree(table[l]);
+    }
+    R_StaticFree(table);
 }
 
 /*
@@ -815,8 +847,11 @@ void idRenderWorldLocal::RenderScene(const renderView_t* renderView)
     }
 
     // close any gui drawing
-    tr.guiModel->EmitFullScreen();
-    tr.guiModel->Clear();
+    {
+        GD_SCOPE("2D drawn before the view (guiModel->EmitFullScreen)");
+        tr.guiModel->EmitFullScreen();
+        tr.guiModel->Clear();
+    }
 
     int startTime = Sys_Microseconds();
 
@@ -871,7 +906,10 @@ void idRenderWorldLocal::RenderScene(const renderView_t* renderView)
     // for mirrors / portals / shadows / environment maps
     // this will also cause any necessary entities and lights to be
     // updated to the demo file
-    R_RenderView(parms);
+    {
+        GD_SCOPE("front end (R_RenderView)");
+        R_RenderView(parms);
+    }
 
     // render any post processing after the view and all its subviews has been draw
     R_RenderPostProcess(parms);
@@ -1165,6 +1203,278 @@ guiPoint_t idRenderWorldLocal::GuiTrace(qhandle_t entityHandle, const idVec3 sta
     return pt;
 }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+===================
+Vita: posed positions for render model traces
+
+A render model trace (bullets, projectiles, the flashlight, monsters aiming)
+against an animated model used to build the model's whole render snapshot -
+every vertex skinned with its normal and tangent, on the CPU, as GPU skinning
+is off here - just to test the trace against its triangles. The game drops an
+animated entity's snapshot each time it updates the entity (every tic for a
+monster on the move), mostly before anything draws it, so in fights those
+skins cost the game 3-9 ms a frame for nothing.
+
+When the entity has no snapshot, a trace now poses only the positions - the
+same meshes, joints and arithmetic (idRenderModelMD5::VitaPoseForTrace), so
+the very numbers the snapshot would hold - and keeps them here until the
+entity changes, for the traces after it. Everything around it is done as
+R_EntityDefDynamicModel does it: the entity's callback (an animated entity
+poses its joints for the current game time there) is issued at the same
+points, an update drops the posed copy as it drops a snapshot, and a posed
+copy made this frame stands for the frame's snapshot - later traces in the
+frame use it without asking the callback again, as they would the snapshot.
+So a trace sees the very pose it saw before. A snapshot that exists is
+still used as it was; other model kinds take the stock path.
+
+Game/draw thread only, like the traces.
+===================
+*/
+static const int VITA_TRACE_SLOTS = 8;
+struct vitaTraceSlot_t {
+    const idRenderEntityLocal* owner;
+    bool valid;
+    int lastUse;
+    int frameCount; // tr.frameCount when posed: this frame's "snapshot"
+    vitaPosedModel_t posed;
+};
+static vitaTraceSlot_t vitaTraceSlots[VITA_TRACE_SLOTS];
+static int vitaTraceUseCount;
+
+void Vita_TraceCacheInvalidate(idRenderEntityLocal* def)
+{
+    const int s = def->vitaTraceSlot;
+    if (s >= 0 && s < VITA_TRACE_SLOTS && vitaTraceSlots[s].owner == def) {
+        vitaTraceSlots[s].valid = false;
+    }
+}
+
+static vitaTraceSlot_t* Vita_TraceSlotOf(const idRenderEntityLocal* def)
+{
+    const int s = def->vitaTraceSlot;
+    if (s >= 0 && s < VITA_TRACE_SLOTS && vitaTraceSlots[s].owner == def && vitaTraceSlots[s].valid) {
+        return &vitaTraceSlots[s];
+    }
+    return NULL;
+}
+
+/*
+===================
+Vita_PosedForTrace
+
+R_EntityDefDynamicModel's steps for an animated MD5 model with no snapshot
+this frame, posing positions instead of building a snapshot. NULL: use the
+stock path (a snapshot is valid, or the model cannot be posed here).
+===================
+*/
+static vitaPosedModel_t* Vita_PosedForTrace(idRenderEntityLocal* def, const idRenderModelMD5* md5)
+{
+    vitaTraceUseCount++;
+
+    // posed this frame and not changed since: as the frame's snapshot would be
+    vitaTraceSlot_t* slot = Vita_TraceSlotOf(def);
+    if (slot != NULL && slot->frameCount == tr.frameCount) {
+        slot->lastUse = vitaTraceUseCount;
+        return &slot->posed;
+    }
+
+    // the deferred update, as R_EntityDefDynamicModel issues it
+    if (def->parms.callback != NULL) {
+        if (R_IssueEntityDefCallback(def)) {
+            R_ClearEntityDefDynamicModel(def); // (drops the posed copy too)
+        }
+    }
+    if (def->dynamicModel != NULL) {
+        // a snapshot from an earlier frame is still good: the stock path
+        // returns it (its callback, asked again, finds nothing to do)
+        return NULL;
+    }
+    slot = Vita_TraceSlotOf(def);
+    if (slot != NULL) {
+        // posed in an earlier frame and unchanged since; like a snapshot in
+        // that case, it keeps its frame (the next trace asks the callback again)
+        slot->lastUse = vitaTraceUseCount;
+        return &slot->posed;
+    }
+
+    int s = def->vitaTraceSlot;
+    if (s < 0 || s >= VITA_TRACE_SLOTS || vitaTraceSlots[s].owner != def) {
+        // the least recently used slot
+        s = 0;
+        for (int i = 1; i < VITA_TRACE_SLOTS; i++) {
+            if (vitaTraceSlots[i].lastUse < vitaTraceSlots[s].lastUse) {
+                s = i;
+            }
+        }
+        vitaTraceSlots[s].owner = def;
+        def->vitaTraceSlot = s;
+    }
+    vitaTraceSlot_t& fresh = vitaTraceSlots[s];
+    fresh.valid = false;
+    fresh.lastUse = vitaTraceUseCount;
+    VITA_ZONE("model trace: set up a pose (no snapshot: joints + mesh reach)");
+    if (!md5->VitaPoseForTrace(&def->parms, fresh.posed)) {
+        return NULL;
+    }
+    fresh.valid = true;
+    fresh.frameCount = tr.frameCount;
+    return &fresh.posed;
+}
+
+/*
+===================
+Vita_ModelTracePosed
+
+The rest of ModelTrace, against the posed positions.
+===================
+*/
+static bool Vita_ModelTracePosed(modelTrace_t& trace, idRenderEntityLocal* def, const idRenderModelMD5* md5, vitaPosedModel_t& posed,
+    const idVec3& start, const idVec3& end, const float radius)
+{
+    VITA_ZONE("model trace: triangles");
+    renderEntity_t* refEnt = &def->parms;
+
+    // transform the points into local space
+    float modelMatrix[16];
+    idVec3 localStart;
+    idVec3 localEnd;
+    R_AxisToModelMatrix(refEnt->axis, refEnt->origin, modelMatrix);
+    R_GlobalPointToLocal(modelMatrix, start, localStart);
+    R_GlobalPointToLocal(modelMatrix, end, localEnd);
+
+    // if we have explicit collision surfaces, only collide against them
+    bool collisionSurface = false;
+    for (int i = 0; i < posed.numMeshes; i++) {
+        const idMaterial* shader = R_RemapShaderBySkin(posed.meshes[i].shader, def->parms.customSkin, def->parms.customShader);
+        if (shader->GetSurfaceFlags() & SURF_COLLISION) {
+            collisionSurface = true;
+            break;
+        }
+    }
+
+    for (int i = 0; i < posed.numMeshes; i++) {
+        const vitaPosedMesh_t& mesh = posed.meshes[i];
+        const idMaterial* shader = R_RemapShaderBySkin(mesh.shader, def->parms.customSkin, def->parms.customShader);
+        if (shader == NULL) {
+            continue;
+        }
+        if (collisionSurface) {
+            // only trace vs collision surfaces
+            if ((shader->GetSurfaceFlags() & SURF_COLLISION) == 0) {
+                continue;
+            }
+        } else {
+            // skip if not drawn or translucent
+            if (!shader->IsDrawn() || (shader->Coverage() != MC_OPAQUE && shader->Coverage() != MC_PERFORATED)) {
+                continue;
+            }
+        }
+
+        // only the parts of the mesh the trace can reach are posed and tested
+        // (idRenderModelMD5::VitaTraceMesh)
+        localTrace_t localTrace = md5->VitaTraceMesh(posed, i, localStart, localEnd, radius);
+
+        if (localTrace.fraction < trace.fraction) {
+            trace.fraction = localTrace.fraction;
+            R_LocalPointToGlobal(modelMatrix, localTrace.point, trace.point);
+            trace.normal = localTrace.normal * refEnt->axis;
+            trace.material = shader;
+            trace.entity = &def->parms;
+            trace.jointNumber = md5->VitaMeshNearestJoint(mesh.mesh, localTrace.indexes[0], localTrace.indexes[1], localTrace.indexes[2]);
+        }
+    }
+
+    return (trace.fraction < 1.0f);
+}
+
+/*
+===================
+Vita_ModelTraceSnapshot / Vita_VerifyPosedTrace
+
+vita_posedTracesVerify 1: the posed trace's result against the stock one -
+ModelTrace's own loop over a full snapshot, built aside (a model of its own,
+deleted after) so the entity's state is left as it was.
+===================
+*/
+static bool Vita_ModelTraceSnapshot(modelTrace_t& trace, idRenderEntityLocal* def, idRenderModel* model, const idVec3& start, const idVec3& end, const float radius)
+{
+    renderEntity_t* refEnt = &def->parms;
+    float modelMatrix[16];
+    idVec3 localStart;
+    idVec3 localEnd;
+    R_AxisToModelMatrix(refEnt->axis, refEnt->origin, modelMatrix);
+    R_GlobalPointToLocal(modelMatrix, start, localStart);
+    R_GlobalPointToLocal(modelMatrix, end, localEnd);
+
+    bool collisionSurface = false;
+    for (int i = 0; i < model->NumBaseSurfaces(); i++) {
+        const modelSurface_t* surf = model->Surface(i);
+        const idMaterial* shader = R_RemapShaderBySkin(surf->shader, def->parms.customSkin, def->parms.customShader);
+        if (shader->GetSurfaceFlags() & SURF_COLLISION) {
+            collisionSurface = true;
+            break;
+        }
+    }
+    for (int i = 0; i < model->NumBaseSurfaces(); i++) {
+        const modelSurface_t* surf = model->Surface(i);
+        const idMaterial* shader = R_RemapShaderBySkin(surf->shader, def->parms.customSkin, def->parms.customShader);
+        if (surf->geometry == NULL || shader == NULL) {
+            continue;
+        }
+        if (collisionSurface) {
+            if ((shader->GetSurfaceFlags() & SURF_COLLISION) == 0) {
+                continue;
+            }
+        } else {
+            if (!shader->IsDrawn() || (shader->Coverage() != MC_OPAQUE && shader->Coverage() != MC_PERFORATED)) {
+                continue;
+            }
+        }
+        localTrace_t localTrace = R_LocalTrace(localStart, localEnd, radius, surf->geometry);
+        if (localTrace.fraction < trace.fraction) {
+            trace.fraction = localTrace.fraction;
+            R_LocalPointToGlobal(modelMatrix, localTrace.point, trace.point);
+            trace.normal = localTrace.normal * refEnt->axis;
+            trace.material = shader;
+            trace.entity = &def->parms;
+            trace.jointNumber = refEnt->hModel->NearestJoint(i, localTrace.indexes[0], localTrace.indexes[1], localTrace.indexes[2]);
+        }
+    }
+    return (trace.fraction < 1.0f);
+}
+
+static void Vita_VerifyPosedTrace(const modelTrace_t& posedTrace, bool posedHit, idRenderEntityLocal* def, const idVec3& start, const idVec3& end, const float radius)
+{
+    static int verifyTraces, verifyHits, verifyMismatches, verifyLastReport;
+    idRenderModel* snapshot = def->parms.hModel->InstantiateDynamicModel(&def->parms, NULL, NULL);
+    if (snapshot == NULL) {
+        return;
+    }
+    modelTrace_t stock;
+    memset(&stock, 0, sizeof(stock));
+    stock.fraction = 1.0f;
+    stock.point = end;
+    const bool stockHit = Vita_ModelTraceSnapshot(stock, def, snapshot, start, end, radius);
+    delete snapshot;
+
+    verifyTraces++;
+    verifyHits += stockHit ? 1 : 0;
+    const bool same = (stockHit == posedHit) && (stock.fraction == posedTrace.fraction) && (stock.point == posedTrace.point)
+        && (stock.normal == posedTrace.normal) && (stock.material == posedTrace.material) && (stock.jointNumber == posedTrace.jointNumber);
+    if (!same && verifyMismatches++ < 20) {
+        common->Printf("vita_posedTracesVerify: MISMATCH on '%s': stock %s %.6f (%.3f %.3f %.3f) joint %d, posed %s %.6f (%.3f %.3f %.3f) joint %d\n",
+            def->parms.hModel->Name(), stockHit ? "hit" : "miss", stock.fraction, stock.point.x, stock.point.y, stock.point.z, stock.jointNumber,
+            posedHit ? "hit" : "miss", posedTrace.fraction, posedTrace.point.x, posedTrace.point.y, posedTrace.point.z, posedTrace.jointNumber);
+    }
+    const int now = Sys_Milliseconds();
+    if (now - verifyLastReport > 5000) {
+        verifyLastReport = now;
+        common->Printf("vita_posedTracesVerify: %d posed traces checked (%d hits), %d mismatches\n", verifyTraces, verifyHits, verifyMismatches);
+    }
+}
+#endif
+
 /*
 ===================
 idRenderWorldLocal::ModelTrace
@@ -1188,10 +1498,33 @@ bool idRenderWorldLocal::ModelTrace(modelTrace_t& trace, qhandle_t entityHandle,
 
     renderEntity_t* refEnt = &def->parms;
 
-    idRenderModel* model = R_EntityDefDynamicModel(def);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // no snapshot made this frame to test against: pose the positions alone
+    // (see above)
+    if (def->dynamicModelFrameCount != tr.frameCount && refEnt->hModel != NULL && refEnt->hModel->IsDynamicModel() == DM_CACHED && vita_posedTraces.GetBool()) {
+        const idRenderModelMD5* md5 = dynamic_cast<const idRenderModelMD5*>(refEnt->hModel);
+        if (md5 != NULL) {
+            vitaPosedModel_t* posed = Vita_PosedForTrace(def, md5);
+            if (posed != NULL) {
+                const bool hit = Vita_ModelTracePosed(trace, def, md5, *posed, start, end, radius);
+                if (vita_posedTracesVerify.GetBool()) {
+                    Vita_VerifyPosedTrace(trace, hit, def, start, end, radius);
+                }
+                return hit;
+            }
+        }
+    }
+#endif
+
+    idRenderModel* model;
+    {
+        VITA_ZONE("model trace: dynamic model (skinning)");
+        model = R_EntityDefDynamicModel(def);
+    }
     if (model == NULL) {
         return false;
     }
+    VITA_ZONE("model trace: triangles");
 
     // transform the points into local space
     float modelMatrix[16];
@@ -1507,6 +1840,11 @@ void idRenderWorldLocal::AddEntityRefToArea(idRenderEntityLocal* def, portalArea
     tr.pc.c_entityReferences++;
 
     ref->entity = def;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    ref->vitaEntityIndex = def->index;
+    ref->vitaStaticModel = def->parms.hModel != NULL && def->parms.callback == NULL && def->parms.hModel->IsDynamicModel() == DM_STATIC;
+    ref->vitaNoSurfaces = def->parms.hModel != NULL && def->parms.callback == NULL && !def->parms.hModel->ModelHasInteractingSurfaces() && !def->parms.hModel->ModelHasShadowCastingSurfaces();
+#endif
 
     // link to entityDef
     ref->ownerNext = def->entityRefs;
@@ -1518,6 +1856,9 @@ void idRenderWorldLocal::AddEntityRefToArea(idRenderEntityLocal* def, portalArea
     ref->areaPrev = area->entityRefs.areaPrev;
     ref->areaNext->areaPrev = ref;
     ref->areaPrev->areaNext = ref;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    area->vitaRefsDirty = true;
+#endif
 }
 
 /*
@@ -1574,10 +1915,8 @@ void idRenderWorldLocal::GenerateAllInteractions()
 
     // build the interaction table
     // this will be dynamically resized if the entity / light counts grow too much
-    interactionTableWidth = entityDefs.Num() + 100;
-    interactionTableHeight = lightDefs.Num() + 100;
-    int size = interactionTableWidth * interactionTableHeight * sizeof(*interactionTable);
-    interactionTable = (idInteraction**)R_ClearedStaticAlloc(size);
+    AllocInteractionTable();
+    const int size = interactionTableHeight * (sizeof(*interactionTable) + interactionTableWidth * sizeof(**interactionTable));
 
     // itterate through all lights
     int count = 0;
@@ -1629,7 +1968,7 @@ void idRenderWorldLocal::GenerateAllInteractions()
     int msec = end - start;
 
     common->Printf("idRenderWorld::GenerateAllInteractions, msec = %i\n", msec);
-    common->Printf("interactionTable size: %i bytes\n", size);
+    common->Printf("interactionTable size: %i bytes (%i lights x %i entities, a row per light)\n", size, interactionTableHeight, interactionTableWidth);
     common->Printf("%i interactions take %i bytes\n", count, count * sizeof(idInteraction));
 
     // entities flagged as noDynamicInteractions will no longer make any

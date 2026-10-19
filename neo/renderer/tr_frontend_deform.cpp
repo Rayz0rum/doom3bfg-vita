@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_ADD (vita_particleThin)
 #include "Model_local.h"
 
 /*
@@ -879,6 +880,12 @@ static drawSurf_t* R_ParticleDeform(drawSurf_t* surf, bool useArea)
         idParticleStage* stage = particleSystem->stages[stageNum];
 
         int numVerts = 0;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        extern idCVar vita_particleThin; // Model_prt.cpp
+        extern bool vita_fullQuality;
+        const int vitaThinMask = (maxStageParticles[stageNum] >= 4 && !vita_fullQuality) ? ((1 << idMath::ClampInt(0, 2, vita_particleThin.GetInteger())) - 1) : 0;
+        int vitaThinned = 0;
+#endif
         for (int currentTri = 0; currentTri < ((useArea) ? 1 : numSourceTris); currentTri++) {
 
             idRandom steppingRandom;
@@ -897,6 +904,15 @@ static drawSurf_t* R_ParticleDeform(drawSurf_t* surf, bool useArea)
                 // bump the random
                 steppingRandom.RandomInt();
                 steppingRandom2.RandomInt();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                // Vita (a cut, vita_particleThin): only every other particle of a
+                // stage with 4 or more is built and drawn (the randoms above
+                // still step for each, so the ones kept are the same particles)
+                if (vitaThinMask != 0 && (index & vitaThinMask) != 0) {
+                    vitaThinned++;
+                    continue;
+                }
+#endif
 
                 // calculate local age for this index
                 int bunchOffset = idMath::Ftoi(stage->particleLife * 1000 * stage->spawnBunching * index / maxStageParticles[stageNum]);
@@ -977,6 +993,9 @@ static drawSurf_t* R_ParticleDeform(drawSurf_t* surf, bool useArea)
                 numVerts += stage->CreateParticle(&g, newVerts + numVerts);
             }
         }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        VITA_ZONE_ADD("particles left out (vita_particleThin: particle deforms)", vitaThinned);
+#endif
 
         if (numVerts == 0) {
             continue;

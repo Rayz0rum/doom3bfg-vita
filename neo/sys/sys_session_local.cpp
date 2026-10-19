@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 #pragma hdrstop
 #include "sys_session_local.h"
+#include "sys_net_online.h"
 #include "sys_voicechat.h"
 #include "sys_dedicated_server_search.h"
 
@@ -3446,6 +3447,10 @@ void idSessionLocal::SetVoiceGroupsToTeams()
             continue;
         }
 
+        if (gameUser->isBot) {
+            continue; // no voice (a bot is never a talker: each call logged "Talker not found", every frame)
+        }
+
         int userTeam = gameUser->teamNumber;
 
         voiceChat->SetTalkerGroup(gameUser, GetGameLobby().lobbyType, userTeam);
@@ -3472,7 +3477,7 @@ void idSessionLocal::ClearVoiceGroups()
             continue;
         }
 
-        if (gameUser->IsDisconnected()) {
+        if (gameUser->IsDisconnected() || gameUser->isBot) {
             continue;
         }
 
@@ -4138,6 +4143,11 @@ idNetSessionPort::ReadRawPacket
 bool idNetSessionPort::ReadRawPacket(lobbyAddress_t& from, void* data, int& size, int maxSize)
 {
     bool result = UDP.GetPacket(from.netAddr, data, size, maxSize);
+    // the DHT (online play, sys_net_online.cpp) talks from this port too:
+    // its packets are eaten here, the game's go on
+    while (result && size > 0 && netOnline.HandleRawPacket(from.netAddr, (const byte*)data, size)) {
+        result = UDP.GetPacket(from.netAddr, data, size, maxSize);
+    }
 
     static idRandom2 random(Sys_Milliseconds());
     if (net_forceDrop.GetInteger() != 0) {

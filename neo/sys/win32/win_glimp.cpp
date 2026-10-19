@@ -1055,7 +1055,15 @@ static bool GLW_CreateWindow(glimpParms_t parms)
 
     ::SetTimer(win32.hWnd, 0, 100, NULL);
 
-    ShowWindow(win32.hWnd, SW_SHOW);
+    // a test run in the background (win_pauseOnFocusLoss 0): minimized,
+    // without taking the focus from whatever the user is doing
+    // - or, placed off every monitor (r_windowX/r_windowY), shown without the
+    // focus: still out of sight, but a minimized window renders nothing, and
+    // a screenshot of it comes out black
+    const bool background = !cvarSystem->GetCVarBool("win_pauseOnFocusLoss");
+    RECT placed = { x, y, x + w, y + h };
+    const bool offscreen = parms.fullScreen == 0 && MonitorFromRect(&placed, MONITOR_DEFAULTTONULL) == NULL;
+    ShowWindow(win32.hWnd, background ? (offscreen ? SW_SHOWNOACTIVATE : SW_SHOWMINNOACTIVE) : SW_SHOW);
     UpdateWindow(win32.hWnd);
     common->Printf("...created window @ %d,%d (%dx%d)\n", x, y, w, h);
 
@@ -1081,8 +1089,10 @@ static bool GLW_CreateWindow(glimpParms_t parms)
         return false;
     }
 
-    SetForegroundWindow(win32.hWnd);
-    SetFocus(win32.hWnd);
+    if (!background) {
+        SetForegroundWindow(win32.hWnd);
+        SetFocus(win32.hWnd);
+    }
 
     glConfig.isFullscreen = parms.fullScreen;
 

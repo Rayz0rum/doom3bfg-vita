@@ -339,6 +339,15 @@ public:
 
     // consoles switch stereo 3D eye views each 60 hz frame
     virtual int GetFrameCount() const = 0;
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita: record the 2D drawing between Begin and End under 'key' (it is
+    // drawn as usual too), and play the last recording of 'key' back - false
+    // if there is none from the previous frame (the HUD at 15 Hz)
+    virtual void VitaGuiCaptureBegin(const void* key) = 0;
+    virtual void VitaGuiCaptureEnd() = 0;
+    virtual bool VitaGuiReplay(const void* key) = 0;
+#endif
 };
 
 extern idRenderSystem* renderSystem;

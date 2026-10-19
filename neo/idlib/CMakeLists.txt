@@ -133,12 +133,19 @@ else()
 
     separate_arguments(_compiler_FLAGS)
 
+    # GCC's PCH must be mmap'd at a fixed address; on Windows hosts that fails
+    # (MapViewOfFileEx / "PCH allocation failure"), especially under -j. Without a
+    # .gch the -include of precompiled.h simply parses normally, so skip generating it.
+    if(VITA OR CMAKE_HOST_WIN32 OR CMAKE_HOST_SYSTEM_NAME MATCHES "Windows|MSYS|MINGW|CYGWIN")
+        set(_pch_cmd ${CMAKE_COMMAND} -E echo "idlib: PCH generation disabled")
+    else()
+        set(_pch_cmd ${CMAKE_CXX_COMPILER} ${_compiler_FLAGS} -std=gnu++14 -x c++-header precompiled.h -o precompiled.h.gch)
+    endif()
+
     add_custom_target(
         precomp_header_idlib
         ALL
-        COMMAND
-            ${CMAKE_CXX_COMPILER} ${_compiler_FLAGS} -std=gnu++14 -x c++-header precompiled.h
-            -o precompiled.h.gch
+        COMMAND ${_pch_cmd}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Creating idlib/precompiled.h.gch for idlib"
     )

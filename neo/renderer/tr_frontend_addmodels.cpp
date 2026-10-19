@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h" // GD_SCOPE / GD_PASS: the game/draw thread's tree of passes (VitaBench.cpp)
 #include "Model_local.h"
 
 idCVar r_skipStaticShadows("r_skipStaticShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip static shadows");
@@ -39,10 +40,112 @@ idCVar r_useParallelAddModels("r_useParallelAddModels", "1", CVAR_RENDERER | CVA
 idCVar r_useParallelAddShadows("r_useParallelAddShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "0 = off, 1 = threaded", 0, 1);
 idCVar r_useShadowPreciseInsideTest("r_useShadowPreciseInsideTest", "1", CVAR_RENDERER | CVAR_BOOL, "use a precise and more expensive test to determine whether the view is inside a shadow volume");
 idCVar r_cullDynamicShadowTriangles("r_cullDynamicShadowTriangles", "1", CVAR_RENDERER | CVAR_BOOL, "cull occluder triangles that are outside the light frustum so they do not contribute to the dynamic shadow volume");
+#if defined(__vita__)
+// Off on the Vita: for a moving light (the flashlight above all) every surface
+// it touches had its triangles culled to the light on the CPU each frame and
+// the surviving indices written to uncached GPU memory - CPU time the Vita
+// does not have. The GPU draws the whole surface instead; the light's scissor
+// rectangle and depth bounds still clip the fill.
+idCVar r_cullDynamicLightTriangles("r_cullDynamicLightTriangles", "0", CVAR_RENDERER | CVAR_BOOL, "cull surface triangles that are outside the light frustum so they do not get rendered for interactions");
+#else
 idCVar r_cullDynamicLightTriangles("r_cullDynamicLightTriangles", "1", CVAR_RENDERER | CVAR_BOOL, "cull surface triangles that are outside the light frustum so they do not get rendered for interactions");
+#endif
 idCVar r_forceShadowCaps("r_forceShadowCaps", "0", CVAR_RENDERER | CVAR_BOOL, "0 = skip rendering shadow caps if view is outside shadow volume, 1 = always render shadow caps");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+#if defined(__vita__)
+#define VITA_ANIMATED_SHADOW_LIGHTS "1"
+#else
+#define VITA_ANIMATED_SHADOW_LIGHTS "0" // the PC test build keeps the stock behaviour unless asked
+#endif
+idCVar vita_animatedLightLimit("vita_animatedLightLimit", "3", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: animated models (monsters, corpses) lit by more lights than this lose the ones that add almost nothing at the model (vita_animatedLightMinShare); 0 = all");
+idCVar vita_animatedLightMinShare("vita_animatedLightMinShare", "0.08", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: a light is only cut from an animated model when its estimated light at the model is under this share of the strongest light's (dropping it can not be seen)");
+idCVar vita_animMaxPixels("vita_animMaxPixels", "40", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: a far monster is only skinned at 15 Hz while it is under this many pixels tall on screen (its steps are then a pixel or so)");
+idCVar vita_animatedShadowDistance("vita_animatedShadowDistance", "640", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: animated models (monsters, corpses) farther than this from the view cast no shadow; 0 = no limit");
+idCVar vita_animatedShadowLights("vita_animatedShadowLights", VITA_ANIMATED_SHADOW_LIGHTS, CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE,
+    "Vita: an animated model (monster, corpse, animated prop) casts shadows from at most this many of the lights touching it - the ones it is deepest in; 0 = from all", 0, 16);
+#endif
 
 static const float CHECK_BOUNDS_EPSILON = 1.0f;
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+==================
+Vita: 15 Hz animation for distant monsters (a fidelity cut the user approved)
+
+A living monster (renderEntity.vitaHalfRateAnim, set by idAI) whose bounds
+are farther than vita_animNearDistance from the view keeps the mesh it was
+skinned with last frame for one frame instead of being skinned again: its
+pose updates at 15 Hz while it still moves with its origin at 30. The user's
+approval was "15Hz animation for distant monsters": distance alone decides.
+vita_animFocusAngle above 0 also keeps monsters within that many degrees
+(plus their own angular size) of the view's center at full rate. Near
+monsters, ragdolls and corpses, the player and its weapon, and subviews are
+never held. The held mesh is only drawn: the
+snapshot the game's traces see is not touched (they still pose the entity
+from its current joints), and the entity's callback is not asked, so its
+joints for the frame are not built either unless the game needs them.
+==================
+*/
+idCVar vita_animLOD("vita_animLOD", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_ARCHIVE, "Vita: distant monsters that are not looked at are skinned at 15 Hz (every other frame)");
+idCVar vita_animNearDistance("vita_animNearDistance", "192", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: monsters closer than this to the view always animate every frame");
+idCVar vita_animFocusAngle("vita_animFocusAngle", "0", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: above 0, monsters within this many degrees (plus their own size) of the view's center always animate every frame; 0 = distance alone decides");
+
+// the model to draw this frame for a monster held at 15 Hz, or NULL to take
+// the normal path
+static idRenderModel* Vita_HeldAnimModel(const idRenderEntityLocal* def)
+{
+    extern bool vita_fullQuality;
+    if (!vita_animLOD.GetBool() || vita_fullQuality || !def->parms.vitaHalfRateAnim || tr.viewDef == NULL || tr.viewDef->isSubview) {
+        return NULL;
+    }
+    const idRenderModel* model = def->parms.hModel;
+    if (model == NULL || model->IsDynamicModel() != DM_CACHED) {
+        return NULL;
+    }
+    // only when a new snapshot is due (the entity changed) and the last one
+    // was made last frame from this model: every other frame at most
+    if (def->dynamicModel != NULL) {
+        VITA_ZONE_COUNT("monster 15 Hz test: snapshot still current (not updated since)");
+        return NULL;
+    }
+    if (def->cachedDynamicModel == NULL || def->vitaSkinModel != model) {
+        VITA_ZONE_COUNT("monster 15 Hz test: no snapshot of this model yet");
+        return NULL;
+    }
+    if (def->vitaSkinFrame != tr.frameCount - 1) {
+        VITA_ZONE_COUNT("monster 15 Hz test: not skinned last frame (its 15 Hz frame)");
+        return NULL;
+    }
+    const idVec3& viewOrigin = tr.viewDef->renderView.vieworg;
+    const idVec3 center = def->globalReferenceBounds.GetCenter();
+    const float radius = (def->globalReferenceBounds[1] - def->globalReferenceBounds[0]).Length() * 0.5f;
+    idVec3 dir = center - viewOrigin;
+    const float dist = dir.Normalize();
+    if (dist - radius < vita_animNearDistance.GetFloat()) {
+        VITA_ZONE_COUNT("monster 15 Hz test: near");
+        return NULL; // near
+    }
+    // only small on screen: a big one's 15 Hz steps are seen (as Campbell's
+    // case was)
+    if (vita_animMaxPixels.GetFloat() > 0.0f) {
+        const float halfFov = DEG2RAD(Max(1.0f, tr.viewDef->renderView.fov_y) * 0.5f);
+        const float viewH = (float)(tr.viewDef->viewport.y2 - tr.viewDef->viewport.y1 + 1);
+        const float pixels = (2.0f * radius / Max(1.0f, dist)) / idMath::Tan(halfFov) * viewH * 0.5f;
+        if (pixels >= vita_animMaxPixels.GetFloat()) {
+            VITA_ZONE_COUNT("monster 15 Hz test: too big on screen (vita_animMaxPixels)");
+            return NULL;
+        }
+    }
+    if (vita_animFocusAngle.GetFloat() > 0.0f) {
+        const float offCenter = RAD2DEG(idMath::ACos(idMath::ClampFloat(-1.0f, 1.0f, dir * tr.viewDef->renderView.viewaxis[0])));
+        const float size = RAD2DEG(idMath::ATan(radius, dist));
+        if (offCenter < vita_animFocusAngle.GetFloat() + size) {
+            return NULL; // looked at
+        }
+    }
+    return def->cachedDynamicModel;
+}
+#endif
 
 /*
 ==================
@@ -117,6 +220,9 @@ void R_ClearEntityDefDynamicModel(idRenderEntityLocal* def)
         def->dynamicModel = NULL;
     }
     def->dynamicModelFrameCount = 0;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    Vita_TraceCacheInvalidate(def);
+#endif
 }
 
 /*
@@ -172,6 +278,7 @@ idRenderModel* R_EntityDefDynamicModel(idRenderEntityLocal* def)
     bool callbackUpdate;
     if (def->parms.callback != NULL) {
         SCOPED_PROFILE_EVENT("R_IssueEntityDefCallback");
+        VITA_ZONE("dynamic model: entity callback (game code: joints for this frame)");
         callbackUpdate = R_IssueEntityDefCallback(def);
     } else {
         callbackUpdate = false;
@@ -199,6 +306,7 @@ idRenderModel* R_EntityDefDynamicModel(idRenderEntityLocal* def)
     if (def->dynamicModel == NULL) {
 
         SCOPED_PROFILE_EVENT("InstantiateDynamicModel");
+        VITA_ZONE("dynamic model: instantiate (skinning, particles, deforms)");
 
         // instantiate the snapshot of the dynamic model, possibly reusing memory from the cached snapshot
         def->cachedDynamicModel = model->InstantiateDynamicModel(&def->parms, tr.viewDef, def->cachedDynamicModel);
@@ -212,6 +320,10 @@ idRenderModel* R_EntityDefDynamicModel(idRenderEntityLocal* def)
 
         def->dynamicModel = def->cachedDynamicModel;
         def->dynamicModelFrameCount = tr.frameCount;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        def->vitaSkinFrame = tr.frameCount;
+        def->vitaSkinModel = model;
+#endif
     }
 
     // set model depth hack value
@@ -318,6 +430,9 @@ two or more lights.
 */
 void R_AddSingleModel(viewEntity_t* vEntity)
 {
+    // the rest of the job (surfaces, light interactions, shadow setup) is
+    // what is left of this zone after the two inside it
+    VITA_ZONE("model job: R_AddSingleModel (whole)");
     // we will add all interaction surfs here, to be chained to the lights in later serial code
     vEntity->drawSurfs = NULL;
     vEntity->staticShadowVolumes = NULL;
@@ -361,6 +476,7 @@ void R_AddSingleModel(viewEntity_t* vEntity)
 
     if (renderEntity->hModel == NULL || renderEntity->hModel->ModelHasInteractingSurfaces() || renderEntity->hModel->ModelHasShadowCastingSurfaces()) {
         SCOPED_PROFILE_EVENT("Find lights");
+        VITA_ZONE("model job: find the lights touching it");
         for (viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next) {
             if (vLight->scissorRect.IsEmpty()) {
                 continue;
@@ -369,7 +485,7 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                 // new code path, everything was done in AddLight
                 if (vLight->entityInteractionState[entityIndex] == viewLight_t::INTERACTION_YES) {
                     contactedLights[numContactedLights] = vLight;
-                    staticInteractions[numContactedLights] = world->interactionTable[vLight->lightDef->index * world->interactionTableWidth + entityIndex];
+                    staticInteractions[numContactedLights] = world->interactionTable[vLight->lightDef->index][entityIndex];
                     if (++numContactedLights == MAX_CONTACTED_LIGHTS) {
                         break;
                     }
@@ -416,12 +532,134 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                 }
             }
             contactedLights[numContactedLights] = vLight;
-            staticInteractions[numContactedLights] = world->interactionTable[vLight->lightDef->index * world->interactionTableWidth + entityIndex];
+            staticInteractions[numContactedLights] = world->interactionTable[vLight->lightDef->index][entityIndex];
             if (++numContactedLights == MAX_CONTACTED_LIGHTS) {
                 break;
             }
         }
     }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a fidelity cut): an animated model - monsters, corpses, animated
+    // props, CPU-skinned and given a dynamic shadow volume job per light -
+    // casts shadows from at most vita_animatedShadowLights of the lights
+    // touching it: the ones it sits deepest in (distance to the light's
+    // origin against the light's size; in a fight usually the flashlight
+    // first). It is still lit by all of them. A light whose shadow is cut
+    // also skips the job's culling of the lit triangles to the light (the
+    // interaction draws the whole surface, as with
+    // r_cullDynamicLightTriangles 0), so no job runs for it at all.
+    bool vitaShadowCut[MAX_CONTACTED_LIGHTS];
+    bool vitaLightCut[MAX_CONTACTED_LIGHTS];
+    for (int i = 0; i < numContactedLights; i++) {
+        vitaLightCut[i] = false;
+    }
+    {
+        const int cap = vita_animatedShadowLights.GetInteger();
+        int numCasting = 0;
+        float score[MAX_CONTACTED_LIGHTS];
+        for (int i = 0; i < numContactedLights; i++) {
+            vitaShadowCut[i] = false;
+            const idRenderLightLocal* lightDef = contactedLights[i]->lightDef;
+            score[i] = idMath::INFINITY;
+            if (cap > 0 && lightDef->LightCastsShadows() && !entityDef->parms.noShadow) {
+                const idVec3 center = entityDef->globalReferenceBounds.GetCenter();
+                const idBounds& lb = lightDef->globalLightBounds;
+                const float reach = Max(1.0f, (lb[1] - lb[0]).Length() * 0.5f);
+                score[i] = (center - lightDef->globalLightOrigin).LengthSqr() / (reach * reach);
+                numCasting++;
+            }
+        }
+        // Vita (a cut): an animated model farther from the view than
+        // vita_animatedShadowDistance casts no shadow at all
+        const bool vitaAnimated = renderEntity->hModel != NULL && renderEntity->hModel->IsDynamicModel() == DM_CACHED;
+        // Vita (a cut): an animated model is lit by at most
+        // vita_animatedLightLimit of the lights touching it - the ones it
+        // sits deepest in; the others neither light it nor shadow it
+        extern bool vita_fullQuality;
+        const int lightLimit = vita_fullQuality ? 0 : vita_animatedLightLimit.GetInteger();
+        if (vitaAnimated && lightLimit > 0 && numContactedLights > lightLimit) {
+            // Each light's light at the model, estimated: its colour's
+            // brightest channel, falling off to nothing at its edge. Only
+            // lights adding under vita_animatedLightMinShare of the strongest
+            // one's are cut (the weakest first, down to the limit at most):
+            // the first version cut the farthest past the limit whatever
+            // they gave, and parts of characters went dark and came back as
+            // they walked between lights.
+            float strength[MAX_CONTACTED_LIGHTS];
+            float strongest = 0.0f;
+            const idVec3 center = entityDef->globalReferenceBounds.GetCenter();
+            for (int i = 0; i < numContactedLights; i++) {
+                const idRenderLightLocal* lightDef = contactedLights[i]->lightDef;
+                const idBounds& lb = lightDef->globalLightBounds;
+                const float reach = Max(1.0f, (lb[1] - lb[0]).Length() * 0.5f);
+                const float depth = (center - lightDef->globalLightOrigin).Length() / reach;
+                const float colour = Max(lightDef->parms.shaderParms[SHADERPARM_RED], Max(lightDef->parms.shaderParms[SHADERPARM_GREEN], lightDef->parms.shaderParms[SHADERPARM_BLUE]));
+                strength[i] = Max(0.0f, colour) * Max(0.0f, 1.0f - depth);
+                strongest = Max(strongest, strength[i]);
+            }
+            const float bar = strongest * vita_animatedLightMinShare.GetFloat();
+            for (int k = 0; k < numContactedLights - lightLimit; k++) {
+                int worst = -1;
+                for (int i = 0; i < numContactedLights; i++) {
+                    if (!vitaLightCut[i] && strength[i] < bar && (worst < 0 || strength[i] < strength[worst])) {
+                        worst = i;
+                    }
+                }
+                if (worst < 0) {
+                    VITA_ZONE_COUNT("model job: animated model keeps more lights than vita_animatedLightLimit (they all add visible light)");
+                    break;
+                }
+                VITA_ZONE_COUNT("model job: lights cut from animated models (vita_animatedLightLimit: adding almost nothing)");
+                vitaLightCut[worst] = true;
+                vitaShadowCut[worst] = true;
+                if (score[worst] != idMath::INFINITY) {
+                    score[worst] = idMath::INFINITY; // no longer a shadow candidate
+                    numCasting--;
+                }
+            }
+        }
+        if (vitaAnimated && numCasting > 0 && vita_animatedShadowDistance.GetFloat() > 0.0f && !vita_fullQuality) {
+            const float d = vita_animatedShadowDistance.GetFloat();
+            if ((entityDef->globalReferenceBounds.GetCenter() - viewDef->renderView.vieworg).LengthSqr() > d * d) {
+                for (int i = 0; i < numContactedLights; i++) {
+                    if (score[i] != idMath::INFINITY) {
+                        vitaShadowCut[i] = true;
+                    }
+                }
+                VITA_ZONE_ADD("model job: animated model shadows cut (beyond vita_animatedShadowDistance)", numCasting);
+                VITA_ZONE_COUNT("model job: animated models casting no shadow (beyond vita_animatedShadowDistance)");
+                if (!modelIsVisible) {
+                    return; // seen only for its shadows, and it casts none
+                }
+                numCasting = 0;
+            }
+        }
+        if (cap > 0 && numCasting > cap && vitaAnimated) {
+            // keep the cap best (lowest score), cut the rest of the casting ones
+            for (int k = 0; k < numCasting - cap; k++) {
+                int worst = -1;
+                for (int i = 0; i < numContactedLights; i++) {
+                    if (!vitaShadowCut[i] && score[i] != idMath::INFINITY && (worst < 0 || score[i] > score[worst])) {
+                        worst = i;
+                    }
+                }
+                vitaShadowCut[worst] = true;
+            }
+            VITA_ZONE_ADD("model job: animated model shadows cut (vita_animatedShadowLights)", numCasting - cap);
+            if (!modelIsVisible) {
+                // seen only for its shadows: nothing to do if none is left
+                bool anyShadow = false;
+                for (int i = 0; i < numContactedLights && !anyShadow; i++) {
+                    anyShadow = !vitaShadowCut[i] && score[i] != idMath::INFINITY;
+                }
+                if (!anyShadow) {
+                    return;
+                }
+            }
+        }
+    }
+#endif
 
     // if we aren't visible and none of the shadows stretch into the view,
     // we don't need to do anything else
@@ -432,7 +670,23 @@ void R_AddSingleModel(viewEntity_t* vEntity)
     //---------------------------
     // create a dynamic model if the geometry isn't static
     //---------------------------
-    idRenderModel* model = R_EntityDefDynamicModel(entityDef);
+    idRenderModel* model;
+    {
+        VITA_ZONE("model job: dynamic model (CPU skinning, particles, deforms)");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        model = Vita_HeldAnimModel(entityDef);
+        if (model != NULL) {
+            VITA_ZONE_COUNT("monsters held at 15 Hz this frame (distant: last frame's mesh)");
+        } else {
+            if (entityDef->parms.vitaHalfRateAnim) {
+                VITA_ZONE_COUNT("monsters skinned this frame (near, or their 15 Hz frame)");
+            }
+            model = R_EntityDefDynamicModel(entityDef);
+        }
+#else
+        model = R_EntityDefDynamicModel(entityDef);
+#endif
+    }
     if (model == NULL || model->NumSurfaces() <= 0) {
         return;
     }
@@ -440,6 +694,12 @@ void R_AddSingleModel(viewEntity_t* vEntity)
     // add the lightweight blood decal surfaces if the model is directly visible
     if (modelIsVisible) {
         assert(!vEntity->scissorRect.IsEmpty());
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        static vitaZone_t decalZone = { "model job: decals + overlays", 0, 0, true, 0, 0 };
+        const bool timeDecals = (entityDef->decals != NULL || entityDef->overlays != NULL);
+        const uint64 decalStart = timeDecals ? Sys_Microseconds() : 0;
+        const int decalGD = timeDecals ? (Vita_ZoneUse(decalZone), VitaGD_PushAt(decalZone.name, decalStart)) : -1;
+#endif
 
         if (entityDef->decals != NULL && !r_skipDecals.GetBool()) {
             entityDef->decals->CreateDeferredDecals(model);
@@ -468,6 +728,14 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                 }
             }
         }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        if (timeDecals) {
+            const uint64 decalEnd = Sys_Microseconds();
+            __sync_fetch_and_add(&decalZone.us, (int)(decalEnd - decalStart));
+            __sync_fetch_and_add(&decalZone.calls, 1);
+            VitaGD_PopAt(decalGD, decalEnd);
+        }
+#endif
     }
 
     //---------------------------
@@ -499,6 +767,12 @@ void R_AddSingleModel(viewEntity_t* vEntity)
     //---------------------------
     // add all the model surfaces
     //---------------------------
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // the loop's counts, added to the zones once per entity: a shared counter
+    // bumped per surface x light pair by three or four job threads at once
+    // kept its cache line moving between the cores (3000 pairs a frame)
+    int vitaNumSurfaces = 0, vitaNumPairs = 0, vitaNumStaticShadows = 0, vitaNumDynamicShadows = 0;
+#endif
     for (int surfaceNum = 0; surfaceNum < model->NumSurfaces(); surfaceNum++) {
         const modelSurface_t* surf = model->Surface(surfaceNum);
 
@@ -521,6 +795,9 @@ void R_AddSingleModel(viewEntity_t* vEntity)
         if (!shader->IsDrawn()) {
             continue; // collision hulls, etc
         }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        vitaNumSurfaces++;
+#endif
 
         // RemapShaderBySkin
         if (entityDef->parms.customShader != NULL) {
@@ -583,9 +860,16 @@ void R_AddSingleModel(viewEntity_t* vEntity)
         // base drawing surface
         //--------------------------
         drawSurf_t* baseDrawSurf = NULL;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // which surfaces the sampled zones below time this frame (one in 8,
+        // a different eighth every frame)
+        const unsigned int vitaSampleKey = (unsigned int)(((uintptr_t)tri >> 5) + tr.frameCount);
+#endif
         if (surfaceDirectlyVisible) {
+            VITA_ZONE_SAMPLED("model job: a surface's base draw surface (vertex cache, shader registers, deforms; sampled)", vitaSampleKey, 3);
             // make sure we have an ambient cache and all necessary normals / tangents
             if (!vertexCache.CacheIsCurrent(tri->indexCache)) {
+                VITA_ZONE("model job: copy indexes to GPU memory");
                 tri->indexCache = vertexCache.AllocIndex(tri->indexes, ALIGN(tri->numIndexes * sizeof(triIndex_t), INDEX_CACHE_ALIGN));
             }
             if (!vertexCache.CacheIsCurrent(tri->ambientCache)) {
@@ -598,6 +882,7 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                     // assert( false );	// this should no longer be hit
                     // RB end
                 }
+                VITA_ZONE("model job: copy vertices to GPU memory");
                 tri->ambientCache = vertexCache.AllocVertex(tri->verts, ALIGN(tri->numVerts * sizeof(idDrawVert), VERTEX_CACHE_ALIGN));
             }
 
@@ -610,11 +895,15 @@ void R_AddSingleModel(viewEntity_t* vEntity)
             baseDrawSurf->extraGLState = 0;
             baseDrawSurf->renderZFail = 0;
 
-            R_SetupDrawSurfShader(baseDrawSurf, shader, renderEntity);
+            {
+                VITA_ZONE_SAMPLED("model job: shader registers (R_SetupDrawSurfShader; sampled)", vitaSampleKey, 3);
+                R_SetupDrawSurfShader(baseDrawSurf, shader, renderEntity);
+            }
 
             // Check for deformations (eyeballs, flares, etc)
             const deform_t shaderDeform = shader->Deform();
             if (shaderDeform != DFRM_NONE) {
+                VITA_ZONE_SAMPLED("model job: deform (R_DeformDrawSurf: sprites, tubes, flares, particles, eyeballs; sampled)", vitaSampleKey, 3);
                 drawSurf_t* deformDrawSurf = R_DeformDrawSurf(baseDrawSurf);
                 if (deformDrawSurf != NULL) {
                     // any deforms may have created multiple draw surfaces
@@ -655,7 +944,13 @@ void R_AddSingleModel(viewEntity_t* vEntity)
         //----------------------------------------
         // add all light interactions
         //----------------------------------------
+        VITA_ZONE_SAMPLED("model job: a surface's light interactions + shadow set up (all its lights; sampled)", vitaSampleKey, 3);
         for (int contactedLight = 0; contactedLight < numContactedLights; contactedLight++) {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            if (vitaLightCut[contactedLight]) {
+                continue; // vita_animatedLightLimit
+            }
+#endif
             viewLight_t* vLight = contactedLights[contactedLight];
             const idRenderLightLocal* lightDef = vLight->lightDef;
             const idInteraction* interaction = staticInteractions[contactedLight];
@@ -677,6 +972,9 @@ void R_AddSingleModel(viewEntity_t* vEntity)
             if (shader->Spectrum() != lightDef->lightShader->Spectrum()) {
                 continue;
             }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            vitaNumPairs++;
+#endif
 
             // Calculate the local light origin to determine if the view is inside the shadow
             // projection and to calculate the triangle facing for dynamic shadow volumes.
@@ -706,7 +1004,11 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                         lightDrawSurf->indexCache = tri->indexCache;
 
                         // optionally cull the triangles to the light volume
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                        if (r_cullDynamicLightTriangles.GetBool() && !vitaShadowCut[contactedLight]) {
+#else
                         if (r_cullDynamicLightTriangles.GetBool()) {
+#endif
 
                             vertCacheHandle_t lightIndexCache = vertexCache.AllocIndex(NULL, ALIGN(lightDrawSurf->numIndexes * sizeof(triIndex_t), INDEX_CACHE_ALIGN));
                             if (vertexCache.CacheIsCurrent(lightIndexCache)) {
@@ -716,6 +1018,8 @@ void R_AddSingleModel(viewEntity_t* vEntity)
 
                                 dynamicShadowParms->verts = tri->verts;
                                 dynamicShadowParms->numVerts = tri->numVerts;
+                                dynamicShadowParms->debugModel = (entityDef->parms.hModel != NULL) ? entityDef->parms.hModel->Name() : "";
+                                dynamicShadowParms->debugLight = vLight->lightDef->index;
                                 dynamicShadowParms->indexes = tri->indexes;
                                 dynamicShadowParms->numIndexes = tri->numIndexes;
                                 dynamicShadowParms->silEdges = tri->silEdges;
@@ -808,6 +1112,13 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                 continue;
             }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            // over vita_animatedShadowLights (see above)
+            if (vitaShadowCut[contactedLight]) {
+                continue;
+            }
+#endif
+
             // No shadow if it's suppressed for this light.
             if (entityDef->parms.suppressShadowInLightID && entityDef->parms.suppressShadowInLightID == lightDef->parms.lightId) {
                 continue;
@@ -837,6 +1148,8 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                     staticShadowVolumeParms_t* staticShadowParms = (staticShadowVolumeParms_t*)R_FrameAlloc(sizeof(staticShadowParms[0]), FRAME_ALLOC_SHADOW_VOLUME_PARMS);
 
                     staticShadowParms->verts = tri->staticShadowVertexes;
+                    staticShadowParms->debugModel = (entityDef->parms.hModel != NULL) ? entityDef->parms.hModel->Name() : "";
+                    staticShadowParms->debugLight = vLight->lightDef->index;
                     staticShadowParms->numVerts = tri->numVerts * 2;
                     staticShadowParms->indexes = surfInter->shadowIndexes;
                     staticShadowParms->numIndexes = surfInter->numShadowIndexes;
@@ -862,6 +1175,9 @@ void R_AddSingleModel(viewEntity_t* vEntity)
 
                     staticShadowParms->next = vEntity->staticShadowVolumes;
                     vEntity->staticShadowVolumes = staticShadowParms;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                    vitaNumStaticShadows++;
+#endif
                 }
 
             } else {
@@ -872,6 +1188,7 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                     // duplicates them with w set to 0 and 1 for the vertex program to project.
                     // This is constant for any number of lights, the vertex program takes care
                     // of projecting the verts to infinity for a particular light.
+                    VITA_ZONE("model job: shadow verts to GPU memory (CreateShadowCache)");
                     tri->shadowCache = vertexCache.AllocVertex(NULL, ALIGN(tri->numVerts * 2 * sizeof(idShadowVert), VERTEX_CACHE_ALIGN));
                     idShadowVert* shadowVerts = (idShadowVert*)vertexCache.MappedVertexBuffer(tri->shadowCache);
                     idShadowVert::CreateShadowCache(shadowVerts, tri->verts, tri->numVerts);
@@ -898,6 +1215,8 @@ void R_AddSingleModel(viewEntity_t* vEntity)
 
                     dynamicShadowParms->verts = tri->verts;
                     dynamicShadowParms->numVerts = tri->numVerts;
+                    dynamicShadowParms->debugModel = (entityDef->parms.hModel != NULL) ? entityDef->parms.hModel->Name() : "";
+                    dynamicShadowParms->debugLight = vLight->lightDef->index;
                     dynamicShadowParms->indexes = tri->indexes;
                     dynamicShadowParms->numIndexes = tri->numIndexes;
                     dynamicShadowParms->silEdges = tri->silEdges;
@@ -940,6 +1259,9 @@ void R_AddSingleModel(viewEntity_t* vEntity)
                     }
 
                     tr.pc.c_createShadowVolumes++;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+                    vitaNumDynamicShadows++;
+#endif
                 }
             }
 
@@ -962,6 +1284,12 @@ void R_AddSingleModel(viewEntity_t* vEntity)
             vEntity->drawSurfs = shadowDrawSurf;
         }
     }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    VITA_ZONE_ADD("model job: surfaces", vitaNumSurfaces);
+    VITA_ZONE_ADD("model job: surface x light pairs", vitaNumPairs);
+    VITA_ZONE_ADD("model job: static shadow volumes set up", vitaNumStaticShadows);
+    VITA_ZONE_ADD("model job: dynamic shadow volumes set up", vitaNumDynamicShadows);
+#endif
 }
 
 REGISTER_PARALLEL_JOB(R_AddSingleModel, "R_AddSingleModel");
@@ -1008,13 +1336,21 @@ void R_AddModels()
 {
     SCOPED_PROFILE_EVENT("R_AddModels");
 
+    GD_PASS_BEGIN("sort view entities");
     tr.viewDef->viewEntitys = R_SortViewEntities(tr.viewDef->viewEntitys);
+
+    // counted for r_showPrimitives-style counters and the Vita logs (BFG left
+    // c_visibleViewEntities at 0)
+    for (viewEntity_t* vEntity = tr.viewDef->viewEntitys; vEntity != NULL; vEntity = vEntity->next) {
+        tr.pc.c_visibleViewEntities++;
+    }
 
     //-------------------------------------------------
     // Go through each view entity that is either visible to the view, or to
     // any light that intersects the view (for shadows).
     //-------------------------------------------------
 
+    GD_PASS("model jobs (R_AddSingleModel per entity, plus the queued pre-light shadow jobs)");
     if (r_useParallelAddModels.GetBool()) {
         for (viewEntity_t* vEntity = tr.viewDef->viewEntitys; vEntity != NULL; vEntity = vEntity->next) {
             tr.frontEndJobList->AddJob((jobRun_t)R_AddSingleModel, vEntity);
@@ -1031,6 +1367,7 @@ void R_AddModels()
     // Kick off jobs to setup static and dynamic shadow volumes.
     //-------------------------------------------------
 
+    GD_PASS("shadow volume jobs (static + dynamic, all waited for here)");
     if (r_useParallelAddShadows.GetInteger() == 1) {
         for (viewEntity_t* vEntity = tr.viewDef->viewEntitys; vEntity != NULL; vEntity = vEntity->next) {
             for (staticShadowVolumeParms_t* shadowParms = vEntity->staticShadowVolumes; shadowParms != NULL; shadowParms = shadowParms->next) {
@@ -1067,6 +1404,7 @@ void R_AddModels()
     // Move the draw surfs to the view.
     //-------------------------------------------------
 
+    GD_PASS("link draw surfaces to the view");
     tr.viewDef->numDrawSurfs = 0; // clear the ambient surface list
     tr.viewDef->maxDrawSurfs = 0; // will be set to INITIAL_DRAWSURFS on R_LinkDrawSurfToView
 
@@ -1083,4 +1421,5 @@ void R_AddModels()
         }
         vEntity->drawSurfs = NULL;
     }
+    GD_PASS_END();
 }

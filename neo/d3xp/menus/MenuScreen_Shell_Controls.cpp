@@ -31,6 +31,28 @@ If you have questions concerning this license or the applicable additional terms
 
 const static int NUM_CONTROLS_OPTIONS = 8;
 
+#if defined(__vita__)
+// The stock handlers use the command id as the option's position in the list.
+// That holds only while every option exists; with options compiled out on the
+// Vita a command id can point past the end of the list, and SetFocusIndex()
+// then dereferences a widget that is not there (crash entering the Gamepad
+// screen from Controls). Find where the pressed option really is instead.
+static int VitaSlotOfWidget(idMenuWidget_DynamicList* list, const idMenuWidget* widget)
+{
+    if (list == NULL || widget == NULL) {
+        return -1;
+    }
+    const idMenuWidgetList& children = list->GetChildren();
+    for (int i = 0; i < children.Num(); i++) {
+        if (children[i] == widget) {
+            const int slot = i - list->GetViewOffset();
+            return (slot >= 0 && slot < list->GetNumVisibleOptions()) ? slot : -1;
+        }
+    }
+    return -1;
+}
+#endif
+
 enum contorlsMenuCmds_t {
     CONTROLS_CMD_BINDINGS,
     CONTROLS_CMD_GAMEPAD,
@@ -74,6 +96,8 @@ void idMenuScreen_Shell_Controls::Initialize(idMenuHandler* data)
     AddChild(btnBack);
 
     idMenuWidget_ControlButton* control;
+#if !defined(__vita__)
+    // the Vita's controls are fixed: no key bindings screen
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_BUTTON_TEXT);
     control->SetLabel("#str_swf_keyboard"); // KEY BINDINGS
@@ -81,6 +105,7 @@ void idMenuScreen_Shell_Controls::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, CONTROLS_CMD_BINDINGS);
     control->RegisterEventObserver(helpWidget);
     options->AddChild(control);
+#endif
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_BUTTON_TEXT);
@@ -90,6 +115,8 @@ void idMenuScreen_Shell_Controls::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, CONTROLS_CMD_GAMEPAD);
     options->AddChild(control);
 
+#if !defined(__vita__)
+    // the pad is the Vita's only input and is always on; there is no mouse
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TOGGLE);
     control->SetLabel("#str_swf_gamepad_enabled"); // Gamepad Enabled
@@ -116,6 +143,7 @@ void idMenuScreen_Shell_Controls::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, CONTROLS_CMD_MOUSE_SENS);
     control->RegisterEventObserver(helpWidget);
     options->AddChild(control);
+#endif
 
     options->AddEventAction(WIDGET_EVENT_SCROLL_DOWN).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_SCROLL_DOWN_START_REPEATER, WIDGET_EVENT_SCROLL_DOWN));
     options->AddEventAction(WIDGET_EVENT_SCROLL_UP).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_SCROLL_UP_START_REPEATER, WIDGET_EVENT_SCROLL_UP));
@@ -242,9 +270,16 @@ bool idMenuScreen_Shell_Controls::HandleAction(idWidgetAction& action, const idW
         }
 
         int selectionIndex = options->GetFocusIndex();
+#if defined(__vita__)
+        const int slot = VitaSlotOfWidget(options, widget);
+        if (slot >= 0) {
+            selectionIndex = slot;
+        }
+#else
         if (parms.Num() > 0) {
             selectionIndex = parms[0].ToInteger();
         }
+#endif
 
         if (selectionIndex != options->GetFocusIndex()) {
             options->SetViewIndex(options->GetViewOffset() + selectionIndex);
@@ -350,7 +385,9 @@ void idMenuScreen_Shell_Controls::idMenuDataSource_ControlSettings::CommitData()
     in_mouseInvertLook.SetBool(fields[CONTROLS_FIELD_INVERT_MOUSE].ToBool());
     float mouseSpeed = 0.25f + ((4.0f - 0.25) * (fields[CONTROLS_FIELD_MOUSE_SENS].ToFloat() / 100.0f));
     in_mouseSpeed.SetFloat(mouseSpeed);
+#if !defined(__vita__)
     in_useJoystick.SetBool(fields[CONTROLS_FIELD_GAMEPAD_ENABLED].ToBool());
+#endif
 
     cvarSystem->SetModifiedFlags(CVAR_ARCHIVE);
 

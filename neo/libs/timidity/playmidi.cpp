@@ -64,6 +64,11 @@ static int32_t lost_notes, cut_notes;
 static int32_t* buffer_pointer;
 static int32_t buffered_count;
 extern int32_t* common_buffer;
+// where the next block of output goes: stock code wrote every block of one
+// Timidity_PlaySome call at the start of 'stream' while counting them all in
+// bytes_written, so a call that finished two blocks lost one and the caller's
+// buffer kept a hole of stale bytes (PS Vita port, 2026-10-19)
+static uint8_t* output_cursor;
 
 static MidiEvent *event_list, *current_event;
 static int32_t sample_count, current_sample;
@@ -650,10 +655,11 @@ static int compute_data(void* stream, int32_t count, int* bytes_written)
 
     if (!count) {
         if (buffered_count) {
-            s32tobuf(stream, common_buffer, channels * buffered_count);
+            s32tobuf(output_cursor, common_buffer, channels * buffered_count);
+            output_cursor += channels * buffered_count * ((play_mode->encoding & PE_16BIT) ? 2 : 1);
             if (bytes_written && (play_mode->encoding & PE_16BIT))
                 *bytes_written += channels * buffered_count * 2;
-            else
+            else if (bytes_written)
                 *bytes_written += channels * buffered_count;
 
             // No need anymore
@@ -667,10 +673,11 @@ static int compute_data(void* stream, int32_t count, int* bytes_written)
     while ((count + buffered_count) >= AUDIO_BUFFER_SIZE) {
         do_compute_data(AUDIO_BUFFER_SIZE - buffered_count);
         count -= AUDIO_BUFFER_SIZE - buffered_count;
-        s32tobuf(stream, common_buffer, channels * AUDIO_BUFFER_SIZE);
+        s32tobuf(output_cursor, common_buffer, channels * AUDIO_BUFFER_SIZE);
+        output_cursor += channels * AUDIO_BUFFER_SIZE * ((play_mode->encoding & PE_16BIT) ? 2 : 1);
         if (bytes_written && (play_mode->encoding & PE_16BIT))
             *bytes_written += channels * AUDIO_BUFFER_SIZE * 2;
-        else
+        else if (bytes_written)
             *bytes_written += channels * AUDIO_BUFFER_SIZE;
 
         // play_mode->output_data(stream, channels*AUDIO_BUFFER_SIZE, bytes_written);
@@ -697,6 +704,7 @@ int Timidity_PlaySome(void* stream, int samples, int* bytes_written)
 
     if (bytes_written)
         *bytes_written = 0;
+    output_cursor = (uint8_t*)stream;
 
     if (!midi_playing) {
         return RC_NO_RETURN_VALUE;

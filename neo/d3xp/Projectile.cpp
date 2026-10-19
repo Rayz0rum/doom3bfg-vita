@@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 #pragma hdrstop
 
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT (debris box clip models)
 #include "Game_local.h"
 
 /*
@@ -39,6 +40,12 @@ If you have questions concerning this license or the applicable additional terms
 ===============================================================================
 */
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_debrisTranslationSweep("vita_debrisTranslationSweep", "1", CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "Vita: debris check collisions along their movement only, not their rotation");
+idCVar vita_debrisHalfRate("vita_debrisHalfRate", "1", CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "Vita: moving debris simulate every other tic, two tics at a time");
+idCVar vita_debrisMaxMoveMs("vita_debrisMaxMoveMs", "1500", CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: debris still moving this many ms after their launch are put to rest; 0 = never");
+idCVar vita_debrisClipBox("vita_debrisClipBox", "1", CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "Vita: debris collide as their bounding box instead of a shape made from their model");
+#endif
 idCVar g_projectileDebug("g_projectileDebug", "0", CVAR_BOOL, "Debug projectiles");
 
 // This is used in MP to simulate frames to catchup a projectile's state. Similiar to how players work much lighter weight.
@@ -172,7 +179,7 @@ void idProjectile::Restore(idRestoreGame* savefile)
     savefile->ReadInt(thrust_end);
 
     savefile->ReadRenderLight(renderLight);
-    savefile->ReadInt((int&)lightDefHandle);
+    savefile->ReadEnum(lightDefHandle);
     savefile->ReadVec3(lightOffset);
     savefile->ReadInt(lightStartTime);
     savefile->ReadInt(lightEndTime);
@@ -183,7 +190,7 @@ void idProjectile::Restore(idRestoreGame* savefile)
 
     savefile->ReadInt(originalTimeGroup);
 
-    savefile->ReadInt((int&)state);
+    savefile->ReadEnum(state);
 
     savefile->ReadFloat(damagePower);
 
@@ -689,8 +696,10 @@ bool idProjectile::Collide(const trace_t& collision, const idVec3& velocity)
             }
 
             // Only handle the server's own attacks here. Attacks by other players on the server occur through
-            // reliable messages.
-            if (!common->IsMultiplayer() || common->IsClient() || (common->IsServer() && owner.GetEntityNum() == gameLocal.GetLocalClientNum()) || (common->IsServer() && !isHitscan)) {
+            // reliable messages. A bot (VitaBots.cpp) has no console to report its hits: its are the server's own.
+            extern bool VitaBot_IsBot(int clientNum);
+            if (!common->IsMultiplayer() || common->IsClient() || (common->IsServer() && owner.GetEntityNum() == gameLocal.GetLocalClientNum()) || (common->IsServer() && !isHitscan)
+                || (common->IsServer() && VitaBot_IsBot(owner.GetEntityNum()))) {
                 ent->Damage(this, owner.GetEntity(), dir, damageDefName, damageScale, CLIPMODEL_ID_TO_JOINT_HANDLE(collision.c.id));
             } else {
                 if (ent->IsType(idPlayer::Type) == false && common->IsServer()) {
@@ -2632,6 +2641,17 @@ void idDebris::Launch()
     }
 
     // load the trace model
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): debris collide as their bounding box - a trace model made
+    // from the visual model cost up to 30 ms in a frame of rigid body
+    // collisions (alphalabs4 fight 2's hitches); a box is the cheapest shape
+    if (vita_debrisClipBox.GetBool()) {
+        VITA_ZONE_COUNT("debris launched with a box clip model (vita_debrisClipBox)");
+        vitaLaunchTime = gameLocal.time;
+        physicsObj.vitaTranslationSweepOnly = vita_debrisTranslationSweep.GetBool();
+        physicsObj.SetClipBox(renderEntity.bounds, 1.0f);
+    } else
+#endif
     if (!collisionModelManager->TrmFromModel(clipModelName, trm)) {
         // default to a box
         physicsObj.SetClipBox(renderEntity.bounds, 1.0f);
@@ -2700,6 +2720,28 @@ idDebris::Think
 */
 void idDebris::Think()
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (cuts): debris physics was 26-32 ms in single frames of
+    // alphalabs4 fight 3 (box clip models or not). Moving debris simulate
+    // every other tic, two tics at a time (idEntity::VitaHalfRateTic), and
+    // are put to rest vita_debrisMaxMoveMs after their launch.
+    if (vita_debrisMaxMoveMs.GetInteger() > 0 && !physicsObj.IsAtRest() && vitaLaunchTime > 0 && gameLocal.time - vitaLaunchTime > vita_debrisMaxMoveMs.GetInteger()) {
+        VITA_ZONE_COUNT("debris put to rest (vita_debrisMaxMoveMs)");
+        physicsObj.PutToRest();
+    }
+    int vitaSkipTime = 0;
+    vitaThinkSpan_t vitaSpan(&vitaLastThinkTime);
+    const int vitaTic = VitaHalfRateTic(vita_debrisHalfRate.GetBool() && !physicsObj.IsAtRest());
+    if (vitaTic == VITA_THINK_SKIP) {
+        VITA_ZONE_COUNT("half-rate think: debris tics off (vita_debrisHalfRate)");
+        vitaSpan.lastThink = &vitaSkipTime;
+        return;
+    }
+    if (vitaTic == VITA_THINK_TWO_TICS) {
+        vitaSpan.Span();
+    }
+    VITA_ZONE_COUNT("debris thinks (physics)");
+#endif
 
     // run physics
     RunPhysics();

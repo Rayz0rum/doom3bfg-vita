@@ -29,17 +29,29 @@ If you have questions concerning this license or the applicable additional terms
 #include "../../idlib/precompiled.h"
 #include "../sys_local.h"
 
+#if defined(__vita__)
+#include "../vita/vita_public.h"
+#endif
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <dirent.h>
 #include <unistd.h>
+#if !defined(__vita__)
 #include <sys/mman.h>
+#endif
 #include <sys/time.h>
 #include <pwd.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#if defined(__vita__)
+// The Vita sysroot ships a termios.h that pulls in a sys/termios.h it does not
+// have, and there is no controlling terminal to configure anyway.
+#define NO_TTY_SUPPORT 1
+#else
 #include <termios.h>
+#endif
 #include <signal.h>
 #include <fcntl.h>
 #include <fnmatch.h>
@@ -79,7 +91,9 @@ idEditField history_backup;            // the base edit line
 idCVar in_tty("in_tty", "1", CVAR_BOOL | CVAR_INIT | CVAR_SYSTEM, "terminal tab-completion and history");
 
 static bool tty_enabled = false;
+#if !defined(NO_TTY_SUPPORT)
 static struct termios tty_tc;
+#endif
 
 // pid - useful when you attach to gdb..
 idCVar com_pid("com_pid", "0", CVAR_INTEGER | CVAR_INIT | CVAR_SYSTEM, "process id");
@@ -96,7 +110,11 @@ static char exit_spawn[1024];
  */
 const char* Sys_DefaultSavePath()
 {
-#if defined(__APPLE__)
+#if defined(__vita__)
+    // There is no HOME or XDG_DATA_HOME here, and sprintf( "%s/...", getenv( "HOME" ) )
+    // on a NULL would take the process down before anything reaches the screen.
+    savepath = DEFAULT_BASEPATH;
+#elif defined(__APPLE__)
     char* base_path = SDL_GetPrefPath("", "RBDOOM-3-BFG");
     if (base_path) {
         savepath = base_path;
@@ -122,12 +140,17 @@ Posix_Exit
 */
 void Posix_Exit(int ret)
 {
+#if defined(__vita__)
+    Vita_LogFlush(); // the log thread will not run again
+#endif
+#if !defined(NO_TTY_SUPPORT)
     if (tty_enabled) {
         Sys_Printf("shutdown terminal support\n");
         if (tcsetattr(0, TCSADRAIN, &tty_tc) == -1) {
             Sys_Printf("tcsetattr failed: %s\n", strerror(errno));
         }
     }
+#endif
     // at this point, too late to catch signals
     Posix_ClearSigs();
 
@@ -294,7 +317,14 @@ Sys_Milliseconds
    assuming this wraps every 0x7fffffff - ~68 years since the Epoch (1970) - we're safe till 2038
    using unsigned long data type to work right with Sys_XTimeToSysTime */
 
-#ifdef CLOCK_MONOTONIC_RAW
+#if defined(__vita__)
+// The Vita's time.h defines CLOCK_MONOTONIC_RAW, but its clock_gettime only
+// implements CLOCK_REALTIME and CLOCK_MONOTONIC - every other id sets EINVAL,
+// returns -1 and leaves the timespec untouched. Selecting RAW here would make
+// Sys_Milliseconds() and Sys_Microseconds() read uninitialised stack on every
+// call, so name the clock that is actually implemented.
+#define D3_CLOCK_TO_USE CLOCK_MONOTONIC
+#elif defined(CLOCK_MONOTONIC_RAW)
 // use RAW monotonic clock if available (=> not subject to NTP etc)
 #define D3_CLOCK_TO_USE CLOCK_MONOTONIC_RAW
 #else
@@ -309,8 +339,69 @@ unsigned int sys_timeBase = 0;
      0x7fffffff ms - ~24 days
                  or is it 48 days? the specs say int, but maybe it's casted from unsigned int?
 */
+#if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
+
+/*
+================
+Vita_ProcessTimeUs
+
+The process clock in microseconds, read through its 32-bit half.
+sceKernelGetProcessTimeLow costs 0.41 us a read against 0.74 for the 64-bit
+sceKernelGetProcessTimeWide (measured, bench header), and a timed zone of the
+perf log reads the clock twice - a thousand and more a frame on the game/draw
+thread in a fight. The low half wraps every 71.6 minutes, so it is extended
+from a 64-bit base taken with the wide read: base + (low - low half of base),
+exact as long as the base is younger than 71 minutes. The base is renewed by
+whichever thread first finds it 18 minutes old (a try-lock: the others go on
+with the old one, still valid), written into the slot readers are not using
+before the generation that picks it moves on.
+
+At the first read, the low half is checked against the wide read (the same
+clock if they differ by under a millisecond); if not, every read is a wide one.
+================
+*/
+static volatile uint64 vitaClockBase[2] = { 0, 0 };
+static volatile unsigned int vitaClockGeneration = 0;
+static volatile int vitaClockLock = 0;
+static volatile int vitaClockMode = 0; // 0 not checked yet, 1 low half + base, 2 wide reads only
+
+static ID_INLINE uint64 Vita_ProcessTimeUs()
+{
+    if (vitaClockMode != 1) {
+        if (vitaClockMode == 0) {
+            const uint64 wide = sceKernelGetProcessTimeWide();
+            const uint32 low = sceKernelGetProcessTimeLow();
+            const uint32 diff = low - (uint32)wide;
+            vitaClockBase[0] = vitaClockBase[1] = wide;
+            __sync_synchronize();
+            vitaClockMode = (diff < 1000) ? 1 : 2;
+        }
+        if (vitaClockMode != 1) {
+            return sceKernelGetProcessTimeWide();
+        }
+    }
+    // no barrier here: the slot index depends on the generation read (an
+    // address dependency orders the two loads on ARM)
+    const unsigned int generation = vitaClockGeneration;
+    const uint64 base = vitaClockBase[generation & 1];
+    const uint32 sinceBase = sceKernelGetProcessTimeLow() - (uint32)base;
+    if (sinceBase > (1u << 30) && __sync_lock_test_and_set(&vitaClockLock, 1) == 0) {
+        vitaClockBase[(vitaClockGeneration + 1) & 1] = sceKernelGetProcessTimeWide();
+        __sync_synchronize();
+        vitaClockGeneration++;
+        __sync_lock_release(&vitaClockLock);
+    }
+    return base + sinceBase;
+}
+#endif
+
 int Sys_Milliseconds()
 {
+#if defined(__vita__)
+    // the process clock (microseconds since it started), as Sys_Microseconds
+    return (int)(Vita_ProcessTimeUs() / 1000);
+#endif
     // DG: use clock_gettime on all platforms
 #if 1
     int curtime;
@@ -357,6 +448,15 @@ static uint64 sys_microTimeBase = 0;
 
 uint64 Sys_Microseconds()
 {
+#if defined(__vita__)
+    // Vita: the process clock, in microseconds already. clock_gettime went
+    // through newlib's wrapper, a timespec and 64-bit multiplies and divides
+    // (library calls on ARMv7) - 1.07 us a read, measured - and every timed
+    // zone of the perf log reads the clock twice, ~1,300 times a frame in a
+    // fight: ~3 ms of the game/draw thread spent timing itself.
+    // Its 32-bit half read and extended since (Vita_ProcessTimeUs): 0.41 us.
+    return Vita_ProcessTimeUs();
+#endif
 #if 0
 	static uint64 ticksPerMicrosecondTimes1024 = 0;
 
@@ -408,6 +508,27 @@ Try to be intelligent: if there is no BASE_GAMEDIR, try the next path
 */
 const char* Sys_DefaultBasePath()
 {
+#if defined(__vita__)
+    // Sys_EXEPath() is app0:/eboot.bin and app0: is the read-only mount of the
+    // installed VPK, so probing it for BASE_GAMEDIR is pointless. Prefer the data
+    // directory, but still honour app0: if someone has bundled base/ into the VPK.
+    struct stat vst;
+    basepath = DEFAULT_BASEPATH;
+    idStr vtest = basepath + "/" + BASE_GAMEDIR;
+    if (stat(vtest.c_str(), &vst) != -1 && S_ISDIR(vst.st_mode)) {
+        return basepath.c_str();
+    }
+
+    basepath = "app0:";
+    vtest = basepath + "/" + BASE_GAMEDIR;
+    if (stat(vtest.c_str(), &vst) != -1 && S_ISDIR(vst.st_mode)) {
+        return basepath.c_str();
+    }
+
+    common->Printf("no '%s' directory in %s or app0:\n", BASE_GAMEDIR, DEFAULT_BASEPATH);
+    basepath = DEFAULT_BASEPATH;
+    return basepath.c_str();
+#else
     struct stat st;
     idStr testbase, exepath = {};
     basepath = Sys_EXEPath();
@@ -464,6 +585,7 @@ const char* Sys_DefaultBasePath()
     }
     common->Printf("WARNING: using hardcoded default base path %s\n", DEFAULT_BASEPATH);
     return DEFAULT_BASEPATH;
+#endif // !__vita__
 }
 
 /*
@@ -1015,6 +1137,12 @@ Posix_InitConsoleInput
 */
 void Posix_InitConsoleInput()
 {
+#if defined(NO_TTY_SUPPORT)
+    in_tty.SetBool(false);
+    tty_enabled = false;
+    Sys_Printf("terminal support disabled: no tty on this platform\n");
+    return;
+#else
     struct termios tc;
 
     if (in_tty.GetBool()) {
@@ -1074,6 +1202,7 @@ void Posix_InitConsoleInput()
     } else {
         Sys_Printf("terminal support disabled\n");
     }
+#endif // !NO_TTY_SUPPORT
 }
 
 /*
@@ -1179,6 +1308,15 @@ Return NULL if a complete line is not ready.
 */
 char* Posix_ConsoleInput()
 {
+#if defined(__vita__)
+    // The Vita has no stdin to poll, and the tty_enabled == false path below
+    // calls select() on STDIN_FILENO once per frame from Sys_GenerateEvents().
+    // VitaSDK implements select() over SceNet: handed fd 0 it looks up a
+    // descriptor that was never registered and calls through the null pointer
+    // it finds there, so the very first frame branches to address 0. Nothing
+    // can ever arrive on this path, so do not ask.
+    return NULL;
+#else
     if (tty_enabled) {
         int ret;
         char key;
@@ -1431,9 +1569,10 @@ char* Posix_ConsoleInput()
 
         input_ret[len - 1] = '\0'; // rip off the \n and terminate
         return input_ret;
-#endif
+#endif // !__APPLE__
     }
     return NULL;
+#endif // !__vita__
 }
 
 /*
@@ -1466,7 +1605,17 @@ low level output
 
 void Sys_DebugPrintf(const char* fmt, ...)
 {
-#if defined(__ANDROID__)
+#if defined(__vita__)
+    va_list argptr;
+    char msg[4096];
+
+    va_start(argptr, fmt);
+    idStr::vsnPrintf(msg, sizeof(msg), fmt, argptr);
+    va_end(argptr);
+    msg[sizeof(msg) - 1] = 0;
+
+    Vita_Log(msg);
+#elif defined(__ANDROID__)
     va_list argptr;
     char msg[4096];
 
@@ -1489,7 +1638,14 @@ void Sys_DebugPrintf(const char* fmt, ...)
 
 void Sys_DebugVPrintf(const char* fmt, va_list arg)
 {
-#if defined(__ANDROID__)
+#if defined(__vita__)
+    // Sys_Error() reports the actual failure through this, so losing it to a
+    // vprintf that goes nowhere would throw away the one line worth reading.
+    char msg[4096];
+    idStr::vsnPrintf(msg, sizeof(msg), fmt, arg);
+    msg[sizeof(msg) - 1] = 0;
+    Vita_Log(msg);
+#elif defined(__ANDROID__)
     __android_log_vprint(ANDROID_LOG_DEBUG, "RBDoom3_Debug", fmt, arg);
 #else
     tty_Hide();
@@ -1500,7 +1656,18 @@ void Sys_DebugVPrintf(const char* fmt, va_list arg)
 
 void Sys_Printf(const char* fmt, ...)
 {
-#if defined(__ANDROID__)
+#if defined(__vita__)
+    // There is no stdout here, so vprintf() would discard this. See Vita_Log().
+    va_list argptr;
+    char msg[4096];
+
+    va_start(argptr, fmt);
+    idStr::vsnPrintf(msg, sizeof(msg), fmt, argptr);
+    va_end(argptr);
+    msg[sizeof(msg) - 1] = 0;
+
+    Vita_Log(msg);
+#elif defined(__ANDROID__)
     va_list argptr;
     char msg[4096];
 
@@ -1523,7 +1690,12 @@ void Sys_Printf(const char* fmt, ...)
 
 void Sys_VPrintf(const char* fmt, va_list arg)
 {
-#if defined(__ANDROID__)
+#if defined(__vita__)
+    char msg[4096];
+    idStr::vsnPrintf(msg, sizeof(msg), fmt, arg);
+    msg[sizeof(msg) - 1] = 0;
+    Vita_Log(msg);
+#elif defined(__ANDROID__)
     __android_log_vprint(ANDROID_LOG_DEBUG, "RBDoom3", fmt, arg);
 #else
     tty_Hide();

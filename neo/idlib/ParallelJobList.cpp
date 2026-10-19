@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "ParallelJobList.h"
+#include "../sys/vita/vita_zones.h" // the game/draw thread's tree of passes (VitaBench.cpp)
 
 /*
 ================================================================================================
@@ -52,7 +53,28 @@ static int numRegisteredJobs;
 
 const char* GetJobListName(jobListId_t id)
 {
-    return jobNames[id];
+    // jobNames holds three names, but the ids are 0, 1 and 9 (and any other
+    // number up to MAX_JOBLISTS): indexing it with the id read past its end.
+    // The classic DOOM frame copy waits on a JOBLIST_UTILITY (9) list, and
+    // formatting that garbage pointer into "wait: job list '%s'" crashed the
+    // first DOOM I frame (strlen on 0xFFFFFFF8).
+    switch (id) {
+    case JOBLIST_RENDERER_FRONTEND:
+        return jobNames[0];
+    case JOBLIST_RENDERER_BACKEND:
+        return jobNames[1];
+    case JOBLIST_UTILITY:
+        return jobNames[2];
+    default:
+        break;
+    }
+    static const char* const others[MAX_JOBLISTS] = {
+        "job list 0", "job list 1", "job list 2", "job list 3", "job list 4", "job list 5", "job list 6", "job list 7",
+        "job list 8", "job list 9", "job list 10", "job list 11", "job list 12", "job list 13", "job list 14", "job list 15",
+        "job list 16", "job list 17", "job list 18", "job list 19", "job list 20", "job list 21", "job list 22", "job list 23",
+        "job list 24", "job list 25", "job list 26", "job list 27", "job list 28", "job list 29", "job list 30", "job list 31"
+    };
+    return ((int)id >= 0 && (int)id < MAX_JOBLISTS) ? others[id] : "job list ?";
 }
 
 /*
@@ -131,6 +153,82 @@ idParallelJobList_Threads
 ================================================================================================
 */
 
+#if defined(__vita__)
+int vita_longJobs = 0, vita_longJobsPrinted = 0;
+#endif
+// jobs run per job thread (slot 31: the threads that wait on a list and help)
+// and the latest jobs over 3 ms, for the benchmark (VitaBench.cpp)
+int vita_benchJobCount[32];
+uint64 vita_benchJobUs[32];
+// The tail of a wait: once the waiting thread finds nothing left to take, it
+// idles until the jobs still running elsewhere end (run 7: 3.1 ms a frame in
+// the slow fights on the front end's list). Each thread notes when its
+// current job started; the tail is charged to the thread holding the oldest
+// one - the straggler - so the log says who the frame waited on (a core 1-2
+// worker sharing its core, or the core-0 helper under the main thread and
+// the OpenAL mixer).
+volatile uint64 vita_jobRunningSince[32];
+uint64 vita_benchTailWaitUs[32];
+int vita_benchTailWaits[32];
+vitaBenchSlowJob_t vita_benchSlowJobs[VITA_BENCH_SLOW_JOBS];
+idSysInterlockedInteger vita_benchSlowJobNext;
+// every job by type (VitaBench.cpp prints them per segment)
+vitaBenchJobType_t vita_benchJobTypes[VITA_BENCH_JOB_TYPES];
+volatile int vita_benchNumJobTypes = 0;
+static char vitaJobNodeNames[VITA_BENCH_JOB_TYPES][64];
+static volatile int vitaJobTypeLock = 0;
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+bool VitaGD_OnThread(); // VitaBench.cpp: running on the game/draw thread
+#endif
+
+static int Vita_BenchJobTypeIndex(jobRun_t function)
+{
+    const int n = vita_benchNumJobTypes;
+    for (int i = 0; i < n; i++) {
+        if (vita_benchJobTypes[i].function == (const void*)function) {
+            return i;
+        }
+    }
+    // a type not seen yet: added under a spin lock (once per type)
+    while (__sync_lock_test_and_set(&vitaJobTypeLock, 1) != 0) {
+    }
+    int k = -1;
+    for (int i = 0; i < vita_benchNumJobTypes; i++) {
+        if (vita_benchJobTypes[i].function == (const void*)function) {
+            k = i;
+        }
+    }
+    if (k < 0 && vita_benchNumJobTypes < VITA_BENCH_JOB_TYPES) {
+        k = vita_benchNumJobTypes;
+        vitaBenchJobType_t& jt = vita_benchJobTypes[k];
+        memset(&jt, 0, sizeof(jt));
+        jt.function = (const void*)function;
+        jt.name = GetJobName(function);
+        idStr::snPrintf(vitaJobNodeNames[k], sizeof(vitaJobNodeNames[k]), "job: %s", jt.name);
+        __sync_synchronize();
+        vita_benchNumJobTypes = k + 1;
+    }
+    __sync_lock_release(&vitaJobTypeLock);
+    return k;
+}
+
+// the name of a job list's wait in the game/draw thread's tree
+static const char* Vita_WaitNodeName(int id)
+{
+    static char names[64][64];
+    if (id < 0 || id >= 64) {
+        return "wait: job list";
+    }
+    if (names[id][0] == 0) {
+        idStr::snPrintf(names[id], sizeof(names[id]), "wait: job list '%s'", GetJobListName((jobListId_t)id));
+    }
+    return names[id];
+}
+#if defined(__vita__)
+uint64 vita_longJobWorstUs = 0;
+const char* vita_longJobWorstName = "";
+#endif
 static idCVar jobs_longJobMicroSec("jobs_longJobMicroSec", "10000", CVAR_INTEGER, "print a warning for jobs that take more than this number of microseconds");
 
 const static int MAX_THREADS = 32;
@@ -477,10 +575,55 @@ void idParallelJobList_Threads::Wait()
 
         bool waited = false;
         uint64 waitStart = Sys_Microseconds();
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // on the game/draw thread: a node of its tree, with the jobs it runs
+        // itself below it (the node's own time is the idle wait)
+        vitaGDScope_t gdWait(Vita_WaitNodeName(GetId()));
+#endif
 
-        while (signalJobCount[signalJobCount.Num() - 1].GetValue() > 0) {
-            Sys_Yield();
-            waited = true;
+#if defined(__vita__)
+        // Help instead of spinning: the waiting thread (Game/Draw waiting on
+        // the front end's model, light and shadow jobs) takes jobs from the
+        // list like a worker would - the fetch is atomic and each worker
+        // keeps its own state - so its core works through the queue too.
+        // Slot 31 of the per-thread stats is free (MAX_THREADS is 32).
+        {
+            threadJobListState_t helper(version.GetValue());
+            helper.jobList = this;
+            while (signalJobCount[signalJobCount.Num() - 1].GetValue() > 0) {
+                const int r = RunJobs(MAX_THREADS - 1, helper, false);
+                if ((r & RUN_DONE) != 0) {
+                    break; // nothing left to fetch; the rest is being executed elsewhere
+                }
+                if ((r & RUN_PROGRESS) == 0) {
+                    Sys_Yield();
+                }
+                waited = true;
+            }
+        }
+#endif
+        {
+            // the tail (see vita_jobRunningSince): charged to the straggler
+            const uint64 tailStart = Sys_Microseconds();
+            int straggler = -1;
+            uint64 oldest = 0;
+            for (int t = 0; t < MAX_THREADS - 1; t++) {
+                const uint64 since = vita_jobRunningSince[t];
+                if (since != 0 && (straggler < 0 || since < oldest)) {
+                    straggler = t;
+                    oldest = since;
+                }
+            }
+            bool tail = false;
+            while (signalJobCount[signalJobCount.Num() - 1].GetValue() > 0) {
+                Sys_Yield();
+                waited = true;
+                tail = true;
+            }
+            if (tail && straggler >= 0) {
+                vita_benchTailWaitUs[straggler] += Sys_Microseconds() - tailStart;
+                vita_benchTailWaits[straggler]++;
+            }
         }
         version.Increment();
         while (numThreadsExecuting.GetValue() > 0) {
@@ -677,12 +820,53 @@ int idParallelJobList_Threads::RunJobsInternal(unsigned int threadNum, threadJob
         // execute the next job
         {
             uint64 jobStart = Sys_Microseconds();
+            vita_jobRunningSince[threadNum] = jobStart;
+            const int jobType = Vita_BenchJobTypeIndex(jobList[state.nextJobIndex].function);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            const bool onGD = (threadNum == MAX_THREADS - 1) && VitaGD_OnThread();
+            const int gdParent = onGD && jobType >= 0 ? VitaGD_PushAt(vitaJobNodeNames[jobType], jobStart) : -1;
+#endif
 
             jobList[state.nextJobIndex].function(jobList[state.nextJobIndex].data);
             jobList[state.nextJobIndex].executed = 1;
 
             uint64 jobEnd = Sys_Microseconds();
+            vita_jobRunningSince[threadNum] = 0;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+            VitaGD_PopAt(gdParent, jobEnd);
+#else
+            const bool onGD = false;
+#endif
+            if (jobType >= 0) {
+                vitaBenchJobType_t& jt = vita_benchJobTypes[jobType];
+                const int jus = (int)(jobEnd - jobStart);
+                __sync_fetch_and_add(&jt.count, 1);
+                __sync_fetch_and_add(&jt.us, (uint64)jus);
+                if (onGD) {
+                    __sync_fetch_and_add(&jt.gdCount, 1);
+                    __sync_fetch_and_add(&jt.gdUs, (uint64)jus);
+                }
+                if (jus > jt.maxUs) {
+                    jt.maxUs = jus; // racy, a report figure only
+                }
+            }
             deferredThreadStats.threadExecTime[threadNum] += jobEnd - jobStart;
+            {
+                // for the benchmark's log (VitaBench.cpp): jobs per thread,
+                // and every job over 3 ms with its list and thread
+                const uint64 jobUs = jobEnd - jobStart;
+                vita_benchJobCount[threadNum]++;
+                vita_benchJobUs[threadNum] += jobUs;
+                if (jobUs >= 3000) {
+                    const int slot = (vita_benchSlowJobNext.Increment() - 1) & (VITA_BENCH_SLOW_JOBS - 1);
+                    vitaBenchSlowJob_t& s = vita_benchSlowJobs[slot];
+                    s.name = GetJobName(jobList[state.nextJobIndex].function);
+                    s.list = GetJobListName(GetId());
+                    s.us = (int)jobUs;
+                    s.thread = (int)threadNum;
+                    s.endUs = jobEnd;
+                }
+            }
 
 #ifndef _DEBUG
             if (jobs_longJobMicroSec.GetInteger() > 0) {
@@ -693,7 +877,25 @@ int idParallelJobList_Threads::RunJobsInternal(unsigned int threadNum, threadJob
                     longJobData = jobList[state.nextJobIndex].data;
                     const char* jobName = GetJobName(jobList[state.nextJobIndex].function);
                     const char* jobListName = GetJobListName(GetId());
+#if defined(__vita__)
+                    // dozens a second in mars_city2, each a log write to the
+                    // card (and a float format on a job thread): counted and
+                    // summed up in the perf line instead, the first 8 printed
+                    extern int vita_longJobs, vita_longJobsPrinted;
+                    extern uint64 vita_longJobWorstUs;
+                    extern const char* vita_longJobWorstName;
+                    vita_longJobs++;
+                    if (jobEnd - jobStart > vita_longJobWorstUs) {
+                        vita_longJobWorstUs = jobEnd - jobStart;
+                        vita_longJobWorstName = jobName;
+                    }
+                    if (vita_longJobsPrinted < 8) {
+                        vita_longJobsPrinted++;
+                        idLib::Printf("%d microseconds for a single '%s' job from job list %s on thread %d\n", (int)(jobEnd - jobStart), jobName, jobListName, threadNum);
+                    }
+#else
                     idLib::Printf("%1.1f milliseconds for a single '%s' job from job list %s on thread %d\n", longJobTime, jobName, jobListName, threadNum);
+#endif
                 }
             }
 #endif
@@ -1068,11 +1270,50 @@ void idJobThread::AddJobList(idParallelJobList_Threads* jobList)
 idJobThread::Run
 ========================
 */
+#if defined(__vita__)
+// the core-0 worker's gate (see VITA_JOB_THREAD_CORES): open while the main
+// thread is blocked waiting for Game/Draw
+#define VITA_CORE0_WORKER 3
+
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+// Where the three core 1-2 workers run (vita_jobWorkerCores): Game/Draw is on
+// core 1 at a lower priority than the workers, so a worker landing on core 1
+// preempts Game/Draw's own serial front-end work - the frame's critical path -
+// for as long as its job lasts. 1 keeps them on core 2: core 1 is Game/Draw's
+// alone (it still takes jobs while it waits for a list), core 0's gated helper
+// as before. Applied by each worker to itself between job lists, so the
+// benchmark can switch it mid-run and compare (VitaBench script: set).
+idCVar vita_jobWorkerCores("vita_jobWorkerCores", "0", CVAR_INTEGER, "the core 1-2 job workers: 0 on cores 1 and 2 (shared with Game/Draw on core 1), 1 on core 2 only (core 1 left to Game/Draw)", 0, 1);
+static volatile int vitaJobWorkerCoresWanted = 0;
+static int vitaJobWorkerCoresApplied[32]; // (MAX_JOB_THREADS is defined below)
+#endif
+static volatile int vitaMainWaiting = 0;
+static idSysSignal vitaMainWaitingSignal;
+void Vita_JobsMainWaiting(bool waiting)
+{
+    vitaMainWaiting = waiting ? 1 : 0;
+    if (waiting) {
+        vitaMainWaitingSignal.Raise();
+    }
+}
+#endif
+
 int idJobThread::Run()
 {
     threadJobListState_t threadJobListState[MAX_JOBLISTS];
     int numJobLists = 0;
     int lastStalledJobList = -1;
+#if defined(__vita__)
+    if (threadNum != VITA_CORE0_WORKER && threadNum < 32 && vitaJobWorkerCoresApplied[threadNum] != vitaJobWorkerCoresWanted + 1) {
+        const int wanted = vitaJobWorkerCoresWanted;
+        const int mask = (wanted == 1) ? SCE_KERNEL_CPU_MASK_USER_2 : (SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
+        const int r = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), mask);
+        vitaJobWorkerCoresApplied[threadNum] = wanted + 1;
+        idLib::Printf("vita: job worker %d now on %s (vita_jobWorkerCores %d)%s\n", threadNum, wanted == 1 ? "core 2 only" : "cores 1-2", wanted,
+            r < 0 ? va(" - REFUSED 0x%08X", (unsigned int)r) : "");
+    }
+#endif
 
     while (!IsTerminating()) {
 
@@ -1089,6 +1330,39 @@ int idJobThread::Run()
         if (numJobLists == 0) {
             break;
         }
+#if defined(__vita__)
+        if (threadNum == VITA_CORE0_WORKER && !vitaMainWaiting) {
+            // The main thread may wake and need core 0 at any moment: take
+            // no job until it is waiting for Game/Draw. But keep the queue
+            // moving - lists are queued to this thread whatever it does, and
+            // a full queue makes Submit (AddJobList) spin: a map load, with
+            // the main thread never waiting for Game/Draw, froze that way.
+            // Lists already done (their version moved on, the test RunJobs
+            // makes) are dropped; the rest are finished by the others.
+            for (int i = 0; i < numJobLists;) {
+                if (threadJobListState[i].version != threadJobListState[i].jobList->GetVersion()) {
+                    threadJobListState[i] = threadJobListState[--numJobLists];
+                } else {
+                    i++;
+                }
+            }
+            lastStalledJobList = -1;
+            while (numJobLists < MAX_JOBLISTS && firstJobList < lastJobList) {
+                threadJobListState[numJobLists].jobList = jobLists[firstJobList & (MAX_JOBLISTS - 1)].jobList;
+                threadJobListState[numJobLists].version = jobLists[firstJobList & (MAX_JOBLISTS - 1)].version;
+                threadJobListState[numJobLists].signalIndex = 0;
+                threadJobListState[numJobLists].lastJobIndex = 0;
+                threadJobListState[numJobLists].nextJobIndex = -1;
+                numJobLists++;
+                firstJobList++;
+            }
+            if (numJobLists == 0) {
+                break; // nothing pending: sleep until the next list is queued
+            }
+            vitaMainWaitingSignal.Wait(1);
+            continue;
+        }
+#endif
 
         int currentJobList = 0;
         jobListPriority_t priority = JOBLIST_PRIORITY_NONE;
@@ -1115,6 +1389,11 @@ int idJobThread::Run()
         // if the priority is high then try to run through the whole list to reduce the overhead
         // otherwise run a single job and re-evaluate priorities for the next job
         bool singleJob = (priority == JOBLIST_PRIORITY_HIGH) ? false : jobs_prioritize.GetBool();
+#if defined(__vita__)
+        if (threadNum == VITA_CORE0_WORKER) {
+            singleJob = true; // back to the gate between jobs
+        }
+#endif
 
         // try running one or more jobs from the current job list
         int result = threadJobListState[currentJobList].jobList->RunJobs(threadNum, threadJobListState[currentJobList], singleJob);
@@ -1172,8 +1451,49 @@ extern void Sys_CPUCount(int& logicalNum, int& coreNum, int& packageNum);
 // Hyperthreading is not dead yet.  Intel's Core i7 Processor is quad-core with HT for 8 logicals.
 
 // DOOM3: We don't have that many jobs, so just set this fairly low so we don't spin up a ton of idle threads
+#if defined(__vita__)
+// Init() starts MAX_JOB_THREADS threads unconditionally and then only ever uses
+// jobs_numThreads (default 2) of them. On a desktop the 30 idle threads cost
+// almost nothing because their stacks are never faulted in; on the Vita every
+// stack is committed up front - 32 * JOB_THREAD_STACK_SIZE is 8 MB - and each
+// one is a real kernel thread on a console with three usable cores. This also
+// clamps the jobs_numThreads cvar, which is declared with MAX_JOB_THREADS as
+// its upper bound, so it can never select a thread that was not started.
+#define MAX_JOB_THREADS 4
+#else
 #define MAX_JOB_THREADS 32
+#endif
+#if defined(__vita__)
+#define NUM_JOB_THREADS "4"
+// Every job list here is waited on within the frame (the front end's model,
+// light and shadow jobs, classic DOOM's columns), so a job held by a thread
+// the OS stops is a frame hitch. Core 3 is the OS's when it wants it (even
+// with CapUnlocker), so no job worker goes there - core 3 only gets work
+// nobody waits for (the log writer, the watchdog, savegame compression; see
+// vita_main.cpp and File_SaveGame.cpp). The workers run on cores 1 and 2
+// (Thread.cpp: core_t 7), never on core 0: there the render back end and
+// OpenAL's mixer run at priority 0x40/0x41, above the workers (0x9F), and
+// stopped whatever job a worker held - the front end then waited for that
+// one job (the benchmark measured 3-7 ms "single jobs", 6% of the shadow
+// volume jobs, for shapes the PC builds in 10 us). Core 2 has nothing above
+// them now (the mixer moved to core 0, vita_main.cpp), and on core 1 they
+// share with Game/Draw at the same priority - which, waiting on a list,
+// takes jobs too.
+//
+// The fourth worker is on core 0 - but only takes jobs while the main thread
+// is blocked waiting for Game/Draw (Vita_JobsMainWaiting below). The front
+// end's jobs ran on cores 1 and 2 only, Game/Draw sharing core 1 with a
+// worker, so in the benchmark's fights Game/Draw ran half of them itself
+// (27 of 54 ms of job time a frame) while the main thread sat in "wait for
+// game/draw" on core 0 for 70 ms. A job this worker takes then cannot be
+// stopped by the back end: the main thread only wakes from that wait when
+// Game/Draw is done, and Game/Draw is only done once every front end job
+// is. When the main thread is busy the worker does not fetch jobs at all.
+#define VITA_JOB_THREAD_CORES { (core_t)7, (core_t)7, (core_t)7, CORE_0A } // VITA_CORE0_WORKER (3) last
+bool Vita_Core3Available(); // vita_main.cpp
+#else
 #define NUM_JOB_THREADS "2"
+#endif
 #define JOB_THREAD_CORES { CORE_ANY, CORE_ANY, CORE_ANY, CORE_ANY, \
     CORE_ANY, CORE_ANY, CORE_ANY, CORE_ANY,                        \
     CORE_ANY, CORE_ANY, CORE_ANY, CORE_ANY,                        \
@@ -1235,7 +1555,13 @@ idParallelJobManagerLocal::Init
 void idParallelJobManagerLocal::Init()
 {
     // on consoles this will have specific cores for the threads, but on PC they will all be CORE_ANY
+#if defined(__vita__)
+    core_t cores[] = VITA_JOB_THREAD_CORES;
+    idLib::Printf("vita: %d job threads - three on cores 1-2, the fourth on core 0 taking jobs only while the main thread waits for game/draw; none on core 3: %s - it only runs work nothing waits for\n", jobs_numThreads.GetInteger(),
+        Vita_Core3Available() ? "available through CapUnlocker or similar" : "kept by the system");
+#else
     core_t cores[] = JOB_THREAD_CORES;
+#endif
     assert(sizeof(cores) / sizeof(cores[0]) >= MAX_JOB_THREADS);
 
     for (int i = 0; i < MAX_JOB_THREADS; i++) {
@@ -1360,6 +1686,9 @@ void idParallelJobManagerLocal::Submit(idParallelJobList_Threads* jobList, int p
         maxThreads = idMath::ClampInt(0, MAX_JOB_THREADS, jobs_numThreads.GetInteger());
         jobs_numThreads.ClearModified();
     }
+#if defined(__vita__)
+    vitaJobWorkerCoresWanted = vita_jobWorkerCores.GetInteger(); // (the workers apply it, Run)
+#endif
 
     // determine the number of threads to use
     int numThreads = maxThreads;

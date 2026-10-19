@@ -29,6 +29,14 @@ If you have questions concerning this license or the applicable additional terms
 #include "Precompiled.h"
 #include "globaldata.h"
 
+#if defined(__vita__)
+extern uint64 vitaClassicTicUs, vitaClassicWallsUs, vitaClassicFlatsUs, vitaClassicSpritesUs;
+extern uint64 vitaClassicNetUs, vitaClassicDisplayUs, vitaClassicSndPosUs, vitaClassicSndSubmitUs, vitaClassicSndEventsUs;
+#define VITA_CLASSIC_TIME(acc, stmt) do { const uint64 vitaT0_ = Sys_Microseconds(); stmt; acc += Sys_Microseconds() - vitaT0_; } while (0)
+#else
+#define VITA_CLASSIC_TIME(acc, stmt) do { stmt; } while (0)
+#endif
+
 
 
 #include <stdlib.h>
@@ -917,6 +925,62 @@ void R_SetupFrame( player_t* player )
 
 
 
+#if defined(__vita__) || defined(ID_TEST_CLASSIC_MT)
+/*
+================
+R_VitaThreadedCheck
+
+vita_classicThreadsCheck 1: every 35th view is rendered a second time on one
+thread and the two pictures are compared pixel by pixel. Only spectres (the
+fuzz effect) may differ.
+================
+*/
+idCVar vita_classicThreadsCheck( "vita_classicThreadsCheck", "0", CVAR_INTEGER,
+								 "debug: compare every 35th threaded DOOM view with a one-thread render of the same frame" );
+extern idCVar vita_classicThreads;
+
+void R_VitaThreadedCheck( player_t* player )
+{
+	static int calls = 0;
+	static bool inside = false;
+	if( inside || !vita_classicThreadsCheck.GetBool() || !vita_classicThreads.GetBool() || ( ++calls % 35 ) != 0 )
+	{
+		return;
+	}
+	inside = true;
+	const int size = SCREENWIDTH * SCREENHEIGHT;
+	static byte* threaded = NULL;
+	if( threaded == NULL )
+	{
+		threaded = ( byte* )malloc( size );
+	}
+	memcpy( threaded, ::g->screens[ 0 ], size );
+	extern int vitaFuzzposAtBegin;
+	::g->fuzzpos = vitaFuzzposAtBegin;	// the same spectre noise start as the threaded render
+	vita_classicThreads.SetBool( false );
+	R_RenderPlayerView( player );
+	vita_classicThreads.SetBool( true );
+	int differ = 0;
+	int first = -1;
+	for( int i = 0; i < size; i++ )
+	{
+		if( threaded[ i ] != ::g->screens[ 0 ][ i ] )
+		{
+			if( first < 0 )
+			{
+				first = i;
+			}
+			differ++;
+		}
+	}
+	extern int vitaFuzzCmds;
+	idLib::Printf( "vita: classic threads check: %d of %d pixels differ%s (%d spectre columns)\n", differ, size,
+			  differ ? va( " (first at x %d y %d)", first % SCREENWIDTH, first / SCREENWIDTH ) : " - identical", vitaFuzzCmds );
+	vitaFuzzCmds = 0;
+	inside = false;
+}
+#endif
+
 //
 // R_RenderView
 //
@@ -928,6 +992,9 @@ void R_RenderPlayerView( player_t* player )
 	}
 
 	R_SetupFrame( player );
+#if defined(__vita__) || defined(ID_TEST_CLASSIC_MT)
+	R_VitaDeferBegin();
+#endif
 
 	// Clear buffers.
 	R_ClearClipSegs();
@@ -936,22 +1003,27 @@ void R_RenderPlayerView( player_t* player )
 	R_ClearSprites();
 
 	// check for new console commands.
-	NetUpdate( NULL );
+	VITA_CLASSIC_TIME( vitaClassicNetUs, NetUpdate( NULL ) );
 
 	// The head node is the last node output.
-	R_RenderBSPNode( ::g->numnodes - 1 );
+	VITA_CLASSIC_TIME( vitaClassicWallsUs, R_RenderBSPNode( ::g->numnodes - 1 ) );
 
 	// Check for new console commands.
-	NetUpdate( NULL );
+	VITA_CLASSIC_TIME( vitaClassicNetUs, NetUpdate( NULL ) );
 
-	R_DrawPlanes();
-
-	// Check for new console commands.
-	NetUpdate( NULL );
-
-	R_DrawMasked();
+	VITA_CLASSIC_TIME( vitaClassicFlatsUs, R_DrawPlanes() );
 
 	// Check for new console commands.
-	NetUpdate( NULL );
+	VITA_CLASSIC_TIME( vitaClassicNetUs, NetUpdate( NULL ) );
+
+	VITA_CLASSIC_TIME( vitaClassicSpritesUs, R_DrawMasked() );
+#if defined(__vita__) || defined(ID_TEST_CLASSIC_MT)
+	// the recorded columns and spans, drawn on every core
+	R_VitaDeferEnd();
+	R_VitaThreadedCheck( player );
+#endif
+
+	// Check for new console commands.
+	VITA_CLASSIC_TIME( vitaClassicNetUs, NetUpdate( NULL ) );
 }
 

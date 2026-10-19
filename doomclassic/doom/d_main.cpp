@@ -27,6 +27,14 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "Precompiled.h"
+
+#if defined(__vita__)
+extern uint64 vitaClassicTicUs, vitaClassicWallsUs, vitaClassicFlatsUs, vitaClassicSpritesUs;
+extern uint64 vitaClassicNetUs, vitaClassicDisplayUs, vitaClassicSndPosUs, vitaClassicSndSubmitUs, vitaClassicSndEventsUs;
+#define VITA_CLASSIC_TIME(acc, stmt) do { const uint64 vitaT0_ = Sys_Microseconds(); stmt; acc += Sys_Microseconds() - vitaT0_; } while (0)
+#else
+#define VITA_CLASSIC_TIME(acc, stmt) do { stmt; } while (0)
+#endif
 #include "globaldata.h"
 
 
@@ -339,16 +347,16 @@ void D_RunFrame( bool Sounds )
 	if( Sounds )
 	{
 		// move positional sounds
-		S_UpdateSounds( ::g->players[::g->consoleplayer].mo );
+		VITA_CLASSIC_TIME( vitaClassicSndPosUs, S_UpdateSounds( ::g->players[::g->consoleplayer].mo ) );
 	}
 
 	// Update display, next frame, with current state.
-	D_Display();
+	VITA_CLASSIC_TIME( vitaClassicDisplayUs, D_Display() );
 
 	if( Sounds )
 	{
 		// Update sound output.
-		I_SubmitSound();
+		VITA_CLASSIC_TIME( vitaClassicSndSubmitUs, I_SubmitSound() );
 	}
 }
 

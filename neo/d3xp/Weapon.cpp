@@ -27,6 +27,7 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "precompiled.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 #pragma hdrstop
 
 #include "Game_local.h"
@@ -473,7 +474,7 @@ idWeapon::Restore
 void idWeapon::Restore(idRestoreGame* savefile)
 {
 
-    savefile->ReadInt((int&)status);
+    savefile->ReadEnum(status);
     savefile->ReadObject(reinterpret_cast<idClass*&>(thread));
     savefile->ReadString(state);
     savefile->ReadString(idealState);
@@ -573,7 +574,7 @@ void idWeapon::Restore(idRestoreGame* savefile)
     savefile->ReadAngles(muzzle_kick_angles);
     savefile->ReadVec3(muzzle_kick_offset);
 
-    savefile->ReadInt((int&)ammoType);
+    savefile->ReadEnum(ammoType);
     savefile->ReadInt(ammoRequired);
     savefile->ReadInt(clipSize);
 
@@ -1648,6 +1649,7 @@ idWeapon::Think
 */
 void idWeapon::Think()
 {
+    VITA_ZONE("weapon think");
     // do nothing because the present is called from the player through PresentWeapon
 }
 
@@ -2225,6 +2227,7 @@ idWeapon::UpdateScript
 */
 void idWeapon::UpdateScript()
 {
+    VITA_ZONE("weapon script");
     int count;
 
     if (!isLinked) {
@@ -2262,6 +2265,49 @@ void idWeapon::AlertMonsters()
     trace_t tr;
     idEntity* ent;
     idVec3 end = muzzleFlash.origin + muzzleFlash.axis * muzzleFlash.target;
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Both traces below only act on what they hit first when it reacts: a
+    // monster set to wake on the flashlight, or a trigger. With neither
+    // anywhere near the beam they change nothing - yet each still tests the
+    // posed render model of every monster the beam passes, skinning it for
+    // the test (2-3 ms a frame in fights). So skip them then - and when every
+    // monster near the beam is one the flashlight would not change: dead, or
+    // already active and after this player (VitaFlashlightChangesNothing). That
+    // is every monster in a fight: 5 ms a frame against the zombie soldiers.
+    if (!g_debugWeapon.GetBool()) {
+        idVec3 jitterEnd = end;
+        jitterEnd += muzzleFlash.axis * muzzleFlash.right * idMath::Sin16(MS2SEC(gameLocal.time) * 31.34f);
+        jitterEnd += muzzleFlash.axis * muzzleFlash.up * idMath::Sin16(MS2SEC(gameLocal.time) * 12.17f);
+        idBounds beam;
+        beam.Clear();
+        beam.AddPoint(muzzleFlash.origin);
+        beam.AddPoint(end);
+        beam.AddPoint(jitterEnd);
+        idClipModel* clipModels[MAX_GENTITIES];
+        const int num = gameLocal.clip.ClipModelsTouchingBounds(beam, CONTENTS_OPAQUE | MASK_SHOT_RENDERMODEL | CONTENTS_FLASHLIGHT_TRIGGER, clipModels, MAX_GENTITIES);
+        bool reacts = false;
+        for (int i = 0; i < num && !reacts; i++) {
+            idEntity* hit = clipModels[i]->GetEntity();
+            if (hit == NULL) {
+                continue;
+            }
+            // what a trace reports is the bind master of what it touched
+            idEntity* master = hit->GetBindMaster();
+            if (master == NULL) {
+                master = hit;
+            }
+            if ((clipModels[i]->GetContents() & CONTENTS_FLASHLIGHT_TRIGGER) || master->IsType(idTrigger::Type) || hit->IsType(idTrigger::Type)) {
+                reacts = true;
+            } else if (master->IsType(idAI::Type) && !static_cast<idAI*>(master)->VitaFlashlightChangesNothing(owner)) {
+                reacts = true;
+            }
+        }
+        if (!reacts) {
+            return;
+        }
+    }
+#endif
 
     gameLocal.clip.TracePoint(tr, muzzleFlash.origin, end, CONTENTS_OPAQUE | MASK_SHOT_RENDERMODEL | CONTENTS_FLASHLIGHT_TRIGGER, owner);
     if (g_debugWeapon.GetBool()) {
@@ -2389,6 +2435,7 @@ idWeapon::PresentWeapon
 */
 void idWeapon::PresentWeapon(bool showViewModel)
 {
+    VITA_ZONE("weapon present");
     playerViewOrigin = owner->firstPersonViewOrigin;
     playerViewAxis = owner->firstPersonViewAxis;
 
@@ -2574,8 +2621,10 @@ void idWeapon::PresentWeapon(bool showViewModel)
     // update the muzzle flash light, so it moves with the gun
     if (muzzleFlashHandle != -1) {
         UpdateFlashPosition();
+        VITA_ZONE_BEGIN(flashLights, "weapon: muzzle/flashlight light updates (UpdateLightDef)");
         gameRenderWorld->UpdateLightDef(muzzleFlashHandle, &muzzleFlash);
         gameRenderWorld->UpdateLightDef(worldMuzzleFlashHandle, &worldMuzzleFlash);
+        VITA_ZONE_END(flashLights);
 
         // wake up monsters with the flashlight
         if (!common->IsMultiplayer() && lightOn && !owner->fl.notarget) {
@@ -3632,6 +3681,9 @@ void idWeapon::Event_LaunchProjectiles(int num_projectiles, float spread, float 
     if (IsHidden()) {
         return;
     }
+#if defined(VITA_PHYSCHECK)
+    Vita_PhysCheck_Shot(weaponDef != NULL ? weaponDef->GetName() : name.c_str());
+#endif
 
     if (!projectileDict.GetNumKeyVals()) {
         const char* classname = weaponDef->dict.GetString("classname");

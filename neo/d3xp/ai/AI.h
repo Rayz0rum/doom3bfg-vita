@@ -256,6 +256,26 @@ private:
 
 class idAI : public idActor {
 public:
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    bool vitaScriptSkipped = false; // this tic's script was skipped (vita_aiScriptHalfRateDistance)
+    int vitaSpanUnused = 0;          // where a skipped tic's think time goes (idAI::Think)
+    bool VitaRagdollBudget();        // vita_afMaxPerTic
+    // a character on the player's side (team 0: Brooks at the checkpoint,
+    // scientists, marines) - their scripts run the story, so the half-rate
+    // cuts never apply to them
+    bool VitaIsStoryCharacter() const
+    {
+        const idPlayer* p = gameLocal.GetLocalPlayer();
+        return p != NULL && team == p->team;
+    }
+    // the last failed out-of-range / cover searches (vita_aiMoveSearchRetryMs)
+    const idEntity* vitaOutOfRangeFailEnt = NULL;
+    float vitaOutOfRangeFailRange = 0.0f;
+    int vitaOutOfRangeFailTime = 0;
+    const idEntity* vitaCoverFailEnt = NULL;
+    idVec3 vitaCoverFailPos = vec3_zero;
+    int vitaCoverFailTime = 0;
+#endif
     CLASS_PROTOTYPE(idAI);
 
     idAI();
@@ -273,6 +293,21 @@ public:
     bool GetAimDir(const idVec3& firePos, idEntity* aimAtEnt, const idEntity* ignore, idVec3& aimDir) const;
 
     void TouchedByFlashlight(idActor* flashlight_owner);
+    bool WakesOnFlashlight() const
+    {
+        return wakeOnFlashlight;
+    }
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // true when TouchedByFlashlight( flashlight_owner ) would change nothing
+    bool VitaFlashlightChangesNothing(const idActor* flashlight_owner) const
+    {
+        if (!wakeOnFlashlight || AI_DEAD) {
+            return true;
+        }
+        // Activate(): already active, already after this player, nothing else to do
+        return num_cinematics == 0 && !cinematic && dormantStart == 0 && AI_ACTIVATED && !AI_ENEMY_DEAD && enemy.GetEntity() == flashlight_owner;
+    }
+#endif
 
     // Outputs a list of all monsters to the console.
     static void List_f(const idCmdArgs& args);

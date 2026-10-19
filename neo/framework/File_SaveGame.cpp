@@ -30,6 +30,14 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "File_SaveGame.h"
 
+#if defined(__vita__)
+// the savegame's compression and file threads: off the game's cores, on core 3
+// (Thread.cpp: core_t 6) - nothing waits on them frame to frame
+#define VITA_SGF_CORE(c) ((core_t)6)
+#else
+#define VITA_SGF_CORE(c) (c)
+#endif
+
 /*
 
 TODO: CRC on each block
@@ -372,13 +380,13 @@ bool idFile_SaveGamePipelined::OpenForWriting(const char* const filename, bool u
         compressThread->sgf = this;
         // DG: change threadname from "SGF_CompressThread" to "SGF_Compress", because Linux
         // has a 15 (+ \0) char limit for threadnames. also, "thread" in a threadname is redundant
-        compressThread->StartWorkerThread("SGF_Compress", CORE_2B, THREAD_NORMAL);
+        compressThread->StartWorkerThread("SGF_Compress", VITA_SGF_CORE(CORE_2B), THREAD_NORMAL);
         // DG end
     }
     if (nativeFile != NULL && sgf_threads.GetInteger() >= 2) {
         writeThread = new (TAG_IDFILE) idSGFwriteThread();
         writeThread->sgf = this;
-        writeThread->StartWorkerThread("SGF_WriteThread", CORE_2A, THREAD_NORMAL);
+        writeThread->StartWorkerThread("SGF_WriteThread", VITA_SGF_CORE(CORE_2A), THREAD_NORMAL);
     }
 
     return true;
@@ -426,13 +434,13 @@ bool idFile_SaveGamePipelined::OpenForWriting(idFile* file)
         compressThread->sgf = this;
         // DG: change threadname from "SGF_CompressThread" to "SGF_Compress", because Linux
         // has a 15 (+ \0) char limit for threadnames. also, "thread" in a threadname is redundant
-        compressThread->StartWorkerThread("SGF_Compress", CORE_2B, THREAD_NORMAL);
+        compressThread->StartWorkerThread("SGF_Compress", VITA_SGF_CORE(CORE_2B), THREAD_NORMAL);
         // DG end
     }
     if (nativeFile != NULL && sgf_threads.GetInteger() >= 2) {
         writeThread = new (TAG_IDFILE) idSGFwriteThread();
         writeThread->sgf = this;
-        writeThread->StartWorkerThread("SGF_WriteThread", CORE_2A, THREAD_NORMAL);
+        writeThread->StartWorkerThread("SGF_WriteThread", VITA_SGF_CORE(CORE_2A), THREAD_NORMAL);
     }
 
     return true;
@@ -741,13 +749,13 @@ bool idFile_SaveGamePipelined::OpenForReading(const char* const filename, bool u
         decompressThread->sgf = this;
         // DG: change threadname from "SGF_DecompressThread" to "SGF_Decompress", because Linux
         // has a 15 (+ \0) char limit for threadnames. also, "thread" in a threadname is redundant
-        decompressThread->StartWorkerThread("SGF_Decompress", CORE_2B, THREAD_NORMAL);
+        decompressThread->StartWorkerThread("SGF_Decompress", VITA_SGF_CORE(CORE_2B), THREAD_NORMAL);
         // DG end
     }
     if (nativeFile != NULL && sgf_threads.GetInteger() >= 2) {
         readThread = new (TAG_IDFILE) idSGFreadThread();
         readThread->sgf = this;
-        readThread->StartWorkerThread("SGF_ReadThread", CORE_2A, THREAD_NORMAL);
+        readThread->StartWorkerThread("SGF_ReadThread", VITA_SGF_CORE(CORE_2A), THREAD_NORMAL);
     }
 
     return true;
@@ -786,13 +794,13 @@ bool idFile_SaveGamePipelined::OpenForReading(idFile* file)
         decompressThread->sgf = this;
         // DG: change threadname from "SGF_DecompressThread" to "SGF_Decompress", because Linux
         // has a 15 (+ \0) char limit for threadnames. also, "thread" in a threadname is redundant
-        decompressThread->StartWorkerThread("SGF_Decompress", CORE_1B, THREAD_NORMAL);
+        decompressThread->StartWorkerThread("SGF_Decompress", VITA_SGF_CORE(CORE_1B), THREAD_NORMAL);
         // DG end
     }
     if (nativeFile != NULL && sgf_threads.GetInteger() >= 2) {
         readThread = new (TAG_IDFILE) idSGFreadThread();
         readThread->sgf = this;
-        readThread->StartWorkerThread("SGF_ReadThread", CORE_1A, THREAD_NORMAL);
+        readThread->StartWorkerThread("SGF_ReadThread", VITA_SGF_CORE(CORE_1A), THREAD_NORMAL);
     }
 
     return true;

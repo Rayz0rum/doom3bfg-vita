@@ -36,6 +36,7 @@ If you have questions concerning this license or the applicable additional terms
 #include <windowsx.h>
 
 LONG WINAPI MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+idCVar win_pauseOnFocusLoss("win_pauseOnFocusLoss", "1", CVAR_SYSTEM | CVAR_BOOL, "pause the game while its window is not in focus");
 
 static bool s_alttab_disabled;
 
@@ -262,8 +263,11 @@ LONG WINAPI MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             // start playing the game sound world
             soundSystem->SetMute(!win32.activeApp);
             // DG: set com_pause so game pauses when focus is lost
-            // and continues when focus is regained
-            cvarSystem->SetCVarBool("com_pause", !win32.activeApp);
+            // and continues when focus is regained (not for test runs in the
+            // background: win_pauseOnFocusLoss 0)
+            if (win_pauseOnFocusLoss.GetBool()) {
+                cvarSystem->SetCVarBool("com_pause", !win32.activeApp);
+            }
             // DG end
 
             // we do not actually grab or release the mouse here,

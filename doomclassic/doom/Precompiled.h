@@ -50,7 +50,21 @@ typedef unsigned int dword;
 #define ACTUALTEXTUREWIDTH	1024		// should always be equal to or larger
 #define ACTUALTEXTUREHEIGHT	1024
 
+#if defined(__vita__)
+// Doom's own 320x200 instead of BFG's 960x600. Measured on the hardware at
+// 640x400: the software renderer took 28 ms (demo) to 85-95 ms (play) and the
+// palette conversion 14 ms - the CPU's memory bandwidth is the limit, and both
+// scale with the pixel count. The GPU scales the picture back up 3x with
+// nearest filtering (idImage::VitaUploadScaled), so the pixels stay crisp.
+// Must match DOOMCLASSIC_RENDERWIDTH/HEIGHT in neo/framework/Common_local.h.
+// -DVITA_CLASSIC_SCALE=3 builds the 960x600 test (BFG's own size).
+#ifndef VITA_CLASSIC_SCALE
+#define VITA_CLASSIC_SCALE 3
+#endif
+#define GLOBAL_IMAGE_SCALER	VITA_CLASSIC_SCALE
+#else
 #define GLOBAL_IMAGE_SCALER	3
+#endif
 
 #define ORIGINAL_WIDTH		320
 #define ORIGINAL_HEIGHT		200

@@ -32,11 +32,31 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "tr_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT (vita_currentRenderReuse)
+
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#include <psp2/kernel/sysmem.h> // sceKernelIsPSVitaTV (the stretch's sharpening)
+#endif
+
+#if defined(__vita__)
+idCVar vita_forceWhiteFalloff("vita_forceWhiteFalloff", "0", CVAR_RENDERER | CVAR_BOOL,
+    "diagnostic: bind a white texture in place of the light falloff image");
+#endif
 
 idCVar r_drawEyeColor("r_drawEyeColor", "0", CVAR_RENDERER | CVAR_BOOL, "Draw a colored box, red = left eye, blue = right eye, grey = non-stereo");
 idCVar r_motionBlur("r_motionBlur", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "1 - 5, log2 of the number of motion blur samples");
 idCVar r_forceZPassStencilShadows("r_forceZPassStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL, "force Z-pass rendering for performance testing");
+#if defined(__vita__)
+// Preload draws every Z-fail shadow volume twice (a pass counting all its
+// fragments, then a Z-pass one) - the stock choice for the Xbox 360, whose
+// Z-cull rejects Z-fail fragments poorly. The Vita's tile-based GPU has no
+// such cull, so the single Z-fail draw (Carmack's reverse) gives the same
+// stencil counts for half the draws and half the fill.
+idCVar r_useStencilShadowPreload("r_useStencilShadowPreload", "0", CVAR_RENDERER | CVAR_BOOL, "use stencil shadow preload algorithm instead of Z-fail");
+#else
 idCVar r_useStencilShadowPreload("r_useStencilShadowPreload", "1", CVAR_RENDERER | CVAR_BOOL, "use stencil shadow preload algorithm instead of Z-fail");
+#endif
 idCVar r_skipShaderPasses("r_skipShaderPasses", "0", CVAR_RENDERER | CVAR_BOOL, "");
 idCVar r_skipInteractionFastPath("r_skipInteractionFastPath", "1", CVAR_RENDERER | CVAR_BOOL, "");
 idCVar r_useLightStencilSelect("r_useLightStencilSelect", "0", CVAR_RENDERER | CVAR_BOOL, "use stencil select pass");
@@ -82,6 +102,142 @@ static ID_INLINE void SetFragmentParm(renderParm_t rp, const float* value)
 RB_SetMVP
 ================
 */
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// Vita: where the render back end's time goes, pass by pass, summed for the
+// frame on the main thread (VitaBench takes and clears them at the end of
+// each frame: the per-hitch "back end passes" line and the segment averages)
+// - 0 depth pre-pass, 1 stencil shadow volumes, 2 light interaction passes,
+// 3 interactions in all (1 + 2 + their set up), 4 shader passes (ambient,
+// translucent, GUIs, 2D), 5 fog and blend lights, 6 framebuffer copies
+// (_currentRender / _currentDepth), 7 the views drawn in all (RB_DrawView),
+// 8 the soft alpha-tested edges' map (RB_VitaAlphaEdgeMask), 9 the 3D view's
+// stretch in all (RB_PostProcess: the map, the copy, the sharpening pass)
+uint64 vita_rbPassUs[10];
+int vita_rbDrawCalls = 0;
+struct vitaRBTimer_t {
+    int pass;
+    uint64 start;
+    explicit vitaRBTimer_t(int p) : pass(p), start(Sys_Microseconds()) {}
+    ~vitaRBTimer_t()
+    {
+        vita_rbPassUs[pass] += Sys_Microseconds() - start;
+    }
+};
+#define VITA_RB_PASS(p) vitaRBTimer_t vitaRBTimer_pass(p)
+#else
+#define VITA_RB_PASS(p)
+#endif
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+// _currentRender reuse (vita_currentRenderReuse, RB_DrawViewInternal)
+idCVar vita_currentRenderReuse("vita_screenCopyReuse2", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_ARCHIVE, "Vita: the main view's screen copy for warping effects (heat haze, glass, distortion) is reused while nothing it shows has changed - the view still, and every surface drawn before it (geometry, entity placement, shader parameters, lights) the same as when the copy was made; any change, a video or a subview on screen, and a new copy is made");
+static uint64 vitaLastCopySignature = 0;
+
+/*
+==================
+RB_VitaSceneSignature
+
+A fingerprint of everything the main view drew before its screen copy: each
+surface's material, geometry (vertex cache handles - frame-temporary ones,
+i.e. anything animated, skinned, a particle or a GUI, are new every frame),
+the placement of its entity and its evaluated shader registers (time-driven
+scrolling, pulsing, flicker), and each light's place, projection, shader
+registers and interaction / shadow surfaces. The same fingerprint as when the
+last copy was made means the copy is what a new one would show (2026-10-13
+the reuse only checked that the view stood still, and glass showed things
+behind it moving at 15 Hz). 0 = can not be reused (a video or subview drawn).
+==================
+*/
+static uint64 RB_VitaHashWords(uint64 h, const void* data, int bytes)
+{
+    const uint32* w = (const uint32*)data;
+    for (int i = 0; i < bytes / 4; i++) {
+        h = (h ^ w[i]) * 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64 RB_VitaHashSurf(uint64 h, const drawSurf_t* surf)
+{
+    h = RB_VitaHashWords(h, &surf->material, sizeof(surf->material));
+    h = RB_VitaHashWords(h, &surf->indexCache, sizeof(surf->indexCache));
+    h = RB_VitaHashWords(h, &surf->ambientCache, sizeof(surf->ambientCache));
+    h = RB_VitaHashWords(h, &surf->shadowCache, sizeof(surf->shadowCache));
+    h = RB_VitaHashWords(h, &surf->jointCache, sizeof(surf->jointCache));
+    h = RB_VitaHashWords(h, &surf->numIndexes, sizeof(surf->numIndexes));
+    h = RB_VitaHashWords(h, &surf->extraGLState, sizeof(surf->extraGLState));
+    if (surf->space != NULL) {
+        h = RB_VitaHashWords(h, surf->space->modelMatrix, sizeof(surf->space->modelMatrix));
+    }
+    if (surf->material != NULL && surf->shaderRegisters != NULL) {
+        h = RB_VitaHashWords(h, surf->shaderRegisters, surf->material->GetNumRegisters() * (int)sizeof(float));
+    }
+    return h;
+}
+
+static bool RB_VitaMaterialIsLive(const idMaterial* m)
+{
+    if (m == NULL) {
+        return false;
+    }
+    if (m->HasSubview()) {
+        return true; // a mirror or remote camera: its picture is redrawn every frame
+    }
+    for (int i = 0; i < m->GetNumStages(); i++) {
+        if (m->GetStage(i)->texture.cinematic != NULL) {
+            return true; // a video
+        }
+    }
+    return false;
+}
+
+static uint64 RB_VitaSceneSignature(const viewDef_t* viewDef, drawSurf_t** drawSurfs, int numSurfs)
+{
+    uint64 h = 1469598103934665603ull;
+    // the view itself, exactly (place, direction, field of view)
+    h = RB_VitaHashWords(h, &viewDef->renderView.vieworg, sizeof(viewDef->renderView.vieworg));
+    h = RB_VitaHashWords(h, &viewDef->renderView.viewaxis, sizeof(viewDef->renderView.viewaxis));
+    h = RB_VitaHashWords(h, &viewDef->renderView.fov_x, sizeof(float));
+    h = RB_VitaHashWords(h, &viewDef->renderView.fov_y, sizeof(float));
+    for (int i = 0; i < numSurfs; i++) {
+        const drawSurf_t* surf = drawSurfs[i];
+        if (RB_VitaMaterialIsLive(surf->material)) {
+            return 0;
+        }
+        h = RB_VitaHashSurf(h, surf);
+    }
+    for (const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next) {
+        h = RB_VitaHashWords(h, &vLight->lightDef, sizeof(vLight->lightDef));
+        h = RB_VitaHashWords(h, &vLight->globalLightOrigin, sizeof(vLight->globalLightOrigin));
+        h = RB_VitaHashWords(h, vLight->lightProject, sizeof(vLight->lightProject));
+        h = RB_VitaHashWords(h, &vLight->lightShader, sizeof(vLight->lightShader));
+        if (RB_VitaMaterialIsLive(vLight->lightShader)) {
+            return 0;
+        }
+        if (vLight->lightShader != NULL && vLight->shaderRegisters != NULL) {
+            h = RB_VitaHashWords(h, vLight->shaderRegisters, vLight->lightShader->GetNumRegisters() * (int)sizeof(float));
+        }
+        const drawSurf_t* lists[5] = { vLight->globalShadows, vLight->localInteractions, vLight->localShadows, vLight->globalInteractions, vLight->translucentInteractions };
+        for (int l = 0; l < 5; l++) {
+            h = (h ^ (uint64)(0x9e37 + l)) * 1099511628211ull;
+            for (const drawSurf_t* s = lists[l]; s != NULL; s = s->nextOnLight) {
+                h = RB_VitaHashSurf(h, s);
+            }
+        }
+    }
+    return h != 0 ? h : 1;
+}
+// the view the last copy was made from (vita_currentRenderReuse)
+static idVec3 vitaLastCopyOrigin(0, 0, 0);
+static idMat3 vitaLastCopyAxis(mat3_identity);
+extern bool vita_fullQuality; // cinematics: no cuts (Game_local / common_frame)
+static int vitaMainViewDraws = 0;
+static int vitaLastCopyDraw = -100;
+static bool vitaLastCopyMain = false;
+static bool vitaLastWasReuse = false;
+static int vitaLastCopyRect[4] = { 0, 0, 0, 0 };
+#endif
+
 void RB_SetMVP(const idRenderMatrix& mvp)
 {
     SetVertexParms(RENDERPARM_MVPMATRIX_X, mvp[0], 4);
@@ -134,6 +290,9 @@ RB_DrawElementsWithCounters
 */
 void RB_DrawElementsWithCounters(const drawSurf_t* surf)
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vita_rbDrawCalls++;
+#endif
     // get vertex buffer
     const vertCacheHandle_t vbHandle = surf->ambientCache;
     idVertexBuffer* vertexBuffer;
@@ -210,6 +369,48 @@ void RB_DrawElementsWithCounters(const drawSurf_t* surf)
         backEnd.glState.currentIndexBuffer = (GLintptrARB)indexBuffer->GetAPIObject();
     }
 
+#if defined(__vita__)
+    // vitaGL accepts glDrawElementsBaseVertex() but never reads baseVertex - it
+    // forwards a literal 0 into the GXM draw, where that third parameter is a
+    // highest-index hint rather than a base. BFG leans on baseVertex for every
+    // surface: a frame's vertex cache packs them all into one buffer and each
+    // surface's indices are relative to its own start. Ignored, every surface
+    // but the first reads another surface's vertices - silently, and with
+    // nothing reaching the screen.
+    //
+    // Fold the base into the attribute offsets instead. That is exactly
+    // equivalent, because vitaGL stores those as byte offsets into the bound
+    // buffer, and key the layout cache on it so the pointers are re-emitted
+    // whenever the base moves.
+    const uintptr_t vertBase = (uintptr_t)vertOffset;
+
+    if ((backEnd.glState.vertexLayout != LAYOUT_DRAW_VERT) || (backEnd.glState.currentVertexBuffer != (GLintptrARB)vertexBuffer->GetAPIObject()) || (backEnd.glState.currentVertOffset != vertBase) || !r_useStateCaching.GetBool()) {
+        qglBindBufferARB(GL_ARRAY_BUFFER_ARB, (GLintptrARB)vertexBuffer->GetAPIObject());
+        backEnd.glState.currentVertexBuffer = (GLintptrARB)vertexBuffer->GetAPIObject();
+        backEnd.glState.currentVertOffset = vertBase;
+
+        qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_VERTEX);
+        qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_NORMAL);
+        qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_COLOR);
+        qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_COLOR2);
+        qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_ST);
+        qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_TANGENT);
+
+        qglVertexAttribPointerARB(PC_ATTRIB_INDEX_VERTEX, 3, GL_FLOAT, GL_FALSE, sizeof(idDrawVert), (void*)(vertBase + DRAWVERT_XYZ_OFFSET));
+        qglVertexAttribPointerARB(PC_ATTRIB_INDEX_NORMAL, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idDrawVert), (void*)(vertBase + DRAWVERT_NORMAL_OFFSET));
+        qglVertexAttribPointerARB(PC_ATTRIB_INDEX_COLOR, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idDrawVert), (void*)(vertBase + DRAWVERT_COLOR_OFFSET));
+        qglVertexAttribPointerARB(PC_ATTRIB_INDEX_COLOR2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idDrawVert), (void*)(vertBase + DRAWVERT_COLOR2_OFFSET));
+        qglVertexAttribPointerARB(PC_ATTRIB_INDEX_ST, 2, GL_HALF_FLOAT, GL_TRUE, sizeof(idDrawVert), (void*)(vertBase + DRAWVERT_ST_OFFSET));
+        qglVertexAttribPointerARB(PC_ATTRIB_INDEX_TANGENT, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idDrawVert), (void*)(vertBase + DRAWVERT_TANGENT_OFFSET));
+
+        backEnd.glState.vertexLayout = LAYOUT_DRAW_VERT;
+    }
+
+    qglDrawElements(GL_TRIANGLES,
+        r_singleTriangle.GetBool() ? 3 : surf->numIndexes,
+        GL_INDEX_TYPE,
+        (triIndex_t*)indexOffset);
+#else
     if ((backEnd.glState.vertexLayout != LAYOUT_DRAW_VERT) || (backEnd.glState.currentVertexBuffer != (GLintptrARB)vertexBuffer->GetAPIObject()) || !r_useStateCaching.GetBool()) {
         qglBindBufferARB(GL_ARRAY_BUFFER_ARB, (GLintptrARB)vertexBuffer->GetAPIObject());
         backEnd.glState.currentVertexBuffer = (GLintptrARB)vertexBuffer->GetAPIObject();
@@ -237,6 +438,7 @@ void RB_DrawElementsWithCounters(const drawSurf_t* surf)
         GL_INDEX_TYPE,
         (triIndex_t*)indexOffset,
         vertOffset / sizeof(idDrawVert));
+#endif
 
     // RB: added stats
     backEnd.pc.c_drawElements++;
@@ -799,6 +1001,7 @@ on the 360.
 */
 static void RB_FillDepthBufferFast(drawSurf_t** drawSurfs, int numDrawSurfs)
 {
+    VITA_RB_PASS(0);
     if (numDrawSurfs == 0) {
         return;
     }
@@ -1056,6 +1259,7 @@ With added sorting and trivial path work.
 */
 static void RB_RenderInteractions(const drawSurf_t* surfList, const viewLight_t* vLight, int depthFunc, bool performStencilTest, bool useLightDepthBounds)
 {
+    VITA_RB_PASS(2);
     if (surfList == NULL) {
         return;
     }
@@ -1148,11 +1352,82 @@ static void RB_RenderInteractions(const drawSurf_t* surfList, const viewLight_t*
 
         // texture 1 will be the light falloff texture
         GL_SelectTexture(INTERACTION_TEXUNIT_FALLOFF);
+#if defined(__vita__)
+        // Diagnostic: substitute a solid white texture for the light falloff.
+        // A shader probe measured lightFalloff as (0,0,0,0) with valid
+        // texcoords, which zeroes lightColor and silently disables every
+        // per-light interaction - the whole scene has been lit by the ambient
+        // pass alone. With white here the lights should come back, without
+        // distance attenuation. If they do, the falloff image is the disease
+        // and everything downstream of it is healthy.
+        if (vita_forceWhiteFalloff.GetBool()) {
+            globalImages->whiteImage->Bind();
+        } else {
+        // Report each distinct falloff image once. A shader probe showed this
+        // texture sampling as (0,0,0,0) with valid texcoords, which zeroes
+        // lightColor and silently disables the entire per-light pass, so it
+        // matters exactly which image and format is landing here.
+        // Once per distinct image: logging every change between consecutive
+        // lights wrote two lines per frame as soon as the flashlight (its own
+        // falloff) was on, and each line is an open/write/close on the card -
+        // that alone halved the frame rate.
+        {
+            static const idImage* seenFalloff[64];
+            static int numSeenFalloff = 0;
+            bool seen = false;
+            for (int k = 0; k < numSeenFalloff; k++) {
+                if (seenFalloff[k] == vLight->falloffImage) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && numSeenFalloff < 64) {
+                seenFalloff[numSeenFalloff++] = vLight->falloffImage;
+                const idImageOpts& fo = vLight->falloffImage->GetOpts();
+                Vita_Checkpoint("falloff '%s' fmt %d cfm %d %dx%d levels %d loaded %d",
+                    vLight->falloffImage->GetName(), (int)fo.format, (int)fo.colorFormat,
+                    fo.width, fo.height, fo.numLevels,
+                    vLight->falloffImage->IsLoaded() ? 1 : 0);
+            }
+        }
         vLight->falloffImage->Bind();
+        }
+#else
+        vLight->falloffImage->Bind();
+#endif
 
         // texture 2 will be the light projection texture
         GL_SelectTexture(INTERACTION_TEXUNIT_PROJECTION);
         lightStage->texture.image->Bind();
+#if defined(__vita__)
+        // Report each distinct light projection image the first time a light
+        // uses it. These are the RGB565 images that used to reach the GPU
+        // byte-swapped; the matching "rgb565 '...'" upload line shows whether
+        // this one was converted.
+        {
+            static const idImage* seenProj[96];
+            static int numSeenProj = 0;
+            const idImage* pi = lightStage->texture.image;
+            bool seen = false;
+            for (int k = 0; k < numSeenProj; k++) {
+                if (seenProj[k] == pi) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && numSeenProj < 96) {
+                seenProj[numSeenProj++] = pi;
+                const idImageOpts& po = pi->GetOpts();
+                Vita_Checkpoint("light projection #%d '%s' fmt %d cfm %d %dx%d levels %d%s, on light shader '%s'%s",
+                    numSeenProj, pi->GetName(), (int)po.format, (int)po.colorFormat, po.width, po.height, po.numLevels,
+                    po.format == FMT_RGB565 ? " (RGB565: byte-swapped at upload)" : "",
+                    lightShader->GetName(), lightShader->IsAmbientLight() ? " [ambient]" : "");
+            }
+            Vita_CensusLight(lightShader->IsAmbientLight(), allSurfaces.Num(),
+                vLight->scissorRect.IsEmpty() ? 0 : (vLight->scissorRect.x2 - vLight->scissorRect.x1 + 1) * (vLight->scissorRect.y2 - vLight->scissorRect.y1 + 1),
+                lightShader->GetName());
+        }
+#endif
 
         // force the light textures to not use anisotropic filtering, which is wasted on them
         // all of the texture sampler parms should be constant for all interactions, only
@@ -1369,8 +1644,87 @@ RB_StencilShadowPass
 The stencil buffer should have been set to 128 on any surfaces that might receive shadows.
 =====================
 */
+/*
+=====================
+Two-sided stencil fallback
+
+The stencil shadow passes drive the front and back faces of a volume with
+different stencil ops inside a single two-sided draw. A driver without separate
+stencil (pre-GL 2.0, no GL_ATI_separate_stencil) cannot express that, but the
+same result comes out of drawing the volume twice with single-sided ops, once
+per face orientation, at the cost of a second draw call per surface.
+
+Note that only the *ops* differ between faces here - the stencil func and mask
+come from GL_State() and are the same on both sides - so the func never needs
+splitting.
+
+RB_ShadowStencilOp() records the requested pair and applies it directly when
+separate stencil is present. RB_DrawShadowVolume() then issues either the one
+two-sided draw or the two culled draws.
+=====================
+*/
+struct shadowStencilOp_t {
+    GLenum fail;
+    GLenum zfail;
+    GLenum zpass;
+};
+static shadowStencilOp_t rb_shadowStencilFront = { GL_KEEP, GL_KEEP, GL_INCR };
+static shadowStencilOp_t rb_shadowStencilBack = { GL_KEEP, GL_KEEP, GL_DECR };
+
+static void RB_ShadowStencilOp(GLenum face, GLenum fail, GLenum zfail, GLenum zpass)
+{
+    shadowStencilOp_t& slot = (face == GL_FRONT) ? rb_shadowStencilFront : rb_shadowStencilBack;
+    slot.fail = fail;
+    slot.zfail = zfail;
+    slot.zpass = zpass;
+
+    if (glConfig.twoSidedStencilAvailable) {
+        qglStencilOpSeparate(face, fail, zfail, zpass);
+    }
+}
+
+// The caller has already folded baseVertex into the attribute offsets on Vita,
+// because vitaGL accepts glDrawElementsBaseVertex() but never applies the base.
+// Passing it again here would double-count it, so every shadow draw goes through
+// one place that knows which of the two entry points is correct.
+static ID_INLINE void RB_ShadowDrawElements(GLsizei numIndexes, const void* indexOffset, GLint baseVertex)
+{
+#if defined(__vita__)
+    (void)baseVertex;
+    qglDrawElements(GL_TRIANGLES, numIndexes, GL_INDEX_TYPE, (triIndex_t*)indexOffset);
+#else
+    qglDrawElementsBaseVertex(GL_TRIANGLES, numIndexes, GL_INDEX_TYPE, (triIndex_t*)indexOffset, baseVertex);
+#endif
+}
+
+static void RB_DrawShadowVolume(GLsizei numIndexes, const void* indexOffset, GLint baseVertex)
+{
+    if (glConfig.twoSidedStencilAvailable) {
+        RB_ShadowDrawElements(numIndexes, indexOffset, baseVertex);
+        return;
+    }
+
+    // CT_BACK_SIDED culls back faces, leaving the front ones; CT_FRONT_SIDED is
+    // the reverse. See GL_Cull().
+    GL_Cull(CT_BACK_SIDED);
+    qglStencilOp(rb_shadowStencilFront.fail, rb_shadowStencilFront.zfail, rb_shadowStencilFront.zpass);
+    RB_ShadowDrawElements(numIndexes, indexOffset, baseVertex);
+
+    GL_Cull(CT_FRONT_SIDED);
+    qglStencilOp(rb_shadowStencilBack.fail, rb_shadowStencilBack.zfail, rb_shadowStencilBack.zpass);
+    RB_ShadowDrawElements(numIndexes, indexOffset, baseVertex);
+
+    // The caller set CT_TWO_SIDED for the whole pass; put it back so the next
+    // surface starts from the state it expects.
+    GL_Cull(CT_TWO_SIDED);
+
+    backEnd.pc.c_shadowElements++;
+    backEnd.pc.c_shadowIndexes += numIndexes;
+}
+
 static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t* vLight)
 {
+    VITA_RB_PASS(1);
     if (r_skipShadows.GetBool()) {
         return;
     }
@@ -1497,14 +1851,19 @@ static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t*
 
         if (renderZPass) {
             // Z-pass
-            qglStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR);
-            qglStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR);
+            RB_ShadowStencilOp(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR);
+            RB_ShadowStencilOp(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR);
         } else if (r_useStencilShadowPreload.GetBool()) {
             // preload + Z-pass
-            qglStencilOpSeparate(GL_FRONT, GL_KEEP, GL_DECR, GL_DECR);
-            qglStencilOpSeparate(GL_BACK, GL_KEEP, GL_INCR, GL_INCR);
+            RB_ShadowStencilOp(GL_FRONT, GL_KEEP, GL_DECR, GL_DECR);
+            RB_ShadowStencilOp(GL_BACK, GL_KEEP, GL_INCR, GL_INCR);
         } else {
-            // Z-fail
+            // Z-fail: the preload and Z-pass ops above summed into one draw -
+            // only the hidden fragments count, front faces down, back faces up.
+            // (Stock code set nothing here, so a Z-fail volume reused whatever
+            // ops the previous volume left: Z-pass ones after a Z-pass volume.)
+            RB_ShadowStencilOp(GL_FRONT, GL_KEEP, GL_DECR, GL_KEEP);
+            RB_ShadowStencilOp(GL_BACK, GL_KEEP, GL_INCR, GL_KEEP);
         }
 
         // get vertex buffer
@@ -1545,6 +1904,17 @@ static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t*
             backEnd.glState.currentIndexBuffer = (GLintptrARB)indexBuffer->GetAPIObject();
         }
 
+        // Same baseVertex problem as RB_DrawElementsWithCounters - vitaGL
+        // accepts glDrawElementsBaseVertex() but never applies the base, so
+        // every shadow volume but the first would read another surface's
+        // vertices. Fold it into the attribute offsets and key the layout
+        // cache on it, exactly as that function does.
+#if defined(__vita__)
+        const uintptr_t shadowVertBase = (uintptr_t)vertOffset;
+#else
+        const uintptr_t shadowVertBase = 0;
+#endif
+
         if (drawSurf->jointCache) {
             assert(renderProgManager.ShaderUsesJoints());
 
@@ -1558,9 +1928,16 @@ static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t*
             const GLintptrARB ubo = reinterpret_cast<GLintptrARB>(jointBuffer.GetAPIObject());
             qglBindBufferRange(GL_UNIFORM_BUFFER, 0, ubo, jointBuffer.GetOffset(), jointBuffer.GetNumJoints() * sizeof(idJointMat));
 
-            if ((backEnd.glState.vertexLayout != LAYOUT_DRAW_SHADOW_VERT_SKINNED) || (backEnd.glState.currentVertexBuffer != (GLintptrARB)vertexBuffer->GetAPIObject()) || !r_useStateCaching.GetBool()) {
+            if ((backEnd.glState.vertexLayout != LAYOUT_DRAW_SHADOW_VERT_SKINNED) || (backEnd.glState.currentVertexBuffer != (GLintptrARB)vertexBuffer->GetAPIObject())
+#if defined(__vita__)
+                || (backEnd.glState.currentVertOffset != shadowVertBase)
+#endif
+                || !r_useStateCaching.GetBool()) {
                 qglBindBufferARB(GL_ARRAY_BUFFER_ARB, (GLintptrARB)vertexBuffer->GetAPIObject());
                 backEnd.glState.currentVertexBuffer = (GLintptrARB)vertexBuffer->GetAPIObject();
+#if defined(__vita__)
+                backEnd.glState.currentVertOffset = shadowVertBase;
+#endif
 
                 qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_VERTEX);
                 qglDisableVertexAttribArrayARB(PC_ATTRIB_INDEX_NORMAL);
@@ -1569,18 +1946,25 @@ static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t*
                 qglDisableVertexAttribArrayARB(PC_ATTRIB_INDEX_ST);
                 qglDisableVertexAttribArrayARB(PC_ATTRIB_INDEX_TANGENT);
 
-                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_VERTEX, 4, GL_FLOAT, GL_FALSE, sizeof(idShadowVertSkinned), (void*)(SHADOWVERTSKINNED_XYZW_OFFSET));
-                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_COLOR, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idShadowVertSkinned), (void*)(SHADOWVERTSKINNED_COLOR_OFFSET));
-                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_COLOR2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idShadowVertSkinned), (void*)(SHADOWVERTSKINNED_COLOR2_OFFSET));
+                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_VERTEX, 4, GL_FLOAT, GL_FALSE, sizeof(idShadowVertSkinned), (void*)(shadowVertBase + SHADOWVERTSKINNED_XYZW_OFFSET));
+                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_COLOR, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idShadowVertSkinned), (void*)(shadowVertBase + SHADOWVERTSKINNED_COLOR_OFFSET));
+                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_COLOR2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(idShadowVertSkinned), (void*)(shadowVertBase + SHADOWVERTSKINNED_COLOR2_OFFSET));
 
                 backEnd.glState.vertexLayout = LAYOUT_DRAW_SHADOW_VERT_SKINNED;
             }
 
         } else {
 
-            if ((backEnd.glState.vertexLayout != LAYOUT_DRAW_SHADOW_VERT) || (backEnd.glState.currentVertexBuffer != (GLintptrARB)vertexBuffer->GetAPIObject()) || !r_useStateCaching.GetBool()) {
+            if ((backEnd.glState.vertexLayout != LAYOUT_DRAW_SHADOW_VERT) || (backEnd.glState.currentVertexBuffer != (GLintptrARB)vertexBuffer->GetAPIObject())
+#if defined(__vita__)
+                || (backEnd.glState.currentVertOffset != shadowVertBase)
+#endif
+                || !r_useStateCaching.GetBool()) {
                 qglBindBufferARB(GL_ARRAY_BUFFER_ARB, (GLintptrARB)vertexBuffer->GetAPIObject());
                 backEnd.glState.currentVertexBuffer = (GLintptrARB)vertexBuffer->GetAPIObject();
+#if defined(__vita__)
+                backEnd.glState.currentVertOffset = shadowVertBase;
+#endif
 
                 qglEnableVertexAttribArrayARB(PC_ATTRIB_INDEX_VERTEX);
                 qglDisableVertexAttribArrayARB(PC_ATTRIB_INDEX_NORMAL);
@@ -1589,7 +1973,7 @@ static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t*
                 qglDisableVertexAttribArrayARB(PC_ATTRIB_INDEX_ST);
                 qglDisableVertexAttribArrayARB(PC_ATTRIB_INDEX_TANGENT);
 
-                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_VERTEX, 4, GL_FLOAT, GL_FALSE, sizeof(idShadowVert), (void*)(SHADOWVERT_XYZW_OFFSET));
+                qglVertexAttribPointerARB(PC_ATTRIB_INDEX_VERTEX, 4, GL_FLOAT, GL_FALSE, sizeof(idShadowVert), (void*)(shadowVertBase + SHADOWVERT_XYZW_OFFSET));
 
                 backEnd.glState.vertexLayout = LAYOUT_DRAW_SHADOW_VERT;
             }
@@ -1599,9 +1983,9 @@ static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t*
         renderProgManager.CommitUniforms();
 
         if (drawSurf->jointCache) {
-            qglDrawElementsBaseVertex(GL_TRIANGLES, r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, GL_INDEX_TYPE, (triIndex_t*)indexOffset, vertOffset / sizeof(idShadowVertSkinned));
+            RB_DrawShadowVolume(r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, (const void*)indexOffset, vertOffset / sizeof(idShadowVertSkinned));
         } else {
-            qglDrawElementsBaseVertex(GL_TRIANGLES, r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, GL_INDEX_TYPE, (triIndex_t*)indexOffset, vertOffset / sizeof(idShadowVert));
+            RB_DrawShadowVolume(r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, (const void*)indexOffset, vertOffset / sizeof(idShadowVert));
         }
 
         // RB: added stats
@@ -1611,13 +1995,13 @@ static void RB_StencilShadowPass(const drawSurf_t* drawSurfs, const viewLight_t*
 
         if (!renderZPass && r_useStencilShadowPreload.GetBool()) {
             // render again with Z-pass
-            qglStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR);
-            qglStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR);
+            RB_ShadowStencilOp(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR);
+            RB_ShadowStencilOp(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR);
 
             if (drawSurf->jointCache) {
-                qglDrawElementsBaseVertex(GL_TRIANGLES, r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, GL_INDEX_TYPE, (triIndex_t*)indexOffset, vertOffset / sizeof(idShadowVertSkinned));
+                RB_DrawShadowVolume(r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, (const void*)indexOffset, vertOffset / sizeof(idShadowVertSkinned));
             } else {
-                qglDrawElementsBaseVertex(GL_TRIANGLES, r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, GL_INDEX_TYPE, (triIndex_t*)indexOffset, vertOffset / sizeof(idShadowVert));
+                RB_DrawShadowVolume(r_singleTriangle.GetBool() ? 3 : drawSurf->numIndexes, (const void*)indexOffset, vertOffset / sizeof(idShadowVert));
             }
 
             // RB: added stats
@@ -1682,10 +2066,21 @@ static void RB_StencilSelectLight(const viewLight_t* vLight)
     RB_SetMVP(invProjectMVPMatrix);
 
     // two-sided stencil test
-    qglStencilOpSeparate(GL_FRONT, GL_KEEP, GL_REPLACE, GL_ZERO);
-    qglStencilOpSeparate(GL_BACK, GL_KEEP, GL_ZERO, GL_REPLACE);
+    if (glConfig.twoSidedStencilAvailable) {
+        qglStencilOpSeparate(GL_FRONT, GL_KEEP, GL_REPLACE, GL_ZERO);
+        qglStencilOpSeparate(GL_BACK, GL_KEEP, GL_ZERO, GL_REPLACE);
 
-    RB_DrawElementsWithCounters(&backEnd.zeroOneCubeSurface);
+        RB_DrawElementsWithCounters(&backEnd.zeroOneCubeSurface);
+    } else {
+        // Same mask, built from two culled passes. See RB_DrawShadowVolume().
+        GL_Cull(CT_BACK_SIDED);
+        qglStencilOp(GL_KEEP, GL_REPLACE, GL_ZERO);
+        RB_DrawElementsWithCounters(&backEnd.zeroOneCubeSurface);
+
+        GL_Cull(CT_FRONT_SIDED);
+        qglStencilOp(GL_KEEP, GL_ZERO, GL_REPLACE);
+        RB_DrawElementsWithCounters(&backEnd.zeroOneCubeSurface);
+    }
 
     // reset stencil state
 
@@ -1713,6 +2108,7 @@ RB_DrawInteractions
 */
 static void RB_DrawInteractions()
 {
+    VITA_RB_PASS(3);
     if (r_skipInteractions.GetBool()) {
         return;
     }
@@ -1868,6 +2264,7 @@ be multiplied by guiEye for polarity and screenSeparation for scale.
 static int RB_DrawShaderPasses(const drawSurf_t* const* const drawSurfs, const int numDrawSurfs,
     const float guiStereoScreenOffset, const int stereoEye)
 {
+    VITA_RB_PASS(4);
     // only obey skipAmbient if we are rendering a view
     if (backEnd.viewDef->viewEntitys && r_skipAmbient.GetBool()) {
         return numDrawSurfs;
@@ -2479,6 +2876,7 @@ RB_FogAllLights
 */
 static void RB_FogAllLights()
 {
+    VITA_RB_PASS(5);
     if (r_skipFogLights.GetBool() || r_showOverDraw.GetInteger() != 0
         || backEnd.viewDef->isXraySubview /* don't fog in xray mode*/) {
         return;
@@ -2517,6 +2915,13 @@ RB_DrawViewInternal
 void RB_DrawViewInternal(const viewDef_t* viewDef, const int stereoEye)
 {
     renderLog.OpenBlock("RB_DrawViewInternal");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // every main 3D view drawn counts, warping effects or not: a copy is
+    // "from the previous frame" only if no frame went by in between
+    if (!viewDef->isSubview && !viewDef->is2Dgui) {
+        vitaMainViewDraws++;
+    }
+#endif
 
     //-------------------------------------------------
     // guis can wind up referencing purged images that need to be loaded.
@@ -2642,6 +3047,7 @@ void RB_DrawViewInternal(const viewDef_t* viewDef, const int stereoEye)
     //-------------------------------------------------
     if (r_motionBlur.GetInteger() > 0) {
         const idScreenRect& viewport = backEnd.viewDef->viewport;
+        VITA_RB_PASS(6);
         globalImages->currentDepthImage->CopyDepthbuffer(viewport.x1, viewport.y1, viewport.GetWidth(), viewport.GetHeight());
     }
 
@@ -2659,7 +3065,77 @@ void RB_DrawViewInternal(const viewDef_t* viewDef, const int stereoEye)
         GL_SelectTexture(0);
 
         // resolve the screen
-        globalImages->currentRenderImage->CopyFramebuffer(x, y, w, h);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        // Vita (a cut, vita_currentRenderReuse): the main view copies the
+        // screen into _currentRender at most every other frame; on the frame
+        // between, its warping effects (heat haze, distortion) sample the
+        // previous frame's copy. A copy ends the GPU scene being drawn, runs
+        // the blit as a scene of its own and starts a new one - the main
+        // thread spent 8-17 ms in it in the heaviest fight frames (run 36's
+        // back end passes; 3-5 ms a frame on average in the fights).
+        // Reused only when the last copy was this view's, from the previous
+        // frame, at the same place and size (a subview's copy, a resolution
+        // step or a skipped frame forces a fresh one).
+        const bool vitaMainView = !backEnd.viewDef->isSubview && !backEnd.viewDef->is2Dgui;
+        bool vitaReuse = false;
+        uint64 vitaSignature = 0;
+        if (vitaMainView && vita_currentRenderReuse.GetBool()) {
+            vitaSignature = RB_VitaSceneSignature(backEnd.viewDef, drawSurfs, processed);
+        }
+        if (vitaMainView) {
+            // reused for as long as nothing it shows changes (the signature
+            // of the frame the copy was made in), any number of frames
+            vitaReuse = vita_currentRenderReuse.GetBool() && vitaLastCopyMain
+                        && vitaLastCopyDraw == vitaMainViewDraws - 1
+                        && vitaLastCopyRect[0] == x && vitaLastCopyRect[1] == y && vitaLastCopyRect[2] == w && vitaLastCopyRect[3] == h;
+            if (vitaReuse && (vitaSignature == 0 || vitaSignature != vitaLastCopySignature)) {
+                vitaReuse = false;
+                VITA_ZONE_COUNT("_currentRender reuse refused: something drawn before the copy changed (vita_screenCopyReuse2)");
+            }
+            // A copy one frame old only looks right while the view stands
+            // still: moving or turning, glass and heat haze showed the
+            // previous frame's picture every other frame (flicker, a low
+            // update rate on anything transparent in motion).
+            if (vitaReuse) {
+                const renderView_t& rv = backEnd.viewDef->renderView;
+                const bool moved = (rv.vieworg - vitaLastCopyOrigin).LengthSqr() > 0.0f;
+                const bool turned = !rv.viewaxis.Compare(vitaLastCopyAxis);
+                if (moved || turned) {
+                    vitaReuse = false;
+                    VITA_ZONE_COUNT("_currentRender reuse refused: the view moved (vita_currentRenderReuse)");
+                } else if (vita_fullQuality) {
+                    vitaReuse = false;
+                    VITA_ZONE_COUNT("_currentRender reuse refused: cinematic (full quality)");
+                }
+            }
+        }
+        if (vitaReuse) {
+            VITA_ZONE_COUNT("_currentRender copies reused from the previous frame (vita_currentRenderReuse)");
+            vitaLastWasReuse = true;
+            vitaLastCopyDraw = vitaMainViewDraws; // the copy stays this view's, one frame older
+        } else {
+            VITA_ZONE_COUNT("_currentRender copies made (screen blit, GPU scene split)");
+            VITA_RB_PASS(6);
+            globalImages->currentRenderImage->CopyFramebuffer(x, y, w, h);
+            vitaLastWasReuse = false;
+            vitaLastCopyMain = vitaMainView;
+            vitaLastCopySignature = vitaMainView ? vitaSignature : 0;
+            vitaLastCopyDraw = vitaMainView ? vitaMainViewDraws : -100;
+            vitaLastCopyRect[0] = x;
+            vitaLastCopyRect[1] = y;
+            vitaLastCopyRect[2] = w;
+            vitaLastCopyRect[3] = h;
+            if (vitaMainView) {
+                vitaLastCopyOrigin = backEnd.viewDef->renderView.vieworg;
+                vitaLastCopyAxis = backEnd.viewDef->renderView.viewaxis;
+            }
+        }
+#else
+        {
+            VITA_RB_PASS(6);
+            globalImages->currentRenderImage->CopyFramebuffer(x, y, w, h);
+        }
+#endif
         backEnd.currentRenderCopied = true;
 
         // RENDERPARM_SCREENCORRECTIONFACTOR amd RENDERPARM_WINDOWCOORD overlap
@@ -2678,7 +3154,20 @@ void RB_DrawViewInternal(const viewDef_t* viewDef, const int stereoEye)
         windowCoordParm[0] = 1.0f / w;
         windowCoordParm[1] = 1.0f / h;
         windowCoordParm[2] = 0.0f;
+#if defined(__vita__)
+        // The Vita's screen-space lookup (vitaVposToScreenPosTexCoord in
+        // RenderProgs_GLSL.cpp) gets a top-origin fragment position r on the
+        // whole display and computes v = w - r / h. The view's rows are GL
+        // rows y .. y + h - 1 (bottom origin), i.e. display rows from
+        // H - y - h down; v = (H - y - r) / h, so w = (H - y) / h. The scaled
+        // 3D view sits in the TOP-left corner (y = H - h, w = 1): the old
+        // H / h (a view at the bottom) pushed v past 1 over the top third of
+        // the view, and the heat haze there smeared one row down the screen -
+        // the striped blobs over the muzzle smoke.
+        windowCoordParm[3] = (float)(renderSystem->GetHeight() - y) / (float)h;
+#else
         windowCoordParm[3] = 1.0f;
+#endif
         SetFragmentParm(RENDERPARM_WINDOWCOORD, windowCoordParm); // rpWindowCoord
 
         // render the remaining surfaces
@@ -2808,6 +3297,7 @@ is 0, so the stereoEye parameter is not always the same as that.
 */
 void RB_DrawView(const void* data, const int stereoEye)
 {
+    VITA_RB_PASS(7);
     const drawSurfsCommand_t* cmd = (const drawSurfsCommand_t*)data;
 
     backEnd.viewDef = cmd->viewDef;
@@ -2884,6 +3374,9 @@ Copy part of the current framebuffer to an image
 void RB_CopyRender(const void* data)
 {
     const copyRenderCommand_t* cmd = (const copyRenderCommand_t*)data;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaLastCopyMain = false; // any other screen copy may have written _currentRender
+#endif
 
     if (r_skipCopyTexture.GetBool()) {
         return;
@@ -2907,18 +3400,225 @@ RB_PostProcess
 ==================
 */
 extern idCVar rs_enable;
+// The verification's z-fail check (VitaVerify.cpp, shadowcheck): every shadow
+// volume the view needs is drawn with Z-fail and its caps (Carmack's reverse
+// everywhere) - the same stencil counts as the Z-pass / Z-fail mix the
+// shadow jobs choose, so the same picture unless a cap or the far end at
+// infinity is wrong. Read by the shadow volume jobs.
+idCVar r_forceZFailStencilShadows("r_forceZFailStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL, "draw every shadow volume with Z-fail and caps (a test: the picture must not change)");
+bool R_ForceZFailStencilShadows()
+{
+    return r_forceZFailStencilShadows.GetBool(); // the shadow jobs keep to the idlib headers
+}
+// FXAA's constants (the shader: vita_fxaa, RenderProgs_GLSL.cpp; NVIDIA FXAA
+// 3.11 console, its documented values): N 0.33 is its 'sharper' sub-pixel
+// offset (0.50 default), sharpness 8 its 'sharper' default, threshold 0.125
+// its default, minimum 0.05 its default
+idCVar vita_fxaaN("vita_fxaaN", "0.33", CVAR_RENDERER | CVAR_FLOAT, "FXAA console: sub-pixel offset N (0.33 sharper, 0.50 default)");
+idCVar vita_fxaaSharpness("vita_fxaaSharpness", "8", CVAR_RENDERER | CVAR_FLOAT, "FXAA console: edge sharpness (8 sharper - the default, 4 softer, 2 really soft)");
+idCVar vita_fxaaThreshold("vita_fxaaThreshold", "0.125", CVAR_RENDERER | CVAR_FLOAT, "FXAA console: edge threshold (0.125 default, 0.25 sharper / more aliasing)");
+idCVar vita_fxaaThresholdMin("vita_fxaaThresholdMin", "0.05", CVAR_RENDERER | CVAR_FLOAT, "FXAA console: edge threshold minimum - skips darks (0.04 slower, 0.05 default, 0.06 faster)");
+#if defined(__vita__)
+bool Vita_RenderScale(float& x, float& y);
+#endif
+
+// The stretch's sharpening and soft alpha-tested edges (RenderProgs_GLSL.cpp,
+// vita_postFilter). Live.
+#if defined(__vita__)
+idCVar vita_sharpen("vita_sharpen", "0.5", CVAR_RENDERER | CVAR_FLOAT, "sharpening strength on the 3D view's stretch (LumaSharpen's diagonal 3-tap; 0 = off, 0.65 = LumaSharpen's default); grows with the stretch as dynamic resolution lowers the view; not on a PS TV", 0.0f, 2.0f);
+idCVar vita_softAlphaEdges("vita_softAlphaEdges", "1", CVAR_RENDERER | CVAR_FLOAT, "soft edges for alpha-tested surfaces (grates, fences, foliage) on the 3D view's stretch, standing in for alpha to coverage (0 = off)", 0.0f, 1.0f);
+#else
+idCVar vita_sharpen("vita_sharpen", "0.5", CVAR_RENDERER | CVAR_FLOAT, "sharpening strength on the 3D view's stretch (vita_postFilter; LumaSharpen's diagonal 3-tap; 0 = off)", 0.0f, 2.0f);
+idCVar vita_softAlphaEdges("vita_softAlphaEdges", "1", CVAR_RENDERER | CVAR_FLOAT, "soft edges for alpha-tested surfaces on the 3D view's stretch (vita_postFilter; 0 = off)", 0.0f, 1.0f);
+#endif
+idCVar vita_sharpenClamp("vita_sharpenClamp", "0.035", CVAR_RENDERER | CVAR_FLOAT, "the most the sharpening may change a pixel's brightness (0.035 = 9/255, LumaSharpen's default)", 0.001f, 0.25f);
+idCVar vita_sharpenOnTV("vita_sharpenOnTV", "0", CVAR_RENDERER | CVAR_BOOL, "sharpen on a PS TV too (off: the TV scales the picture again)");
+idCVar vita_softAlphaEdgesShow("vita_softAlphaEdgesShow", "0", CVAR_RENDERER | CVAR_BOOL, "paint the pixels the soft edges blur red (a check)");
+idCVar vita_postFilterPlain("vita_postFilterPlain", "0", CVAR_RENDERER | CVAR_BOOL, "stretch the 3D view with the stock shader instead of the filter (no sharpening, no soft edges - the verification's cost check)");
+extern bool r_vitaPostFilterBuilt;
+// for the verification and the log: the last frame's map
+int r_vitaAlphaEdgeSurfaces = 0;
+int r_vitaAlphaEdgeFrames = 0; // frames with a map, since start
+
+static bool RB_VitaOnTV()
+{
+#if defined(__vita__)
+    static int tv = -1;
+    if (tv < 0) {
+        tv = sceKernelIsPSVitaTV() ? 1 : 0;
+    }
+    return tv == 1;
+#else
+    return false;
+#endif
+}
+
+/*
+==================
+RB_VitaAlphaEdgeMask
+
+Soft edges for alpha-tested surfaces (vita_softAlphaEdges): the user's
+stand-in for alpha to coverage, which GXM does not have. Just before the
+stretch copies the 3D view, the view's alpha channel - nothing reads it
+past this point - becomes a map of where alpha-tested surfaces show:
+zeroed over the view (a quad, alpha only: the colours are untouched), then
+every alpha-tested stage is drawn again exactly as the depth pass drew it
+(same shader, matrices, polygon offsets, culling and test), alpha only, with
+depth EQUAL, writing its texture alpha where it passes the test. The
+stretch's shader blurs where that map changes between neighbouring pixels -
+the edges of the cut-outs, both sides - and sharpens everywhere else.
+
+Returns the number of surfaces drawn: 0 (none in view) draws nothing, and
+the shader is told to ignore alpha.
+==================
+*/
+static int RB_VitaAlphaEdgeMask(const viewDef_t* viewDef)
+{
+    VITA_RB_PASS(8);
+    if (viewDef == NULL || viewDef->viewEntitys == NULL || viewDef->numDrawSurfs <= 0 || viewDef->isSubview) {
+        return 0;
+    }
+    // anything to draw?
+    int candidates = 0;
+    for (int i = 0; i < viewDef->numDrawSurfs && candidates == 0; i++) {
+        const drawSurf_t* drawSurf = viewDef->drawSurfs[i];
+        if (drawSurf->material != NULL && drawSurf->material->Coverage() == MC_PERFORATED && drawSurf->material->GetSort() != SS_SUBVIEW) {
+            candidates++;
+        }
+    }
+    if (candidates == 0) {
+        return 0;
+    }
+    renderLog.OpenBlock("RB_VitaAlphaEdgeMask");
+
+    const idScreenRect& viewport = viewDef->viewport;
+    GL_Viewport(viewport.x1, viewport.y1, viewport.x2 + 1 - viewport.x1, viewport.y2 + 1 - viewport.y1);
+    GL_Scissor(viewport.x1, viewport.y1, viewport.x2 + 1 - viewport.x1, viewport.y2 + 1 - viewport.y1);
+
+    // 1. alpha 0 over the view
+    {
+        float identity[16] = { 0 };
+        identity[0] = identity[5] = identity[10] = identity[15] = 1.0f;
+        renderProgManager.SetRenderParms(RENDERPARM_MVPMATRIX_X, identity, 4);
+        GL_State(GLS_COLORMASK | GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS);
+        GL_Cull(CT_TWO_SIDED);
+        renderProgManager.BindShader_Color();
+        GL_Color(0.0f, 0.0f, 0.0f, 0.0f);
+        RB_DrawElementsWithCounters(&backEnd.unitSquareSurface);
+    }
+
+    // 2. the alpha-tested stages, as RB_FillDepthBufferGeneric draws them
+    GL_Cull(CT_FRONT_SIDED);
+    backEnd.currentSpace = NULL;
+    int drawn = 0;
+    for (int i = 0; i < viewDef->numDrawSurfs; i++) {
+        const drawSurf_t* drawSurf = viewDef->drawSurfs[i];
+        const idMaterial* shader = drawSurf->material;
+        if (shader == NULL || shader->Coverage() != MC_PERFORATED || shader->GetSort() == SS_SUBVIEW) {
+            continue;
+        }
+        const float* regs = drawSurf->shaderRegisters;
+        uint64 surfGLState = GLS_COLORMASK | GLS_DEPTHMASK | GLS_DEPTHFUNC_EQUAL;
+        if (shader->TestMaterialFlag(MF_POLYGONOFFSET)) {
+            surfGLState |= GLS_POLYGON_OFFSET;
+            GL_PolygonOffset(r_offsetFactor.GetFloat(), r_offsetUnits.GetFloat() * shader->GetPolygonOffset());
+        }
+        bool spaceSet = false;
+        for (int stage = 0; stage < shader->GetNumStages(); stage++) {
+            const shaderStage_t* pStage = shader->GetStage(stage);
+            if (!pStage->hasAlphaTest || regs[pStage->conditionRegister] == 0) {
+                continue;
+            }
+            float color[4] = { 0.0f, 0.0f, 0.0f, regs[pStage->color.registers[3]] };
+            if (color[3] <= 0.0f) {
+                continue;
+            }
+            if (!spaceSet && drawSurf->space != backEnd.currentSpace) {
+                RB_SetMVP(drawSurf->space->mvp);
+                backEnd.currentSpace = drawSurf->space;
+            }
+            spaceSet = true;
+            uint64 stageGLState = surfGLState;
+            if (pStage->privatePolygonOffset) {
+                GL_PolygonOffset(r_offsetFactor.GetFloat(), r_offsetUnits.GetFloat() * pStage->privatePolygonOffset);
+                stageGLState |= GLS_POLYGON_OFFSET;
+            }
+            GL_Color(color);
+#ifdef USE_CORE_PROFILE
+            GL_State(stageGLState);
+            idVec4 alphaTestValue(regs[pStage->alphaTestRegister]);
+            SetFragmentParm(RENDERPARM_ALPHA_TEST, alphaTestValue.ToFloatPtr());
+#else
+            GL_State(stageGLState | GLS_ALPHATEST_FUNC_GREATER | GLS_ALPHATEST_MAKE_REF(idMath::Ftob(255.0f * regs[pStage->alphaTestRegister])));
+#endif
+            if (drawSurf->jointCache) {
+                renderProgManager.BindShader_TextureVertexColorSkinned();
+            } else {
+                renderProgManager.BindShader_TextureVertexColor();
+            }
+            RB_SetVertexColorParms(SVC_IGNORE);
+            GL_SelectTexture(0);
+            pStage->texture.image->Bind();
+            RB_PrepareStageTexturing(pStage, drawSurf);
+            RB_DrawElementsWithCounters(drawSurf);
+            RB_FinishStageTexturing(pStage, drawSurf);
+            if (pStage->privatePolygonOffset) {
+                GL_PolygonOffset(r_offsetFactor.GetFloat(), r_offsetUnits.GetFloat() * shader->GetPolygonOffset());
+            }
+            drawn++;
+        }
+    }
+#ifdef USE_CORE_PROFILE
+    SetFragmentParm(RENDERPARM_ALPHA_TEST, vec4_zero.ToFloatPtr());
+#endif
+    backEnd.currentSpace = NULL;
+    renderLog.CloseBlock();
+    return drawn;
+}
+
 void RB_PostProcess(const void* data)
 {
+    VITA_RB_PASS(9);
 
     // only do the post process step if resolution scaling is enabled. Prevents the unnecessary copying of the framebuffer and
     // corresponding full screen quad pass.
+#if defined(__vita__)
+    float vitaScaleX, vitaScaleY;
+    if (rs_enable.GetInteger() == 0 && !Vita_RenderScale(vitaScaleX, vitaScaleY)) {
+        return;
+    }
+#else
     if (rs_enable.GetInteger() == 0) {
         return;
     }
+#endif
 
     // resolve the scaled rendering to a temporary texture
     postProcessCommand_t* cmd = (postProcessCommand_t*)data;
     const idScreenRect& viewport = cmd->viewDef->viewport;
+#if defined(__vita__)
+    {
+        static int logged = 0;
+        if (logged < 2) {
+            logged++;
+            Vita_Checkpoint("render scale: 3D view drawn at %dx%d in (%d,%d), stretched to %dx%d before the HUD/menus",
+                viewport.GetWidth(), viewport.GetHeight(), viewport.x1, viewport.y1, renderSystem->GetWidth(), renderSystem->GetHeight());
+        }
+    }
+#endif
+    // the soft edges' map, in the view's alpha (before the copy)
+    float softEdges = 0.0f;
+    const bool vitaFilter = r_vitaPostFilterBuilt && !vita_postFilterPlain.GetBool();
+    if (vitaFilter && vita_softAlphaEdges.GetFloat() > 0.0f) {
+        r_vitaAlphaEdgeSurfaces = RB_VitaAlphaEdgeMask(cmd->viewDef);
+        if (r_vitaAlphaEdgeSurfaces > 0) {
+            softEdges = vita_softAlphaEdges.GetFloat();
+            r_vitaAlphaEdgeFrames++;
+        }
+    } else {
+        r_vitaAlphaEdgeSurfaces = 0;
+    }
+
     globalImages->currentRenderImage->CopyFramebuffer(viewport.x1, viewport.y1, viewport.GetWidth(), viewport.GetHeight());
 
     GL_State(GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO | GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS);
@@ -2933,7 +3633,43 @@ void RB_PostProcess(const void* data)
 
     GL_SelectTexture(0);
     globalImages->currentRenderImage->Bind();
-    renderProgManager.BindShader_PostProcess();
+    if (r_vitaPostFilterBuilt && !vitaFilter) {
+        renderProgManager.BindShader_PostProcessPlain();
+    } else {
+        renderProgManager.BindShader_PostProcess();
+    }
+    const float copyW = (float)Max(1, globalImages->currentRenderImage->GetUploadWidth());
+    const float copyH = (float)Max(1, globalImages->currentRenderImage->GetUploadHeight());
+    if (vitaFilter) {
+        // the sharpening and soft edges' constants (RenderProgs_GLSL.cpp):
+        // the strength grows with the stretch - x1 at 720 wide, x1.32 at 544
+        float strength = vita_sharpen.GetFloat() * Max(1.0f, (screenWidth / (float)Max(1, (int)viewport.GetWidth())) * (720.0f / 960.0f));
+        if (RB_VitaOnTV() && !vita_sharpenOnTV.GetBool()) {
+            strength = 0.0f;
+        }
+        const float clampTo = vita_sharpenClamp.GetFloat();
+        const float k = strength * 1.5f * (0.5f / clampTo); // LumaSharpen's fast pattern x1.5, its clamp folded in
+        const idVec4 p0(1.0f / copyW, 1.0f / copyH, 2.0f * clampTo, -clampTo);
+        const idVec4 p1(0.2126f * k, 0.7152f * k, 0.0722f * k, 0.0f);
+        const idVec4 p2(softEdges, vita_softAlphaEdgesShow.GetBool() ? 1.0f : 0.0f, 0.0f, 0.0f);
+        SetFragmentParm(RENDERPARM_TEXGEN_0_S, p0.ToFloatPtr());
+        SetFragmentParm(RENDERPARM_TEXGEN_0_T, p1.ToFloatPtr());
+        SetFragmentParm(RENDERPARM_TEXGEN_0_Q, p2.ToFloatPtr());
+        static int logged = 0;
+        if (logged < 2) {
+            logged++;
+            common->Printf("vita: stretch %dx%d -> %dx%d: sharpening %.2f (clamp %.3f%s), soft alpha-tested edges %.2f (%d surfaces in the map)\n",
+                viewport.GetWidth(), viewport.GetHeight(), screenWidth, screenHeight, strength, clampTo,
+                RB_VitaOnTV() ? (vita_sharpenOnTV.GetBool() ? ", PS TV" : ", PS TV: off") : "", softEdges, r_vitaAlphaEdgeSurfaces);
+        }
+    } else {
+        // FXAA's constants (unused by the plain stretch): the copy's texel size,
+        // N, the edge sharpness, the threshold and its minimum
+        const idVec4 fxaa0(1.0f / copyW, 1.0f / copyH, vita_fxaaN.GetFloat(), vita_fxaaSharpness.GetFloat());
+        const idVec4 fxaa1(vita_fxaaThreshold.GetFloat(), vita_fxaaThresholdMin.GetFloat(), 0.0f, 0.0f);
+        SetFragmentParm(RENDERPARM_TEXGEN_0_S, fxaa0.ToFloatPtr());
+        SetFragmentParm(RENDERPARM_TEXGEN_0_T, fxaa1.ToFloatPtr());
+    }
 
     // Draw
     RB_DrawElementsWithCounters(&backEnd.unitSquareSurface);

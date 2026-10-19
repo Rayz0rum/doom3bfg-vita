@@ -828,6 +828,11 @@ int idFile_Memory::Write(const void* buffer, int len)
         }
         int extra = granularity * (1 + alloc / granularity);
         char* newPtr = (char*)Mem_Alloc(allocated + extra, TAG_IDFILE);
+        if (newPtr == NULL) {
+            // (unchecked in stock BFG: the copy below wrote through NULL)
+            common->Error("idFile_Memory::Write: out of memory - %" PRIuSIZE " bytes for '%s'", allocated + extra, name.c_str());
+            return 0;
+        }
         if (allocated) {
             memcpy(newPtr, filePtr, allocated);
         }
@@ -908,6 +913,12 @@ void idFile_Memory::PreAllocate(size_t len)
             idLib::Error("idFile_Memory::SetLength: exceeded maximum size %" PRIuSIZE "", maxSize);
         }
         char* newPtr = (char*)Mem_Alloc(len, TAG_IDFILE);
+        if (newPtr == NULL) {
+            // a head start only: Write grows the buffer as it needs to (stock
+            // BFG recorded the new size with a NULL buffer behind it)
+            idLib::Warning("idFile_Memory::PreAllocate: no %" PRIuSIZE " bytes for '%s' - it grows as it is written", len, name.c_str());
+            return;
+        }
         if (allocated > 0) {
             memcpy(newPtr, filePtr, allocated);
         }

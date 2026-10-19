@@ -407,7 +407,7 @@ R_DrawVisSprite
 	}
 	else if( vis->mobjflags & MF_TRANSLATION )
 	{
-		colfunc = R_DrawTranslatedColumn;
+		colfunc = transcolfunc;		// (was R_DrawTranslatedColumn: the same, unless drawing is deferred)
 		::g->dc_translation = ::g->translationtables - 256 +
 							  ( ( vis->mobjflags & MF_TRANSLATION ) >> ( MF_TRANSSHIFT - 8 ) );
 	}

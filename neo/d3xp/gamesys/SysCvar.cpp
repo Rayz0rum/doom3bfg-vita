@@ -187,6 +187,10 @@ idCVar g_vehicleDebug("g_vehicleDebug", "0", CVAR_GAME | CVAR_BOOL, "");
 idCVar ik_enable("ik_enable", "1", CVAR_GAME | CVAR_BOOL, "enable IK");
 idCVar ik_debug("ik_debug", "0", CVAR_GAME | CVAR_BOOL, "show IK debug lines");
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+idCVar vita_afContactsPerBody("vita_afContactsPerBody", "2", CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "Vita: ragdoll bodies keep at most this many contacts (stock: up to 3 a pair of bodies); 0 = stock");
+idCVar vita_afMaxMoveTime("vita_afMaxMoveTime", "0.9", CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "Vita: seconds a ragdoll may move before it is put to rest (0 = as the .af file says)");
+#endif
 idCVar af_useLinearTime("af_useLinearTime", "1", CVAR_GAME | CVAR_BOOL, "use linear time algorithm for tree-like structures");
 idCVar af_useImpulseFriction("af_useImpulseFriction", "0", CVAR_GAME | CVAR_BOOL, "use impulse based contact friction");
 idCVar af_useJointImpulseFriction("af_useJointImpulseFriction", "0", CVAR_GAME | CVAR_BOOL, "use impulse based joint friction");

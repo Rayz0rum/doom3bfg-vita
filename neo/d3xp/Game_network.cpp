@@ -199,6 +199,8 @@ void idGameLocal::SyncPlayersWithLobbyUsers(bool initial)
 
         mpGame.ServerClientConnect(freePlayerDataIndex);
         Printf("client %d connected.\n", freePlayerDataIndex);
+        extern void VitaBot_Reset(int clientNum);
+        VitaBot_Reset(freePlayerDataIndex); // a bot's brain starts afresh in a reused slot
 
         lobbyUserIDs[freePlayerDataIndex] = lobbyUserID;
 

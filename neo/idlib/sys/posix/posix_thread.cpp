@@ -124,6 +124,17 @@ uintptr_t Sys_CreateThread(xthread_t function, void* parms, xthreadPriority prio
         return (uintptr_t)0;
     }
 
+#if defined(__vita__)
+    // stackSize is otherwise ignored here, which is survivable on a desktop
+    // (glibc hands out an 8 MB stack that grows on demand) and not on the Vita,
+    // where pthread-embedded's default is small and fixed. The callers size their
+    // threads deliberately - Common.cpp asks for 1 MB for Game/Draw, the job
+    // threads and AutoRender for 256 KB each - so honour the request.
+    if (stackSize > 0 && pthread_attr_setstacksize(&attr, stackSize) != 0) {
+        idLib::common->Warning("pthread_attr_setstacksize %s (%i bytes) failed", name, stackSize);
+    }
+#endif
+
     pthread_t handle;
     if (pthread_create((pthread_t*)&handle, &attr, (pthread_function_t)function, parms) != 0) {
         idLib::common->FatalError("ERROR: pthread_create %s failed\n", name);

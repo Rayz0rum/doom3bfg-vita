@@ -110,9 +110,22 @@ public:
     virtual int WriteVec6(const idVec6& vec);
     virtual int WriteMat3(const idMat3& mat);
 
+    // -fshort-enums is the ARM EABI default, so an enum whose enumerators all fit
+    // in a byte is one byte wide on the Vita and four bytes on the x86 tools that
+    // wrote the binary files shipped inside the .resources. Serialising one
+    // through these helpers reads or writes the wrong number of bytes and
+    // silently desynchronises the rest of the stream - the failure surfaces much
+    // later as a garbage length or count. Any enum that reaches this path needs an
+    // explicit 0x7fffffff enumerator to pin it to 32 bits.
+#define ID_ASSERT_FIXED_WIDTH_ENUM(T) \
+    static_assert(!__is_enum(T) || sizeof(T) == 4, \
+        "serialized enum is not 32 bits wide; give it a _FORCE_32BIT = 0x7fffffff " \
+        "enumerator (see the -fshort-enums note above)")
+
     template <class type>
     ID_INLINE size_t ReadBig(type& c)
     {
+        ID_ASSERT_FIXED_WIDTH_ENUM(type);
         size_t r = Read(&c, sizeof(c));
         idSwap::Big(c);
         return r;
@@ -121,6 +134,7 @@ public:
     template <class type>
     ID_INLINE size_t ReadBigArray(type* c, int count)
     {
+        ID_ASSERT_FIXED_WIDTH_ENUM(type);
         size_t r = Read(c, sizeof(c[0]) * count);
         idSwap::BigArray(c, count);
         return r;
@@ -129,6 +143,7 @@ public:
     template <class type>
     ID_INLINE size_t WriteBig(const type& c)
     {
+        ID_ASSERT_FIXED_WIDTH_ENUM(type);
         type b = c;
         idSwap::Big(b);
         return Write(&b, sizeof(b));
@@ -137,6 +152,7 @@ public:
     template <class type>
     ID_INLINE size_t WriteBigArray(const type* c, int count)
     {
+        ID_ASSERT_FIXED_WIDTH_ENUM(type);
         size_t r = 0;
         for (int i = 0; i < count; i++) {
             r += WriteBig(c[i]);

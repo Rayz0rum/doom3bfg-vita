@@ -32,6 +32,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 #include "Model_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE_COUNT / VITA_ZONE_ADD: the model trace counts in the perf log
 
 #if defined(USE_INTRINSICS)
 static const __m128 vector_float_posInfinity = { idMath::INFINITY, idMath::INFINITY, idMath::INFINITY, idMath::INFINITY };
@@ -76,6 +77,19 @@ idMD5Mesh::idMD5Mesh()
     maxJointVertDist = 0.0f;
     deformInfo = NULL;
     surfaceNum = 0;
+#if defined(__vita__)
+    vitaUnitNT = NULL;
+#endif
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaWeightSumMax = -1.0f;
+    vitaGroupsOf = NULL;
+    vitaNumGroups = 0;
+    vitaGroups = NULL;
+    vitaGroupJoints = NULL;
+    vitaGroupVerts = NULL;
+    vitaGroupIndexes = NULL;
+    vitaGroupTriPos = NULL;
+#endif
 }
 
 /*
@@ -85,6 +99,15 @@ idMD5Mesh::~idMD5Mesh
 */
 idMD5Mesh::~idMD5Mesh()
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    VitaFreeTraceGroups();
+#endif
+#if defined(__vita__)
+    if (vitaUnitNT != NULL) {
+        Mem_Free16(vitaUnitNT);
+        vitaUnitNT = NULL;
+    }
+#endif
     if (meshJoints != NULL) {
         Mem_Free(meshJoints);
         meshJoints = NULL;
@@ -401,6 +424,357 @@ void idMD5Mesh::ParseMesh(idLexer& parser, int numJoints, const idJointMat* join
     Mem_Free(basePose);
 }
 
+#if defined(__vita__) && defined(__ARM_NEON__)
+#include <arm_neon.h>
+/*
+============
+Vita_SkinColumns
+
+The blended joint matrix of a vertex - its four weighted joint matrices
+summed row by row - turned into columns (c3 is the translation). Shared by the
+full skin and the positions-only one, so both give bit-identical positions.
+The weights come from one 8-byte load (color holds the joint indexes, color2
+right after it the weights) and one vector conversion.
+============
+*/
+static ID_FORCE_INLINE void Vita_SkinColumns(const idDrawVert& base, const idJointMat* joints, const float32x4_t inv255,
+    float32x4_t& c0, float32x4_t& c1, float32x4_t& c2, float32x4_t& c3)
+{
+    const float* j0 = joints[base.color[0]].ToFloatPtr();
+    const float* j1 = joints[base.color[1]].ToFloatPtr();
+    const float* j2 = joints[base.color[2]].ToFloatPtr();
+    const float* j3 = joints[base.color[3]].ToFloatPtr();
+    const uint16x8_t indexesAndWeights = vmovl_u8(vld1_u8(base.color));
+    const float32x4_t w = vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(indexesAndWeights))), inv255);
+    const float32x2_t w01 = vget_low_f32(w);
+    const float32x2_t w23 = vget_high_f32(w);
+    // the three rows side by side, so the multiply-adds do not wait on each other
+    float32x4_t r0 = vmulq_lane_f32(vld1q_f32(j0 + 0), w01, 0);
+    float32x4_t r1 = vmulq_lane_f32(vld1q_f32(j0 + 4), w01, 0);
+    float32x4_t r2 = vmulq_lane_f32(vld1q_f32(j0 + 8), w01, 0);
+    r0 = vmlaq_lane_f32(r0, vld1q_f32(j1 + 0), w01, 1);
+    r1 = vmlaq_lane_f32(r1, vld1q_f32(j1 + 4), w01, 1);
+    r2 = vmlaq_lane_f32(r2, vld1q_f32(j1 + 8), w01, 1);
+    r0 = vmlaq_lane_f32(r0, vld1q_f32(j2 + 0), w23, 0);
+    r1 = vmlaq_lane_f32(r1, vld1q_f32(j2 + 4), w23, 0);
+    r2 = vmlaq_lane_f32(r2, vld1q_f32(j2 + 8), w23, 0);
+    r0 = vmlaq_lane_f32(r0, vld1q_f32(j3 + 0), w23, 1);
+    r1 = vmlaq_lane_f32(r1, vld1q_f32(j3 + 4), w23, 1);
+    r2 = vmlaq_lane_f32(r2, vld1q_f32(j3 + 8), w23, 1);
+    // rows -> columns (the fourth row is zero)
+    const float32x4x2_t t01 = vtrnq_f32(r0, r1);
+    const float32x4x2_t t2z = vtrnq_f32(r2, vdupq_n_f32(0.0f));
+    c0 = vcombine_f32(vget_low_f32(t01.val[0]), vget_low_f32(t2z.val[0]));
+    c1 = vcombine_f32(vget_low_f32(t01.val[1]), vget_low_f32(t2z.val[1]));
+    c2 = vcombine_f32(vget_high_f32(t01.val[0]), vget_high_f32(t2z.val[0]));
+    c3 = vcombine_f32(vget_high_f32(t01.val[1]), vget_high_f32(t2z.val[1]));
+}
+
+static ID_FORCE_INLINE float32x4_t Vita_SkinPosition(const idDrawVert& base, const float32x4_t c0, const float32x4_t c1, const float32x4_t c2, const float32x4_t c3)
+{
+    // x, y, z in one load (the fourth lane is the texture coordinates, unused)
+    // and multiplied by lane: with the three floats passed as scalars, GCC
+    // built each one's vector through the stack, lane by lane, every vertex.
+    // The same multiply-adds by scalar, so the same results.
+    const float32x4_t xyz = vld1q_f32(&base.xyz.x);
+    const float32x2_t xy = vget_low_f32(xyz);
+    const float32x2_t zs = vget_high_f32(xyz);
+    return vmlaq_lane_f32(vmlaq_lane_f32(vmlaq_lane_f32(c3, c0, xy, 0), c1, xy, 1), c2, zs, 0);
+}
+
+/*
+============
+Vita_UnitNormalTangent
+
+A base vertex's normal and tangent (bytes: normal[4], then tangent[4]) as the
+unit vectors the skin rotates - unpacked and renormalized. They depend on the
+base vertex alone, so Vita_UnitNormalsTangents_NEON can make them once per
+mesh (idMD5Mesh::VitaUnitNormals) with this very code.
+============
+*/
+static ID_FORCE_INLINE void Vita_UnitNormalTangent(const uint8x8_t bytes, const float32x4_t byteScale, const float32x4_t minusOne, float32x4_t& nn, float32x4_t& nt)
+{
+    // unpack (b * 2/255 - 1), the fourth lanes are ignored
+    const uint16x8_t bytes16 = vmovl_u8(bytes);
+    const float32x4_t fn = vmlaq_f32(minusOne, vcvtq_f32_u32(vmovl_u16(vget_low_u16(bytes16))), byteScale);
+    const float32x4_t ft = vmlaq_f32(minusOne, vcvtq_f32_u32(vmovl_u16(vget_high_u16(bytes16))), byteScale);
+    // renormalize: lane 0 the normal, lane 1 the tangent, each x2 + y2 + z2
+    const float32x4_t sqn = vmulq_f32(fn, fn);
+    const float32x4_t sqt = vmulq_f32(ft, ft);
+    const float32x2x2_t zz = vtrn_f32(vget_high_f32(sqn), vget_high_f32(sqt));
+    const float32x2_t len2 = vadd_f32(vpadd_f32(vget_low_f32(sqn), vget_low_f32(sqt)), zz.val[0]);
+    float32x2_t inv = vrsqrte_f32(len2);
+    inv = vmul_f32(inv, vrsqrts_f32(vmul_f32(len2, inv), inv));
+    inv = vmul_f32(inv, vrsqrts_f32(vmul_f32(len2, inv), inv));
+    nn = vmulq_lane_f32(fn, inv, 0);
+    nt = vmulq_lane_f32(ft, inv, 1);
+}
+
+/*
+============
+Vita_SkinVertexUnit / Vita_SkinVertex
+
+One vertex of Vita_TransformVertsAndTangents_NEON (see there), from its unit
+normal and tangent (nn, nt) - given, or made here.
+============
+*/
+static ID_FORCE_INLINE void Vita_SkinVertexUnit(const idDrawVert& base, idDrawVert& out, const uint8x8_t bytes, const float32x4_t nn, const float32x4_t nt, byte* outNormal,
+    const idJointMat* joints, const float32x4_t one, const float32x4_t half, const float32x4_t inv255, const uint32x4_t maxByte, const uint8x8_t keepFourth, const float32x4_t halfByteRange)
+{
+    float32x4_t c0, c1, c2, c3;
+    Vita_SkinColumns(base, joints, inv255, c0, c1, c2, c3);
+
+    const float32x4_t pos = Vita_SkinPosition(base, c0, c1, c2, c3);
+    vst1_f32(&out.xyz.x, vget_low_f32(pos));
+    vst1q_lane_f32(&out.xyz.z, pos, 2);
+
+    // rotate
+    float32x4_t rn = vmulq_lane_f32(c0, vget_low_f32(nn), 0);
+    float32x4_t rt = vmulq_lane_f32(c0, vget_low_f32(nt), 0);
+    rn = vmlaq_lane_f32(rn, c1, vget_low_f32(nn), 1);
+    rt = vmlaq_lane_f32(rt, c1, vget_low_f32(nt), 1);
+    rn = vmlaq_lane_f32(rn, c2, vget_high_f32(nn), 0);
+    rt = vmlaq_lane_f32(rt, c2, vget_high_f32(nt), 0);
+    // pack: Ftob( ( x + 1 ) * 127.5 + 0.5 ), truncating, clamped to 0..255
+    // (127.5 as a vector: the scalar form moved it from an ARM register into a lane twice a vertex)
+    const uint32x4_t un = vminq_u32(vcvtq_u32_f32(vmlaq_f32(half, vaddq_f32(rn, one), halfByteRange)), maxByte);
+    const uint32x4_t ut = vminq_u32(vcvtq_u32_f32(vmlaq_f32(half, vaddq_f32(rt, one), halfByteRange)), maxByte);
+    const uint8x8_t packed = vmovn_u16(vcombine_u16(vmovn_u32(un), vmovn_u32(ut)));
+    vst1_u8(outNormal, vbsl_u8(keepFourth, bytes, packed));
+}
+
+static ID_FORCE_INLINE void Vita_SkinVertex(const idDrawVert& base, idDrawVert& out, const byte* baseNormal, byte* outNormal, const idJointMat* joints, const float32x4_t one, const float32x4_t half,
+    const float32x4_t byteScale, const float32x4_t minusOne, const float32x4_t inv255, const uint32x4_t maxByte, const uint8x8_t keepFourth, const float32x4_t halfByteRange)
+{
+    const uint8x8_t bytes = vld1_u8(baseNormal); // normal[4], then tangent[4]
+    float32x4_t nn, nt;
+    Vita_UnitNormalTangent(bytes, byteScale, minusOne, nn, nt);
+    Vita_SkinVertexUnit(base, out, bytes, nn, nt, outNormal, joints, one, half, inv255, maxByte, keepFourth, halfByteRange);
+}
+
+/*
+============
+Vita_TransformVertsAndTangents_NEON
+
+GPU skinning is off on the Vita (no uniform blocks in GLSL ES 1.00), so every
+animated mesh is skinned here, on the CPU, every frame it is seen - the
+biggest part of the front end's "models" time. The same work in NEON: the
+blended joint matrix (Vita_SkinColumns) applied to the position, normal and
+tangent (normal and tangent unpacked from bytes, renormalized - reciprocal
+square root estimate plus two Newton steps - and packed back with the same
+rounding and clamping as VERTEX_FLOAT_TO_BYTE).
+
+Normal and tangent go through together: one 8-byte load, both lengths in one
+2-lane reciprocal square root, one 8-byte store. Moving a value from a NEON
+register to an ARM one stalls the Cortex-A9 until the NEON pipeline catches
+up, and the first version paid that six times a vertex, storing the bytes one
+by one; this one never leaves NEON. The arithmetic is unchanged, lane for lane.
+============
+*/
+void Vita_TransformVertsAndTangents_NEON(idDrawVert* __restrict targetVerts, const int numVerts, const idDrawVert* __restrict baseVerts, const idJointMat* __restrict joints)
+{
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t byteScale = vdupq_n_f32(2.0f / 255.0f);
+    const float32x4_t minusOne = vdupq_n_f32(-1.0f);
+    const float32x4_t inv255 = vdupq_n_f32(1.0f / 255.0f);
+    const uint32x4_t maxByte = vdupq_n_u32(255);
+    // the fourth byte of each: normal[3] stays, tangent[3] (the bitangent sign) is copied
+    const uint8x8_t keepFourth = vcreate_u8(0xFF000000FF000000ULL);
+
+    // Run 22 timed this loop at ~400 cycles a vertex for ~60 instructions.
+    // Two vertices an iteration (run 23) did not help: the disassembly showed
+    // GCC building the x, y, z scalar operands through the stack lane by lane
+    // and moving 127.5 from an ARM register into lanes every vertex, and two
+    // vertices' worth of values spilling - fixed in Vita_SkinPosition and with
+    // a vector constant, one vertex an iteration again. The data 8 vertices
+    // ahead is asked for early (source read, output written). Same
+    // operations on every vertex, so the same bits.
+    const float32x4_t halfByteRange = vdupq_n_f32(255.0f / 2.0f);
+    for (int i = 0; i < numVerts; i++) {
+        __builtin_prefetch(&baseVerts[i + 8], 0);
+        __builtin_prefetch(&targetVerts[i + 8], 1);
+        Vita_SkinVertex(baseVerts[i], targetVerts[i], baseVerts[i].normal, targetVerts[i].normal, joints, one, half, byteScale, minusOne, inv255, maxByte, keepFourth, halfByteRange);
+    }
+}
+
+/*
+============
+Vita_UnitNormalsTangents_NEON / Vita_TransformVertsAndTangentsUnit_NEON
+
+The unit normal and tangent of every base vertex, made once (8 floats a
+vertex: normal, then tangent, each in a 4-lane vector), and the skin that
+reads them instead of unpacking and renormalizing every vertex every frame -
+a fifth of the skin's instructions, on its longest chain. The same vectors
+from the same code, so the same bytes (tools/vita/neontest).
+============
+*/
+void Vita_UnitNormalsTangents_NEON(float* __restrict unit, const int numVerts, const idDrawVert* __restrict baseVerts)
+{
+    const float32x4_t byteScale = vdupq_n_f32(2.0f / 255.0f);
+    const float32x4_t minusOne = vdupq_n_f32(-1.0f);
+    for (int i = 0; i < numVerts; i++) {
+        float32x4_t nn, nt;
+        Vita_UnitNormalTangent(vld1_u8(baseVerts[i].normal), byteScale, minusOne, nn, nt);
+        vst1q_f32(unit + i * 8 + 0, nn);
+        vst1q_f32(unit + i * 8 + 4, nt);
+    }
+}
+
+void Vita_TransformVertsAndTangentsUnit_NEON(idDrawVert* __restrict targetVerts, const int numVerts, const idDrawVert* __restrict baseVerts, const float* __restrict unit, const idJointMat* __restrict joints)
+{
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t inv255 = vdupq_n_f32(1.0f / 255.0f);
+    const uint32x4_t maxByte = vdupq_n_u32(255);
+    const uint8x8_t keepFourth = vcreate_u8(0xFF000000FF000000ULL);
+    const float32x4_t halfByteRange = vdupq_n_f32(255.0f / 2.0f);
+    for (int i = 0; i < numVerts; i++) {
+        __builtin_prefetch(&baseVerts[i + 8], 0);
+        __builtin_prefetch(&targetVerts[i + 8], 1);
+        __builtin_prefetch(unit + (i + 8) * 8, 0);
+        const uint8x8_t bytes = vld1_u8(baseVerts[i].normal);
+        Vita_SkinVertexUnit(baseVerts[i], targetVerts[i], bytes, vld1q_f32(unit + i * 8 + 0), vld1q_f32(unit + i * 8 + 4), targetVerts[i].normal,
+            joints, one, half, inv255, maxByte, keepFourth, halfByteRange);
+    }
+}
+
+/*
+============
+Vita_TransformPositions_NEON
+
+The positions alone, for render model traces (Vita_PoseForTrace) - the same
+arithmetic as the full skin's, so a trace sees exactly the positions the
+model is drawn with.
+============
+*/
+static void Vita_TransformPositions_NEON(idVec3* targetXyz, const int numVerts, const idDrawVert* baseVerts, const idJointMat* joints)
+{
+    const float32x4_t inv255 = vdupq_n_f32(1.0f / 255.0f);
+    for (int i = 0; i < numVerts; i++) {
+        const idDrawVert& base = baseVerts[i];
+        float32x4_t c0, c1, c2, c3;
+        Vita_SkinColumns(base, joints, inv255, c0, c1, c2, c3);
+        const float32x4_t pos = Vita_SkinPosition(base, c0, c1, c2, c3);
+        vst1_f32(&targetXyz[i].x, vget_low_f32(pos));
+        vst1q_lane_f32(&targetXyz[i].z, pos, 2);
+    }
+}
+#endif
+
+#if !defined(__vita__) && defined(ID_VITA_PHYSCHECK)
+/*
+============
+Vita_AnimMeasure (PC test build, vita_animLODMeasure 1, with r_useGPUSkinning 0)
+
+What a monster held at 15 Hz shows against its true pose, and what a linear
+extrapolation would: every time a living monster's mesh is skinned (once per
+game tic it changes), its positions go into a 4-pose history; with poses N
+(now) and N-1, N-3 (the two a 15 Hz monster was last skinned at), a held
+frame shows N-1 (error |N - (N-1)|) and an extrapolated one would show
+N-1 + 0.5 (N-1 - N-3). Summed per vertex in 1/10 units.
+============
+*/
+idCVar vita_animLODMeasure("vita_animLODMeasure", "0", CVAR_RENDERER | CVAR_BOOL, "PC test build: monster pose error of the 15 Hz hold vs a linear extrapolation (needs r_useGPUSkinning 0)");
+struct vitaAnimHistory_t {
+    const srfTriangles_t* tri;
+    int numVerts;
+    int count;
+    int lastUse;
+    int head;               // pose[head] newest, pose[(head + k) & 3] k poses older
+    idList<idVec3> pose[4];
+};
+static vitaAnimHistory_t vitaAnimHistory[48];
+static int vitaAnimHistoryUse = 0;
+static idSysMutex vitaAnimHistoryLock;
+
+static void Vita_AnimMeasure(const srfTriangles_t* tri)
+{
+    idScopedCriticalSection lock(vitaAnimHistoryLock);
+    vitaAnimHistoryUse++;
+    vitaAnimHistory_t* h = NULL;
+    for (int i = 0; i < 48 && h == NULL; i++) {
+        if (vitaAnimHistory[i].tri == tri && vitaAnimHistory[i].numVerts == tri->numVerts) {
+            h = &vitaAnimHistory[i];
+        }
+    }
+    if (h == NULL) {
+        h = &vitaAnimHistory[0];
+        for (int i = 1; i < 48; i++) {
+            if (vitaAnimHistory[i].lastUse < h->lastUse) {
+                h = &vitaAnimHistory[i];
+            }
+        }
+        h->tri = tri;
+        h->numVerts = tri->numVerts;
+        h->count = 0;
+    }
+    h->lastUse = vitaAnimHistoryUse;
+    // the oldest slot becomes the newest pose
+    h->head = (h->head + 3) & 3;
+    idList<idVec3>& newest = h->pose[h->head];
+    newest.SetNum(tri->numVerts);
+    for (int v = 0; v < tri->numVerts; v++) {
+        newest[v] = tri->verts[v].xyz;
+    }
+    h->count++;
+    if (h->count < 4) {
+        return;
+    }
+    double holdErr = 0.0, extrapErr = 0.0, holdMax = 0.0, extrapMax = 0.0;
+    for (int v = 0; v < tri->numVerts; v++) {
+        const idVec3& now = h->pose[h->head][v];
+        const idVec3& p1 = h->pose[(h->head + 1) & 3][v];
+        const idVec3& p3 = h->pose[(h->head + 3) & 3][v];
+        const float eh = (now - p1).Length();
+        const float ee = (now - (p1 + 0.5f * (p1 - p3))).Length();
+        holdErr += eh;
+        extrapErr += ee;
+        holdMax = Max(holdMax, (double)eh);
+        extrapMax = Max(extrapMax, (double)ee);
+    }
+    VITA_ZONE_ADD("anim measure: vertices compared", tri->numVerts);
+    VITA_ZONE_ADD("anim measure: held pose error, summed (1/10 units)", (int)(holdErr * 10.0));
+    VITA_ZONE_ADD("anim measure: extrapolated pose error, summed (1/10 units)", (int)(extrapErr * 10.0));
+    VITA_ZONE_ADD("anim measure: held pose error, worst vertex of each mesh (1/10 units)", (int)(holdMax * 10.0));
+    VITA_ZONE_ADD("anim measure: extrapolated pose error, worst vertex of each mesh (1/10 units)", (int)(extrapMax * 10.0));
+    VITA_ZONE_COUNT("anim measure: meshes compared");
+}
+#endif
+
+#if defined(__vita__) && defined(__ARM_NEON__)
+idCVar vita_skinUnitNormals("vita_skinUnitNormals", "1", CVAR_RENDERER | CVAR_BOOL, "Vita: the skin reads each mesh's unit normals and tangents made once instead of renormalizing them every frame (the same bytes)");
+
+/*
+============
+idMD5Mesh::VitaUnitNormals
+
+Made the first time the mesh is skinned; two model jobs may skin meshes of the
+same model at once, so the array is made aside and installed with a
+compare-and-swap (the loser frees its copy - the same values either way).
+============
+*/
+const float* idMD5Mesh::VitaUnitNormals() const
+{
+    float* unit = vitaUnitNT;
+    if (unit != NULL || !vita_skinUnitNormals.GetBool() || deformInfo == NULL) {
+        return unit;
+    }
+    const int n = deformInfo->numOutputVerts;
+    float* fresh = (float*)Mem_Alloc16(n * 8 * sizeof(float), TAG_MODEL);
+    if (fresh == NULL) {
+        return NULL;
+    }
+    Vita_UnitNormalsTangents_NEON(fresh, n, deformInfo->verts);
+    if (__sync_bool_compare_and_swap(&vitaUnitNT, (float*)NULL, fresh)) {
+        VITA_ZONE_ADD("dynamic model: unit normals made (vertices, once per mesh)", n);
+    } else {
+        Mem_Free16(fresh);
+    }
+    return vitaUnitNT;
+}
+#endif
+
 /*
 ============
 TransformVertsAndTangents
@@ -408,6 +782,10 @@ TransformVertsAndTangents
 */
 void TransformVertsAndTangents(idDrawVert* targetVerts, const int numVerts, const idDrawVert* baseVerts, const idJointMat* joints)
 {
+#if defined(__vita__) && defined(__ARM_NEON__)
+    Vita_TransformVertsAndTangents_NEON(targetVerts, numVerts, baseVerts, joints);
+    return;
+#endif
     for (int i = 0; i < numVerts; i++) {
         const idDrawVert& base = baseVerts[i];
 
@@ -433,6 +811,73 @@ void TransformVertsAndTangents(idDrawVert* targetVerts, const int numVerts, cons
         targetVerts[i].tangent[3] = base.tangent[3];
     }
 }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+============
+Vita_TransformPositions
+
+The positions of TransformVertsAndTangents, computed the same way, alone.
+============
+*/
+static void Vita_TransformPositions(idVec3* targetXyz, const int numVerts, const idDrawVert* baseVerts, const idJointMat* joints)
+{
+#if defined(__vita__) && defined(__ARM_NEON__)
+    Vita_TransformPositions_NEON(targetXyz, numVerts, baseVerts, joints);
+#else
+    for (int i = 0; i < numVerts; i++) {
+        const idDrawVert& base = baseVerts[i];
+
+        const idJointMat& j0 = joints[base.color[0]];
+        const idJointMat& j1 = joints[base.color[1]];
+        const idJointMat& j2 = joints[base.color[2]];
+        const idJointMat& j3 = joints[base.color[3]];
+
+        const float w0 = base.color2[0] * (1.0f / 255.0f);
+        const float w1 = base.color2[1] * (1.0f / 255.0f);
+        const float w2 = base.color2[2] * (1.0f / 255.0f);
+        const float w3 = base.color2[3] * (1.0f / 255.0f);
+
+        idJointMat accum;
+        idJointMat::Mul(accum, j0, w0);
+        idJointMat::Mad(accum, j1, w1);
+        idJointMat::Mad(accum, j2, w2);
+        idJointMat::Mad(accum, j3, w3);
+
+        targetXyz[i] = accum * idVec4(base.xyz.x, base.xyz.y, base.xyz.z, 1.0f);
+    }
+#endif
+}
+
+/*
+============
+Vita_TransformPositionsIndexed
+
+Vita_TransformPositions for the listed vertices only, each to its own place:
+the same arithmetic per vertex, so the same positions.
+============
+*/
+static void Vita_TransformPositionsIndexed(idVec3* targetXyz, const triIndex_t* list, const int numList, const idDrawVert* baseVerts, const idJointMat* joints)
+{
+#if defined(__vita__) && defined(__ARM_NEON__)
+    const float32x4_t inv255 = vdupq_n_f32(1.0f / 255.0f);
+    for (int k = 0; k < numList; k++) {
+        const int i = list[k];
+        const idDrawVert& base = baseVerts[i];
+        float32x4_t c0, c1, c2, c3;
+        Vita_SkinColumns(base, joints, inv255, c0, c1, c2, c3);
+        const float32x4_t pos = Vita_SkinPosition(base, c0, c1, c2, c3);
+        vst1_f32(&targetXyz[i].x, vget_low_f32(pos));
+        vst1q_lane_f32(&targetXyz[i].z, pos, 2);
+    }
+#else
+    for (int k = 0; k < numList; k++) {
+        const int i = list[k];
+        Vita_TransformPositions(targetXyz + i, 1, baseVerts + i, joints);
+    }
+#endif
+}
+#endif
 
 /*
 ====================
@@ -495,7 +940,27 @@ void idMD5Mesh::UpdateSurface(const struct renderEntity_s* ent, const idJointMat
             assert(tri->verts != NULL);                                                                       // quiet analyze warning
             memcpy(tri->verts, deformInfo->verts, deformInfo->numOutputVerts * sizeof(deformInfo->verts[0])); // copy over the texture coordinates
         }
-        TransformVertsAndTangents(tri->verts, deformInfo->numOutputVerts, deformInfo->verts, entJointsInverted);
+        {
+            // vertices counted, one mesh in 8 timed (a different eighth each frame)
+            VITA_ZONE_ADD("dynamic model: vertices skinned (CPU)", deformInfo->numOutputVerts);
+#if defined(__vita__) && defined(__ARM_NEON__)
+            const float* unit = VitaUnitNormals();
+            VITA_ZONE_SAMPLED("dynamic model: skin a mesh (TransformVertsAndTangents; sampled)", ((uintptr_t)tri >> 5) + tr.frameCount, 3);
+            if (unit != NULL) {
+                Vita_TransformVertsAndTangentsUnit_NEON(tri->verts, deformInfo->numOutputVerts, deformInfo->verts, unit, entJointsInverted);
+            } else {
+                TransformVertsAndTangents(tri->verts, deformInfo->numOutputVerts, deformInfo->verts, entJointsInverted);
+            }
+#else
+            VITA_ZONE_SAMPLED("dynamic model: skin a mesh (TransformVertsAndTangents; sampled)", ((uintptr_t)tri >> 5) + tr.frameCount, 3);
+            TransformVertsAndTangents(tri->verts, deformInfo->numOutputVerts, deformInfo->verts, entJointsInverted);
+#endif
+        }
+#if !defined(__vita__) && defined(ID_VITA_PHYSCHECK)
+        if (ent != NULL && ent->vitaHalfRateAnim && vita_animLODMeasure.GetBool()) {
+            Vita_AnimMeasure(tri);
+        }
+#endif
         tri->referencedVerts = false;
     }
     tri->tangentsCalculated = true;
@@ -1307,6 +1772,361 @@ idRenderModel* idRenderModelMD5::InstantiateDynamicModel(const struct renderEnti
 
     return staticModel;
 }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+====================
+idMD5Mesh::VitaBuildTraceGroups
+
+The mesh's triangles grouped for render model traces, once per mesh: by the
+heaviest joint of each triangle's first vertex, in their order in the mesh.
+Each group keeps the vertices its triangles use (each once), the joints those
+vertices hang on (weight above zero) and the farthest any of them is from one
+of those joints in the base pose - the distance the joint carries it at in
+any pose (see VitaPoseForTrace).
+====================
+*/
+void idMD5Mesh::VitaFreeTraceGroups() const
+{
+    Mem_Free(vitaGroups);
+    Mem_Free(vitaGroupJoints);
+    Mem_Free(vitaGroupVerts);
+    Mem_Free(vitaGroupIndexes);
+    Mem_Free(vitaGroupTriPos);
+    vitaGroups = NULL;
+    vitaGroupJoints = NULL;
+    vitaGroupVerts = NULL;
+    vitaGroupIndexes = NULL;
+    vitaGroupTriPos = NULL;
+    vitaNumGroups = 0;
+    vitaGroupsOf = NULL;
+}
+
+void idMD5Mesh::VitaBuildTraceGroups(const idJointMat* invertedDefaultPose) const
+{
+    VitaFreeTraceGroups();
+    const deformInfo_t* di = deformInfo;
+    const int numTris = di->numIndexes / 3;
+    const int numMeshVerts = di->numOutputVerts;
+
+    int groupOfJoint[256];
+    for (int j = 0; j < 256; j++) {
+        groupOfJoint[j] = -1;
+    }
+    int* triGroup = (int*)Mem_Alloc(Max(1, numTris) * sizeof(int), TAG_MODEL);
+    int numGroups = 0;
+    for (int t = 0; t < numTris; t++) {
+        const int j = di->verts[di->indexes[t * 3]].color[0];
+        if (groupOfJoint[j] < 0) {
+            groupOfJoint[j] = numGroups++;
+        }
+        triGroup[t] = groupOfJoint[j];
+    }
+
+    vitaGroups = (vitaTraceGroup_t*)Mem_ClearedAlloc(Max(1, numGroups) * sizeof(vitaTraceGroup_t), TAG_MODEL);
+    vitaGroupIndexes = (triIndex_t*)Mem_Alloc(Max(1, numTris * 3) * sizeof(triIndex_t), TAG_MODEL);
+    vitaGroupTriPos = (int*)Mem_Alloc(Max(1, numTris) * sizeof(int), TAG_MODEL);
+    for (int t = 0; t < numTris; t++) {
+        vitaGroups[triGroup[t]].numTris++;
+    }
+    for (int g = 0, first = 0; g < numGroups; g++) {
+        vitaGroups[g].firstTri = first;
+        first += vitaGroups[g].numTris;
+        vitaGroups[g].numTris = 0;
+    }
+    for (int t = 0; t < numTris; t++) {
+        vitaTraceGroup_t& g = vitaGroups[triGroup[t]];
+        const int k = g.firstTri + g.numTris++;
+        vitaGroupIndexes[k * 3 + 0] = di->indexes[t * 3 + 0];
+        vitaGroupIndexes[k * 3 + 1] = di->indexes[t * 3 + 1];
+        vitaGroupIndexes[k * 3 + 2] = di->indexes[t * 3 + 2];
+        vitaGroupTriPos[k] = t;
+    }
+    Mem_Free(triGroup);
+
+    // each group's vertices, joints and reach from them
+    int* stamp = (int*)Mem_Alloc(Max(1, numMeshVerts) * sizeof(int), TAG_MODEL);
+    for (int v = 0; v < numMeshVerts; v++) {
+        stamp[v] = -1;
+    }
+    idList<triIndex_t> verts;
+    idList<byte> jointList;
+    verts.SetGranularity(1024);
+    jointList.SetGranularity(256);
+    for (int gi = 0; gi < numGroups; gi++) {
+        vitaTraceGroup_t& g = vitaGroups[gi];
+        bool hasJoint[256];
+        memset(hasJoint, 0, sizeof(hasJoint));
+        g.firstVert = verts.Num();
+        g.dist = 0.0f;
+        for (int k = g.firstTri * 3; k < (g.firstTri + g.numTris) * 3; k++) {
+            const int v = vitaGroupIndexes[k];
+            if (stamp[v] == gi) {
+                continue;
+            }
+            stamp[v] = gi;
+            verts.Append((triIndex_t)v);
+            const idDrawVert& dv = di->verts[v];
+            // how far it can be from the weighted blend of its joints' origins:
+            // each joint carries it at the length of the vertex in the joint's
+            // base frame, and the blend weighs those
+            float weighted = 0.0f;
+            for (int w = 0; w < 4; w++) {
+                if (dv.color2[w] == 0) {
+                    continue;
+                }
+                const int j = dv.color[w];
+                hasJoint[j] = true;
+                const float d = (invertedDefaultPose[j] * idVec4(dv.xyz.x, dv.xyz.y, dv.xyz.z, 1.0f)).Length();
+                weighted += dv.color2[w] * (1.0f / 255.0f) * d;
+            }
+            g.dist = Max(g.dist, weighted);
+        }
+        g.numVerts = verts.Num() - g.firstVert;
+        g.firstJoint = jointList.Num();
+        for (int j = 0; j < 256; j++) {
+            if (hasJoint[j]) {
+                jointList.Append((byte)j);
+            }
+        }
+        g.numJoints = jointList.Num() - g.firstJoint;
+    }
+    Mem_Free(stamp);
+
+    vitaGroupVerts = (triIndex_t*)Mem_Alloc(Max(1, verts.Num()) * sizeof(triIndex_t), TAG_MODEL);
+    if (verts.Num() > 0) {
+        memcpy(vitaGroupVerts, verts.Ptr(), verts.Num() * sizeof(triIndex_t));
+    }
+    vitaGroupJoints = (byte*)Mem_Alloc(Max(1, jointList.Num()), TAG_MODEL);
+    if (jointList.Num() > 0) {
+        memcpy(vitaGroupJoints, jointList.Ptr(), jointList.Num());
+    }
+    vitaNumGroups = numGroups;
+    vitaGroupsOf = di;
+}
+
+/*
+====================
+idRenderModelMD5::VitaPoseForTrace
+
+The posed positions of the meshes InstantiateDynamicModel would build for this
+entity - the same meshes, joints and arithmetic, without the normals and
+tangents, the GPU copies or the snapshot. For render model traces when the
+entity has no snapshot (RenderWorld.cpp). False when it cannot be done here;
+the trace then builds the snapshot as before.
+
+Positions are made on demand, a trace group at a time (VitaTraceMesh): this
+sets up the pose's skinning matrices and, for each mesh and each of its
+groups, a box that holds every position it can have - so a trace that cannot
+reach a box leaves what is in it unposed and untested. A position blends its
+joints' transforms of the base vertex, sum of w * (origin + offset): each
+offset is as long as the vertex is far from that joint in the base pose (the
+joint matrices are rigid), so the position lies within sum of w * length -
+the group's distance at most - of the weighted blend of the origins, which
+lies in the joints' box (scaled away from the model origin by however much
+the weights, bytes / 255, sum past 1). The mesh's own box is the bound
+idMD5Mesh::CalculateBounds culls drawn surfaces with; all are widened for
+that sum and for rounding.
+====================
+*/
+static void Vita_JointReach(idBounds& reach, const idJointMat* entJoints, const byte* list, const int numList, const float dist, const float weightSumMax)
+{
+    reach.Clear();
+    float farthest = 0.0f;
+    for (int j = 0; j < numList; j++) {
+        const idVec3 origin = entJoints[list[j]].GetTranslation();
+        reach.AddPoint(origin);
+        farthest = Max(farthest, origin.Length());
+    }
+    const float d = dist * 1.001f;
+    const float overweight = Max(0.0f, weightSumMax - 1.0f) * (farthest + d);
+    reach.ExpandSelf(d + overweight + 0.5f);
+}
+
+bool idRenderModelMD5::VitaPoseForTrace(const struct renderEntity_s* ent, vitaPosedModel_t& posed) const
+{
+    if (purged || ent->joints == NULL || ent->numJoints != joints.Num() || meshes.Num() > VITA_POSED_MAX_MESHES || r_showSkel.GetInteger() > 1) {
+        return false;
+    }
+
+    // the snapshot's jointsInverted
+    const int numInvertedJoints = SIMD_ROUND_JOINTS(joints.Num());
+    if (numInvertedJoints > posed.maxJoints) {
+        Mem_Free16(posed.joints);
+        posed.maxJoints = ALIGN(numInvertedJoints, 16);
+        posed.joints = (idJointMat*)Mem_Alloc16(posed.maxJoints * sizeof(idJointMat), TAG_MODEL);
+    }
+    TransformJoints(posed.joints, joints.Num(), ent->joints, invertedDefaultPose.Ptr());
+
+    int numVerts = 0;
+    int numGroups = 0;
+    posed.numMeshes = 0;
+    for (int i = 0; i < meshes.Num(); i++) {
+        const idMD5Mesh& mesh = meshes[i];
+        // the meshes InstantiateDynamicModel keeps
+        const idMaterial* shader = R_RemapShaderBySkin(mesh.shader, ent->customSkin, ent->customShader);
+        if (!shader || (!shader->IsDrawn() && !shader->SurfaceCastsShadow())) {
+            continue;
+        }
+        if (mesh.vitaGroupsOf != mesh.deformInfo) {
+            mesh.VitaBuildTraceGroups(invertedDefaultPose.Ptr());
+        }
+        if (mesh.vitaWeightSumMax < 0.0f) {
+            int most = 0;
+            for (int v = 0; v < mesh.deformInfo->numOutputVerts; v++) {
+                const byte* w = mesh.deformInfo->verts[v].color2;
+                most = Max(most, w[0] + w[1] + w[2] + w[3]);
+            }
+            mesh.vitaWeightSumMax = most / 255.0f;
+        }
+        vitaPosedMesh_t& pm = posed.meshes[posed.numMeshes++];
+        pm.shader = mesh.shader;
+        pm.numVerts = mesh.deformInfo->numOutputVerts;
+        pm.firstVert = numVerts;
+        pm.mesh = i;
+        pm.firstGroup = numGroups;
+        pm.numGroups = mesh.vitaNumGroups;
+        numVerts += pm.numVerts;
+        numGroups += pm.numGroups;
+    }
+
+    if (numVerts > posed.maxVerts) {
+        Mem_Free16(posed.xyz);
+        posed.maxVerts = ALIGN(numVerts, 256);
+        posed.xyz = (idVec3*)Mem_Alloc16(posed.maxVerts * sizeof(idVec3), TAG_MODEL);
+    }
+    if (numGroups > posed.maxGroups) {
+        Mem_Free(posed.groups);
+        posed.maxGroups = ALIGN(numGroups, 64);
+        posed.groups = (vitaPosedGroup_t*)Mem_Alloc(posed.maxGroups * sizeof(vitaPosedGroup_t), TAG_MODEL);
+    }
+
+    // the reaches, from the joints as they are now
+    for (int i = 0; i < posed.numMeshes; i++) {
+        vitaPosedMesh_t& pm = posed.meshes[i];
+        const idMD5Mesh& mesh = meshes[pm.mesh];
+        pm.reachValid = (mesh.numMeshJoints > 0);
+        if (pm.reachValid) {
+            Vita_JointReach(pm.reach, ent->joints, mesh.meshJoints, mesh.numMeshJoints, mesh.maxJointVertDist, mesh.vitaWeightSumMax);
+        }
+        for (int g = 0; g < pm.numGroups; g++) {
+            const vitaTraceGroup_t& tg = mesh.vitaGroups[g];
+            vitaPosedGroup_t& pg = posed.groups[pm.firstGroup + g];
+            pg.posed = false;
+            pg.reachValid = (tg.numJoints > 0);
+            if (pg.reachValid) {
+                Vita_JointReach(pg.reach, ent->joints, mesh.vitaGroupJoints + tg.firstJoint, tg.numJoints, tg.dist, mesh.vitaWeightSumMax);
+            }
+        }
+    }
+    return true;
+}
+
+/*
+====================
+idRenderModelMD5::VitaTraceMesh
+
+R_LocalTracePositions against one posed mesh: the groups the trace cannot
+reach are left unposed and untested (no triangle of theirs can be hit: a hit
+lies within the trace's radius of a triangle, so of the group's box), the
+others are posed if they are not yet and traced together
+(R_LocalTracePositionsSubsets) - the whole mesh's result.
+====================
+*/
+extern idCVar vita_posedTracesVerify;
+
+static void Vita_VerifyGroupReach(const char* model, int mesh, const vitaPosedGroup_t& pg, const idVec3* xyz, const triIndex_t* list, int numList)
+{
+    static int groups, outside, verts;
+    groups++;
+    verts += numList;
+    for (int k = 0; k < numList; k++) {
+        const idVec3& p = xyz[list[k]];
+        if (pg.reachValid && !pg.reach.ContainsPoint(p)) {
+            if (outside++ < 20) {
+                common->Printf("vita_posedTracesVerify: REACH MISSED a vertex of '%s' mesh %d: (%.3f %.3f %.3f) outside (%.3f %.3f %.3f)-(%.3f %.3f %.3f)\n",
+                    model, mesh, p.x, p.y, p.z, pg.reach[0].x, pg.reach[0].y, pg.reach[0].z, pg.reach[1].x, pg.reach[1].y, pg.reach[1].z);
+            }
+        }
+    }
+    if ((groups % 2000) == 0) {
+        common->Printf("vita_posedTracesVerify: %d trace groups posed on demand (%d vertices), %d vertices outside their reach\n", groups, verts, outside);
+    }
+}
+
+localTrace_t idRenderModelMD5::VitaTraceMesh(vitaPosedModel_t& posed, int posedMesh, const idVec3& localStart, const idVec3& localEnd, float radius) const
+{
+    localTrace_t none;
+    none.fraction = 1.0f;
+
+    vitaPosedMesh_t& pm = posed.meshes[posedMesh];
+    const idMD5Mesh& mesh = meshes[pm.mesh];
+    if (pm.reachValid) {
+        idBounds reach = pm.reach;
+        reach.ExpandSelf(radius + 1.0f);
+        if (!reach.LineIntersection(localStart, localEnd)) {
+            VITA_ZONE_COUNT("model trace: meshes out of reach");
+            return none;
+        }
+    }
+
+    idVec3* xyz = posed.xyz + pm.firstVert;
+    vitaTraceSubset_t* subsets = (vitaTraceSubset_t*)_alloca(Max(1, pm.numGroups) * sizeof(vitaTraceSubset_t));
+    int numSubsets = 0;
+    int posedNow = 0;
+    int vertsPosedNow = 0;
+    for (int g = 0; g < pm.numGroups; g++) {
+        const vitaTraceGroup_t& tg = mesh.vitaGroups[g];
+        vitaPosedGroup_t& pg = posed.groups[pm.firstGroup + g];
+        const triIndex_t* list = mesh.vitaGroupVerts + tg.firstVert;
+        if (!pg.posed) {
+            if (pg.reachValid) {
+                idBounds reach = pg.reach;
+                reach.ExpandSelf(radius + 1.0f);
+                if (!reach.LineIntersection(localStart, localEnd)) {
+                    VITA_ZONE_COUNT("model trace: groups out of reach, left unposed");
+                    continue;
+                }
+            }
+            Vita_TransformPositionsIndexed(xyz, list, tg.numVerts, mesh.deformInfo->verts, posed.joints);
+            pg.bounds.Clear();
+            for (int k = 0; k < tg.numVerts; k++) {
+                pg.bounds.AddPoint(xyz[list[k]]);
+            }
+            pg.posed = true;
+            posedNow++;
+            vertsPosedNow += tg.numVerts;
+            if (vita_posedTracesVerify.GetBool()) {
+                Vita_VerifyGroupReach(Name(), pm.mesh, pg, xyz, list, tg.numVerts);
+            }
+        }
+        idBounds bounds = pg.bounds;
+        bounds.ExpandSelf(radius + 1.0f);
+        if (!bounds.LineIntersection(localStart, localEnd)) {
+            VITA_ZONE_COUNT("model trace: groups missed (posed bounds)");
+            continue;
+        }
+        vitaTraceSubset_t& sub = subsets[numSubsets++];
+        sub.verts = list;
+        sub.numVerts = tg.numVerts;
+        sub.indexes = mesh.vitaGroupIndexes + tg.firstTri * 3;
+        sub.triPos = mesh.vitaGroupTriPos + tg.firstTri;
+        sub.numTris = tg.numTris;
+    }
+    VITA_ZONE_ADD("model trace: groups posed", posedNow);
+    VITA_ZONE_ADD("model trace: vertices posed", vertsPosedNow);
+    VITA_ZONE_ADD("model trace: groups traced", numSubsets);
+    if (numSubsets == 0) {
+        return none;
+    }
+    return R_LocalTracePositionsSubsets(localStart, localEnd, radius, xyz, pm.numVerts, subsets, numSubsets);
+}
+
+int idRenderModelMD5::VitaMeshNearestJoint(int mesh, int a, int b, int c) const
+{
+    return meshes[mesh].NearestJoint(a, b, c);
+}
+#endif
 
 /*
 ====================

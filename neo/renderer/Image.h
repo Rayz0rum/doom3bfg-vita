@@ -97,6 +97,25 @@ public:
     void CopyDepthbuffer(int x, int y, int width, int height);
 
     void UploadScratch(const byte* pic, int width, int height);
+    // Off the GL thread (the game/draw thread referencing a new image during
+    // play): set up opts from the .bimage header only - so the image already
+    // reports its size - and leave the GPU work to Bind() on the GL thread.
+    void LoadHeaderOnly();
+#if defined(__vita__)
+    int VitaSkipLevels() const; // top mip levels vita_imageDownSize drops for the current opts
+    // a lower vita_textureQualityDrop applies than when this was loaded: reload it smaller
+    bool VitaWantsSmaller() const;
+    void VitaReplaceRGBA(const byte* pic); // whole level 0 of a 1-level RGBA8 2D image
+    // pic (w x h RGBA) blown up 'scale' times into this image, nearest filtered, on the GPU
+    void VitaUploadScaled(const byte* pic, int w, int h, int scale);
+    // Classic Doom as an 8-bit paletted texture (the GPU does the palette
+    // lookup): BeginFrame makes this image a w x h P8 texture if it is not one
+    // and hands out the next of three index buffers (rows (w + 7) & ~7 bytes
+    // apart) and its 256-entry palette (0xAABBGGRR) to fill; EndFrame points
+    // the texture at them.
+    byte* VitaClassicBeginFrameP8(int w, int h, uint32** palette);
+    void VitaClassicEndFrameP8();
+#endif
 
     // estimates size of the GL image based on dimensions and storage type
     int StorageSize() const;
@@ -114,6 +133,10 @@ public:
 
     void MakeDefault(); // fill with a grid pattern
 
+    textureUsage_t GetUsage() const
+    {
+        return usage;
+    }
     const idImageOpts& GetOpts() const
     {
         return opts;
@@ -179,6 +202,16 @@ public:
         return texnum != TEXTURE_NOT_LOADED;
     }
 
+#if defined(__vita__)
+    // The Vita cinematic backend repoints this texture at the hardware video
+    // decoder's own output buffer once per frame, which needs the raw GL name.
+    // See neo/sys/vita/vita_avplayer.cpp.
+    GLuint GetTexNum() const
+    {
+        return texnum;
+    }
+#endif
+
     static void GetGeneratedName(idStr& _name, const textureUsage_t& _usage, const cubeFiles_t& _cube);
 
 private:
@@ -198,7 +231,12 @@ private:
     textureFilter_t filter;
     textureRepeat_t repeat;
 
+#if defined(__vita__)
+    int vitaAppliedSkip; // top mip levels dropped when this was loaded
+    int vitaSkipCap;     // the most its size allows dropping
+#endif
     bool referencedOutsideLevelLoad;
+    bool referencedDuringPlay; // ...and that happened after the first level load began
     bool levelLoadReferenced; // for determining if it needs to be purged
     bool defaulted;           // true if the default image was generated because a file couldn't be loaded
     ID_TIME_T sourceFileTime; // the most recent of all images used in creation, for reloadImages command
@@ -229,7 +267,12 @@ ID_INLINE idImage::idImage(const char* name)
     usage = TD_DEFAULT;
     cubeFiles = CF_2D;
 
+#if defined(__vita__)
+    vitaAppliedSkip = 0;
+    vitaSkipCap = 0;
+#endif
     referencedOutsideLevelLoad = false;
+    referencedDuringPlay = false;
     levelLoadReferenced = false;
     defaulted = false;
     sourceFileTime = FILE_NOT_FOUND_TIMESTAMP;
@@ -274,6 +317,17 @@ public:
 
     // scratch images are for internal renderer use.  ScratchImage names should always begin with an underscore
     idImage* ScratchImage(const char* name, idImageOpts* imgOpts, textureFilter_t filter, textureRepeat_t repeat, textureUsage_t usage);
+
+    // texture memory by usage, to the console
+    void PrintMemorySummary(const char* when);
+#if defined(__vita__)
+    // Reload textures loaded before vita_textureQualityDrop went up, smaller,
+    // for at most budgetUs. GL thread only, with the game/draw thread idle.
+    // Returns how many still wait.
+    int VitaShrinkLoadedTextures(int budgetUs, int* shrunk, int64* savedBytes);
+#endif
+
+    bool firstLevelLoadStarted = false;
 
     // purges all the images before a vid_restart
     void PurgeAllImages();
@@ -384,3 +438,20 @@ IMAGEPROGRAM
 
 void R_LoadImageProgram(const char* name, byte** pic, int* width, int* height, ID_TIME_T* timestamp, textureUsage_t* usage = NULL);
 const char* R_ParsePastImageProgram(idLexer& src);
+
+// menu/HUD/GUI/font art, sampled by pixel and read by the game thread (Image_load.cpp)
+bool R_ImageIsInterfaceArt(const char* name);
+// may this texture lose top mip levels on the Vita (Image_load.cpp)
+bool R_VitaImageCanShrink(const char* name, textureUsage_t usage, textureType_t type, int numLevels);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+bool R_VitaImageHasText(const char* name); // tools/vita/text_textures.py's list
+#endif
+#if defined(__vita__)
+// how many of 'request' top levels it may lose at this size (text kept, specular a level more, never below 64 texels or the last level)
+int R_VitaSkipLevels(const char* name, textureUsage_t usage, textureType_t type, int width, int height, int numLevels, int request);
+// extra top mip levels dropped from world textures while memory is tight (0..2)
+extern int vita_textureQualityDrop;
+#endif
+
+// is this the thread GL calls may be made from (RenderSystem_init.cpp)
+bool R_IsGLThread();

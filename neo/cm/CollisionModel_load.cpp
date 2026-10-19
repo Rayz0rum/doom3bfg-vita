@@ -181,6 +181,10 @@ idCollisionModelManagerLocal::Clear
 */
 void idCollisionModelManagerLocal::Clear()
 {
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaNoModelNames.Clear();
+    vitaNoModelHash.Clear();
+#endif
     mapName.Clear();
     mapFileTime = 0;
     loaded = 0;
@@ -3892,6 +3896,24 @@ cmHandle_t idCollisionModelManagerLocal::LoadModel(const char* modelName)
         return handle;
     }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // A name that has no collision model - a particle system an entity uses
+    // as its model, say - went through every attempt below again each time:
+    // the source file's timestamp, the binary in generated/collision, a .cm
+    // file, then the render model. Most are lookups of files that are not
+    // there, through every search path; on the Vita's memory card those cost
+    // 150 ms each time a wraith spawned its teleport effect (0.6 ms on a PC).
+    // The answer cannot change until the map does: remembered until then.
+    {
+        const int key = vitaNoModelHash.GenerateKey(modelName, false);
+        for (int i = vitaNoModelHash.First(key); i != -1; i = vitaNoModelHash.Next(i)) {
+            if (vitaNoModelNames[i].Icmp(modelName) == 0) {
+                return 0;
+            }
+        }
+    }
+#endif
+
     if (numModels >= MAX_SUBMODELS) {
         common->Error("idCollisionModelManagerLocal::LoadModel: no free slots\n");
         return 0;
@@ -3932,6 +3954,9 @@ cmHandle_t idCollisionModelManagerLocal::LoadModel(const char* modelName)
         return (numModels - 1);
     }
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaNoModelHash.Add(vitaNoModelHash.GenerateKey(modelName, false), vitaNoModelNames.Append(modelName));
+#endif
     return 0;
 }
 

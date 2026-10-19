@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "Font.h"
+#include "tr_local.h" // tr.fonts (Vita_RegisteredFontNames)
 
 const char* DEFAULT_FONT = "Arial_Narrow";
 
@@ -284,7 +285,9 @@ idFont::GetGlyphIndex
 int idFont::GetGlyphIndex(uint32 idx) const
 {
     if (idx < 128) {
-        return fontInfo->ascii[idx];
+        // signed: -1 is "no glyph", and char is unsigned on ARM (the Vita
+        // read 255 instead, an index past the glyphs of a font without it)
+        return (signed char)fontInfo->ascii[idx];
     }
     if (fontInfo->numGlyphs == 0) {
         return -1;
@@ -425,5 +428,30 @@ void idFont::Touch()
     if (fontInfo != NULL) {
         const_cast<idMaterial*>(fontInfo->material)->EnsureNotPurged();
         fontInfo->material->SetSort(SS_GUI);
+    }
+}
+
+/*
+==============================
+idFont::HasGlyph
+==============================
+*/
+bool idFont::HasGlyph(uint32 idx) const
+{
+    const idFont* f = this;
+    while (f->alias != NULL) {
+        f = f->alias;
+    }
+    if (f->fontInfo == NULL) {
+        return false;
+    }
+    return f->GetGlyphIndex(idx) >= 0;
+}
+
+// the verification: the names of the fonts registered so far
+void Vita_RegisteredFontNames(idStrList& out)
+{
+    for (int i = 0; i < tr.fonts.Num(); i++) {
+        out.AddUnique(tr.fonts[i]->GetName());
     }
 }

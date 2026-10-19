@@ -43,6 +43,9 @@ idRenderEntityLocal::idRenderEntityLocal()
     dynamicModel = NULL;
     dynamicModelFrameCount = 0;
     cachedDynamicModel = NULL;
+    vitaTraceSlot = -1;
+    vitaSkinFrame = -1;
+    vitaSkinModel = NULL;
     localReferenceBounds = bounds_zero;
     globalReferenceBounds = bounds_zero;
     viewCount = 0;
@@ -91,6 +94,9 @@ idRenderLightLocal::idRenderLightLocal()
     memset(lightProject, 0, sizeof(lightProject));
 
     lightHasMoved = false;
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    vitaSmallDropped = false;
+#endif
     world = NULL;
     index = 0;
     areaNum = 0;

@@ -70,6 +70,18 @@ idSWF::idSWF(const char* filename_, idSoundWorld* soundWorld_)
     tooltipButtonImage.Append(keyButtonImages_t("<MOUSE1>", "guis/assets/hud/controller/mouse1", "", 64, 52, 0));
     tooltipButtonImage.Append(keyButtonImages_t("<MOUSE2>", "guis/assets/hud/controller/mouse2", "", 64, 52, 0));
     tooltipButtonImage.Append(keyButtonImages_t("<MOUSE3>", "guis/assets/hud/controller/mouse3", "", 64, 52, 0));
+#if defined(__vita__)
+    // Keys the Vita scheme binds that the stock table has no art for. They
+    // are drawn from the Vita UI atlas (see FindTooltipIcons), so no material.
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY_DPAD_UP>", "", "", 37, 37, 0));
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY_DPAD_DOWN>", "", "", 37, 37, 0));
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY_DPAD_LEFT>", "", "", 37, 37, 0));
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY_DPAD_RIGHT>", "", "", 37, 37, 0));
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY9>", "", "", 52, 32, 0));
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY10>", "", "", 52, 32, 0));
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY15>", "", "", 56, 35, 0));
+    tooltipButtonImage.Append(keyButtonImages_t("<JOY16>", "", "", 56, 35, 0));
+#endif
 
     for (int index = 0; index < tooltipButtonImage.Num(); index++) {
         if ((tooltipButtonImage[index].xbImage != NULL) && (tooltipButtonImage[index].xbImage[0] != '\0')) {
@@ -101,6 +113,19 @@ idSWF::idSWF(const char* filename_, idSoundWorld* soundWorld_)
     hoverObject = NULL;
     soundWorld = NULL;
     forceNonPCPlatform = false;
+
+#if defined(__vita__)
+    vitaCaptureSprite = NULL;
+    vitaCapturing = 0;
+    vitaCaptureAny = false;
+    vitaCaptureValid = false;
+    vitaCaptureAlpha = 0.0f;
+    vitaCapturedAlpha = 0.0f;
+    vitaCaptureMins.Zero();
+    vitaCaptureMaxs.Zero();
+    vitaCapturedMins.Zero();
+    vitaCapturedMaxs.Zero();
+#endif
 
     if (idStr::Cmpn(filename_, "swf/", 4) != 0) {
         // if it doesn't already have swf/ in front of it, add it

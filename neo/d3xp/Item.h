@@ -197,6 +197,9 @@ public:
 
     static void DropItems(idAnimatedEntity* ent, const char* type, idList<idEntity*>* list);
     static idEntity* DropItem(const char* classname, const idVec3& origin, const idMat3& axis, const idVec3& velocity, int activateDelay, int removeDelay);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    void VitaSimplifyGib();
+#endif
 
     virtual void WriteToSnapshot(idBitMsg& msg) const;
     virtual void ReadFromSnapshot(const idBitMsg& msg);
@@ -209,6 +212,9 @@ protected:
 
     int nextSoundTime;
     bool repeatSmoke; // never stop updating the particles
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    bool vitaGib; // a temporary gib piece (VitaSimplifyGib)
+#endif
 
     void Gib(const idVec3& dir, const char* damageDefName);
 

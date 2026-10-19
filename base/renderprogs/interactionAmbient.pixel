@@ -65,9 +65,15 @@ void main( PS_IN fragment, out PS_OUT result ) {
 	localNormal.z = sqrt( abs( dot( localNormal.xy, localNormal.xy ) - 0.25 ) );
 	localNormal = normalize( localNormal );
 
-	const half specularPower = 10.0f;
+	// Toksvig (Toksvig.cpp): blue holds (10 - s') / 6, s' the mip level's Toksvig
+	// exponent (10 at blue 0). pow( hDotN, s' ) as max( 1 - k * (1 - hDotN), 0 )^8,
+	// k = (0.75 + 0.9 s') / 8 - the Vita's math (RenderProgs_GLSL.cpp), so the PC shows it
 	half hDotN = dot3( normalize( fragment.texcoord6.xyz ), localNormal );
-	half3 specularContribution = _half3( pow( hDotN, specularPower ) );
+	half toksvigPow = max( 1.0 - ( 1.21875 - 0.675 * bumpMap.z ) * ( 1.0 - hDotN ), 0.0 );
+	toksvigPow = toksvigPow * toksvigPow;
+	toksvigPow = toksvigPow * toksvigPow;
+	toksvigPow = toksvigPow * toksvigPow;
+	half3 specularContribution = _half3( toksvigPow * ( 1.0 - 0.5454545 * bumpMap.z ) );
 
 	half3 diffuseColor = diffuseMap * rpDiffuseModifier.xyz;
 	half3 specularColor = specMap.xyz * specularContribution * rpSpecularModifier.xyz;

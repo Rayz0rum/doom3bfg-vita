@@ -873,7 +873,25 @@ bool idAF::Load(idEntity* ent, const char* fileName)
     physicsObj.SetDefaultFriction(file->defaultLinearFriction, file->defaultAngularFriction, file->defaultContactFriction);
     physicsObj.SetSuspendSpeed(file->suspendVelocity, file->suspendAcceleration);
     physicsObj.SetSuspendTolerance(file->noMoveTime, file->noMoveTranslation, file->noMoveRotation);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    {
+        // Ragdolls are simulated until they come to rest, and a tangled one
+        // ("body ... stuck in ...") may never: each death cost the game
+        // thread whole frames of articulated-figure physics in mars_city2.
+        // On the Vita a figure is put to rest after vita_afMaxMoveTime
+        // seconds of motion at the latest (most settle well before).
+        extern idCVar vita_afMaxMoveTime;
+        float maxMove = file->maxMoveTime;
+        const float cap = vita_afMaxMoveTime.GetFloat();
+        if (cap > 0.0f && (maxMove <= 0.0f || maxMove > cap)) {
+            maxMove = cap;
+        }
+        physicsObj.SetSuspendTime(file->minMoveTime, maxMove);
+        physicsObj.VitaSetFileMaxMoveTime(maxMove != file->maxMoveTime ? file->maxMoveTime : -1.0f);
+    }
+#else
     physicsObj.SetSuspendTime(file->minMoveTime, file->maxMoveTime);
+#endif
     physicsObj.SetSelfCollision(file->selfCollision);
 
     // clear the list with transforms from joints to bodies
@@ -996,6 +1014,9 @@ bool idAF::TestSolid() const
 
             body->SetWorldOrigin(body->GetWorldOrigin() + trace.c.normal * (depth + 8.0f));
 
+#if defined(VITA_PHYSCHECK)
+            Vita_PhysCheck_RagdollStuck();
+#endif
             gameLocal.DWarning("%s: body '%s' stuck in %d (normal = %.2f %.2f %.2f, depth = %.2f)", self->name.c_str(),
                 body->GetName().c_str(), trace.c.contents, trace.c.normal.x, trace.c.normal.y, trace.c.normal.z, depth);
             solid = true;

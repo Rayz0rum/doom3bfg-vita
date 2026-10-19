@@ -289,6 +289,10 @@ public:
         BindShader_Builtin(BUILTIN_STEREO_INTERLACE);
     }
 
+    void BindShader_PostProcessPlain()
+    {
+        BindShader_Builtin(BUILTIN_POSTPROCESS_PLAIN);
+    }
     void BindShader_PostProcess()
     {
         BindShader_Builtin(BUILTIN_POSTPROCESS);
@@ -389,6 +393,7 @@ protected:
         BUILTIN_BINK_GUI,
         BUILTIN_STEREO_INTERLACE,
         BUILTIN_MOTION_BLUR,
+        BUILTIN_POSTPROCESS_PLAIN, // the stock stretch, beside a filtered BUILTIN_POSTPROCESS (vita_postFilterPlain)
 
         MAX_BUILTINS
     };

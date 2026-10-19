@@ -26,3 +26,13 @@ base/sound/
 base/strings/
 base/video/
 base/wads/
+tools/vita/owner_key.json
+tools/vita/owner_account_*.dat
+
+# PS Vita port: never published
+neo/sys/online/
+tools/vita/owner_*
+tools/vita/crypto_test*
+dist/sound/
+dist/video/
+neo/sys/vita/sce_sys/trophy/

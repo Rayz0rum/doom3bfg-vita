@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #include "../Game_local.h"
 
@@ -180,6 +181,22 @@ bool idPhysics_RigidBody::CheckForCollisions(const float deltaTime, rigidBodyPSt
     bool startsolid;
     if (gameLocal.clip.Contents(current.i.position, clipModel, current.i.orientation, clipMask, self)) {
         startsolid = true;
+    }
+#endif
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Vita (a cut): debris sweep their translation only, at the new
+    // orientation - the translation + rotation sweep against the world was
+    // 30-41 ms in a frame (alphalabs4 fights 1 and 2, run 32)
+    if (vitaTranslationSweepOnly) {
+        VITA_ZONE_COUNT("rigid body: translation-only sweeps (debris)");
+        if (gameLocal.clip.Translation(collision, current.i.position, next_.i.position, clipModel, next_.i.orientation, clipMask, self)) {
+            next_.i.position = collision.endpos;
+            next_.i.linearMomentum = current.i.linearMomentum;
+            next_.i.angularMomentum = current.i.angularMomentum;
+            return true;
+        }
+        return false;
     }
 #endif
 
@@ -465,6 +482,12 @@ idPhysics_RigidBody::idPhysics_RigidBody()
 
     // use the least expensive euler integrator
     integrator = new (TAG_PHYSICS) idODE_Euler(sizeof(rigidBodyIState_t) / sizeof(float), RigidBodyDerivatives, this);
+#if defined(VITA_PHYSCHECK)
+    vpcSince = -1;
+    vpcFrom.Zero();
+    vpcTopSpeed = 0.0f;
+    vpcOutLogged = false;
+#endif
 
     dropToFloor = false;
     noImpact = false;
@@ -735,6 +758,12 @@ idPhysics_RigidBody::Rest
 */
 void idPhysics_RigidBody::Rest()
 {
+#if defined(VITA_PHYSCHECK)
+    if (vpcSince >= 0 && self != NULL) {
+        Vita_PhysCheck_ObjectRest(self->name.c_str(), (gameLocal.time - vpcSince) * 0.001f, (current.i.position - vpcFrom).Length(), vpcTopSpeed);
+    }
+    vpcSince = -1;
+#endif
     current.atRest = gameLocal.time;
     current.i.linearMomentum.Zero();
     current.i.angularMomentum.Zero();
@@ -856,6 +885,21 @@ idPhysics_RigidBody::Evaluate
 */
 bool idPhysics_RigidBody::Evaluate(int timeStepMSec, int endTimeMSec)
 {
+#if defined(VITA_PHYSCHECK)
+    if (current.atRest < 0 && self != NULL) {
+        if (vpcSince < 0) {
+            vpcSince = gameLocal.time;
+            vpcFrom = current.i.position;
+            vpcTopSpeed = 0.0f;
+        }
+        vpcTopSpeed = Max(vpcTopSpeed, (current.i.linearMomentum * inverseMass).Length());
+        if (!vpcOutLogged && !gameLocal.clip.GetWorldBounds().Expand(128.0f).ContainsPoint(current.i.position)) {
+            vpcOutLogged = true;
+            Vita_PhysCheck_ObjectOutOfWorld(self->name.c_str(), current.i.position);
+        }
+    }
+#endif
+    VITA_ZONE("physics rigid body");
     rigidBodyPState_t next_step;
     idAngles angles;
     trace_t collision;
@@ -922,7 +966,9 @@ bool idPhysics_RigidBody::Evaluate(int timeStepMSec, int endTimeMSec)
 #endif
 
     // check for collisions from the current to the next state
+    VITA_ZONE_BEGIN(rbCollide, "rigid body: collision sweep (clip motion)");
     collided = CheckForCollisions(timeStep, next_step, collision);
+    VITA_ZONE_END(rbCollide);
 
 #ifdef RB_TIMINGS
     timer_collision.Stop();
@@ -949,7 +995,9 @@ bool idPhysics_RigidBody::Evaluate(int timeStepMSec, int endTimeMSec)
         timer_collision.Start();
 #endif
         // get contacts
+        VITA_ZONE_BEGIN(rbContacts, "rigid body: contacts (clip contacts)");
         EvaluateContacts();
+        VITA_ZONE_END(rbContacts);
 
 #ifdef RB_TIMINGS
         timer_collision.Stop();

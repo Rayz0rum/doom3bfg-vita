@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "../Game_local.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 /***********************************************************************
 
@@ -1704,9 +1705,13 @@ void idAI::Event_CanHitEnemyFromAnim(const char* animname)
         start = ownerBounds.GetCenter();
     }
 
-    gameLocal.clip.Translation(tr, start, fromPos, projectileClipModel, mat3_identity, MASK_SHOT_RENDERMODEL, this);
+    {
+        VITA_ZONE("ai canHitEnemyFromAnim: launch trace");
+        gameLocal.clip.Translation(tr, start, fromPos, projectileClipModel, mat3_identity, MASK_SHOT_RENDERMODEL, this);
+    }
     fromPos = tr.endpos;
 
+    VITA_ZONE("ai canHitEnemyFromAnim: aim (trajectory traces)");
     if (GetAimDir(fromPos, enemy.GetEntity(), this, dir)) {
         idThread::ReturnInt(true);
     } else {

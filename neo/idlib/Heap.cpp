@@ -45,6 +45,9 @@ Mem_Alloc16
 ==================
 */
 // RB: 64 bit fixes, changed int to size_t
+#if defined(__vita__)
+void Vita_NoteTagAlloc(int tag, size_t size, void* p); // vita_mem.cpp: cached heap or uncached pools, by tag
+#endif
 void* Mem_Alloc16(const size_t size, const memTag_t tag)
 // RB end
 {
@@ -57,8 +60,24 @@ void* Mem_Alloc16(const size_t size, const memTag_t tag)
     return _aligned_malloc(paddedSize, 16);
 #else  // not _WIN32
        // DG: the POSIX solution for linux etc
-    void* ret;
-    posix_memalign(&ret, 16, paddedSize);
+    void* ret = NULL;
+    if (posix_memalign(&ret, 16, paddedSize) != 0) {
+        // posix_memalign leaves *memptr unspecified when it fails, so the
+        // original `posix_memalign(&ret, 16, paddedSize); return ret;` read an
+        // uninitialised variable. That is undefined behaviour and GCC took it:
+        // on the failure path it omitted the load of `ret` entirely and returned
+        // whatever was already in r3 - the caller's last scratch value, since
+        // this function only takes two arguments.
+        //
+        // On Vita that turned a failed audio allocation into the pointer
+        // 0x00000001, because the caller had just loaded numChannels into r3.
+        // Every `if ( p == NULL )` check downstream passed, and the first store
+        // faulted. Returning NULL makes all of those checks work as written.
+        return NULL;
+    }
+#if defined(__vita__)
+    Vita_NoteTagAlloc((int)tag, paddedSize, ret);
+#endif
     return ret;
     // DG end
 #endif // _WIN32

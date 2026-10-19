@@ -93,6 +93,23 @@ void idMenuScreen_Shell_MatchSettings::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
     options->AddChild(control);
 
+    // the host's bots (VitaBots.cpp): how many, how good
+    control = new (TAG_SWF) idMenuWidget_ControlButton();
+    control->SetOptionType(OPTION_SLIDER_TEXT);
+    control->SetLabel("Bots");
+    control->SetDataSource(&matchData, idMenuDataSource_MatchSettings::MATCH_FIELD_BOTS);
+    control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
+    options->AddChild(control);
+
+    control = new (TAG_SWF) idMenuWidget_ControlButton();
+    control->SetOptionType(OPTION_SLIDER_TEXT);
+    control->SetLabel("Bot Difficulty");
+    control->SetDataSource(&matchData, idMenuDataSource_MatchSettings::MATCH_FIELD_BOT_SKILL);
+    control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
+    options->AddChild(control);
+
     options->AddEventAction(WIDGET_EVENT_SCROLL_DOWN).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_SCROLL_DOWN_START_REPEATER, WIDGET_EVENT_SCROLL_DOWN));
     options->AddEventAction(WIDGET_EVENT_SCROLL_UP).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_SCROLL_UP_START_REPEATER, WIDGET_EVENT_SCROLL_UP));
     options->AddEventAction(WIDGET_EVENT_SCROLL_DOWN_RELEASE).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_STOP_REPEATER, WIDGET_EVENT_SCROLL_DOWN_RELEASE));
@@ -259,6 +276,9 @@ extern idCVar si_timeLimit;
 extern idCVar si_fragLimit;
 extern idCVar si_map;
 extern idCVar si_mode;
+extern idCVar bot_count; // VitaBots.cpp
+extern idCVar bot_skill;
+const char* VitaBot_SkillName(int skill);
 
 /*
 ========================
@@ -296,6 +316,9 @@ void idMenuScreen_Shell_MatchSettings::idMenuDataSource_MatchSettings::LoadData(
 
     int fragLimit = matchParameters.serverInfo.GetInt("si_fragLimit");
     fields[MATCH_FIELD_SCORE].SetInteger(fragLimit);
+
+    fields[MATCH_FIELD_BOTS].SetString(bot_count.GetInteger() == 0 ? "None" : va("%d", bot_count.GetInteger()));
+    fields[MATCH_FIELD_BOT_SKILL].SetString(VitaBot_SkillName(bot_skill.GetInteger()));
 
     originalFields = fields;
 }
@@ -444,6 +467,17 @@ void idMenuScreen_Shell_MatchSettings::idMenuDataSource_MatchSettings::AdjustFie
 
         matchParameters.serverInfo.SetInt("si_fragLimit", si_fragLimit.GetInteger());
         session->UpdateMatchParms(matchParameters);
+    } else if (fieldIndex == MATCH_FIELD_BOTS) {
+        // 0..7 (the lobby's other slots go to players first: VitaBots.cpp)
+        const int n = ((bot_count.GetInteger() + adjustAmount) % 8 + 8) % 8;
+        bot_count.SetInteger(n);
+        fields[MATCH_FIELD_BOTS].SetString(n == 0 ? "None" : va("%d", n));
+        common->Printf("bots: %d picked in Match Settings\n", n);
+    } else if (fieldIndex == MATCH_FIELD_BOT_SKILL) {
+        const int s = ((bot_skill.GetInteger() - 1 + adjustAmount) % 5 + 5) % 5 + 1;
+        bot_skill.SetInteger(s);
+        fields[MATCH_FIELD_BOT_SKILL].SetString(VitaBot_SkillName(s));
+        common->Printf("bots: difficulty %d (%s) picked in Match Settings\n", s, VitaBot_SkillName(s));
     }
 
     cvarSystem->ClearModifiedFlags(CVAR_ARCHIVE);
@@ -470,6 +504,11 @@ bool idMenuScreen_Shell_MatchSettings::idMenuDataSource_MatchSettings::IsDataCha
     }
 
     if (fields[MATCH_FIELD_SCORE].ToInteger() != originalFields[MATCH_FIELD_SCORE].ToInteger()) {
+        return true;
+    }
+
+    if (fields[MATCH_FIELD_BOTS].ToString() != originalFields[MATCH_FIELD_BOTS].ToString()
+        || fields[MATCH_FIELD_BOT_SKILL].ToString() != originalFields[MATCH_FIELD_BOT_SKILL].ToString()) {
         return true;
     }
 

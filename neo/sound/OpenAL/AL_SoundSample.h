@@ -149,6 +149,37 @@ public:
 
     void CreateOpenALBuffer();
 
+#if defined(ID_SOUND_STREAM)
+    // compressed playback (AL_SoundStream.cpp): the data is a run of blocks,
+    // the first ResidentBlocks() of them in buffers[0], the rest on disk
+    bool IsStreamed() const
+    {
+        return streamPathId >= 0;
+    }
+    int NumBlocks() const
+    {
+        return numBlocks;
+    }
+    int ResidentBlocks() const
+    {
+        return residentBlocks;
+    }
+    int BlockAlign() const
+    {
+        return blockAlign;
+    }
+    int FramesPerBlock() const
+    {
+        return framesPerBlock;
+    }
+    int ResidentBytes() const
+    {
+        return residentBytes;
+    }
+    int BlockBytes(int block) const;
+    int DecodeBlock(const byte* src, int bytes, int16* dst) const;
+#endif
+
 protected:
     friend class idSoundHardware_OpenAL;
     friend class idSoundVoice_OpenAL;
@@ -160,6 +191,10 @@ protected:
     void WriteAllSamples(const idStr& sampleName);
     bool LoadGeneratedSample(const idStr& name);
     void WriteGeneratedSample(idFile* fileOut);
+#if defined(ID_SOUND_STREAM)
+    bool LoadGeneratedSampleStreaming(const idStr& name);
+    void SetupBlocks();
+#endif
 
     struct MS_ADPCM_decodeState_t {
         uint8 hPredictor;
@@ -203,6 +238,18 @@ protected:
     idWaveFile::waveFmt_t format;
 
     idList<byte, TAG_AMPLITUDE> amplitude;
+
+#if defined(ID_SOUND_STREAM)
+    int streamPathId;     // container file being streamed from, -1 = all in memory
+    int streamDataOffset; // where the audio data starts in that file
+    int dataBytes;        // all the audio data
+    int residentBytes;    // how much of it, from the start, is in buffers[0]
+    int blockAlign;
+    int framesPerBlock;
+    int numBlocks;
+    int residentBlocks;
+    int accountedBytes;   // what SoundStream_AccountSample was told
+#endif
 };
 
 /*

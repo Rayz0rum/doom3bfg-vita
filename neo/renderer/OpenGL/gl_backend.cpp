@@ -32,6 +32,10 @@ If you have questions concerning this license or the applicable additional terms
 #include "../tr_local.h"
 #include "../../framework/Common_local.h"
 
+#if defined(__vita__)
+#include "../../sys/vita/vita_public.h"
+#endif
+
 idCVar r_drawFlickerBox("r_drawFlickerBox", "0", CVAR_RENDERER | CVAR_BOOL, "visual test for dropping frames");
 idCVar stereoRender_warp("stereoRender_warp", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "use the optical warping renderprog instead of stereoDeGhost");
 idCVar stereoRender_warpStrength("stereoRender_warpStrength", "1.45", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "amount of pre-distortion");
@@ -44,6 +48,18 @@ idCVar stereoRender_warpTargetFraction("stereoRender_warpTargetFraction", "1.0",
 
 idCVar r_showSwapBuffers("r_showSwapBuffers", "0", CVAR_BOOL, "Show timings from GL_BlockingSwapBuffers");
 idCVar r_syncEveryFrame("r_syncEveryFrame", "1", CVAR_BOOL, "Don't let the GPU buffer execution past swapbuffers");
+#if defined(__vita__)
+// vitaGL has no fences, so the stock path called glFinish() - sceGxmFinish(),
+// a wait for ALL the GPU's work - before every swap: the CPU stood idle while
+// the GPU finished the frame, 5-10 ms of every frame in the benchmark's busy
+// views (its "swap + wait for GPU"), and the GPU then idled while the CPU
+// built the next one. Without it the GPU draws frame N while the CPU builds
+// N+1; vitaGL's display queue (two pending frames) bounds how far behind the
+// GPU can get, and the per-frame buffers are sized for that (four vertex
+// cache sets, VertexCache.h; vitaGL's own pools rotate over three frames and
+// free nothing for four).
+idCVar vita_gpuSync("vita_gpuSync", "0", CVAR_BOOL, "Vita: wait for the GPU to finish each frame before the swap (the stock behaviour; slower)");
+#endif
 
 static int swapIndex; // 0 or 1 into renderSync
 static GLsync renderSync[2];
@@ -78,6 +94,48 @@ static void RB_DrawFlickerBox()
     qglClear(GL_COLOR_BUFFER_BIT);
 }
 
+#if defined(__vita__)
+/*
+=============
+RB_VitaClearRenderCorner
+
+The 3D view only writes a pixel's colour where an opaque surface covers it
+(the depth pass writes black there, the lights add on top); any other pixel
+keeps what the buffer held - a frame vitaGL presented a few frames ago, HUD
+included. Stock BFG never clears and gets away with it: at full resolution
+that leftover is the same picture in the same place. Here the 3D view is
+drawn smaller in the top-left corner and stretched to the screen, so the
+leftover is an old full-size frame, stretched again - ghost copies of the
+scene and a second crosshair to the lower right, feeding on themselves frame
+after frame (and glass, whose heat haze copies the corner, shows them too).
+Clear the 3D view's corner (its largest size) to black once a frame, before
+any view is drawn, so a mirror or other subview drawn into the frame later
+is not wiped. Runs on RC_SET_BUFFER, the first command of every frame - in
+the mono loop too, which otherwise only counts it.
+=============
+*/
+static void RB_VitaClearRenderCorner()
+{
+    int topW, topH;
+    extern void Vita_RenderSizeForStep(int step, int* outW, int* outH);
+    Vita_RenderSizeForStep(0, &topW, &topH);
+    if (topW >= tr.GetWidth() && topH >= tr.GetHeight()) {
+        return;
+    }
+    GL_State(GLS_DEFAULT); // colour writes on
+    GL_Scissor(0, tr.GetHeight() - topH, topW, topH);
+    GL_Clear(true, false, false, 0, 0.0f, 0.0f, 0.0f, 1.0f);
+    GL_Scissor(0, 0, tr.GetWidth(), tr.GetHeight());
+
+    static int logged = 0;
+    if (logged < 2) {
+        logged++;
+        Vita_Checkpoint("frame start: 3D view corner %dx%d of %dx%d cleared to black (scissor test %d)",
+            topW, topH, tr.GetWidth(), tr.GetHeight(), (int)qglIsEnabled(GL_SCISSOR_TEST));
+    }
+}
+#endif
+
 /*
 =============
 RB_SetBuffer
@@ -92,6 +150,22 @@ static void RB_SetBuffer(const void* data)
     RENDERLOG_PRINTF("---------- RB_SetBuffer ---------- to buffer # %d\n", cmd->buffer);
 
     GL_Scissor(0, 0, tr.GetWidth(), tr.GetHeight());
+
+#if defined(__vita__)
+    // GL_Clear honours the scissor, so a degenerate rect here swallows the
+    // clear and every draw after it without raising a GL error.
+    {
+        static int logged = 0;
+        if (logged < 3) {
+            logged++;
+            Vita_Checkpoint("setbuffer: native=%dx%d tr=%dx%d virtual=%dx%d scissorTest=%d",
+                glConfig.nativeScreenWidth, glConfig.nativeScreenHeight,
+                tr.GetWidth(), tr.GetHeight(),
+                renderSystem->GetVirtualWidth(), renderSystem->GetVirtualHeight(),
+                (int)qglIsEnabled(GL_SCISSOR_TEST));
+        }
+    }
+#endif
 
     // clear screen for debugging
     // automatically enable this with several other debug tools
@@ -108,6 +182,10 @@ static void RB_SetBuffer(const void* data)
             GL_Clear(true, false, false, 0, 0.4f, 0.0f, 0.25f, 1.0f);
         }
     }
+
+#if defined(__vita__)
+    RB_VitaClearRenderCorner();
+#endif
 }
 
 /*
@@ -124,13 +202,24 @@ const void GL_BlockingSwapBuffers()
     const int beforeFinish = Sys_Milliseconds();
 
     if (!glConfig.syncAvailable) {
+#if defined(__vita__)
+        if (vita_gpuSync.GetBool()) {
+            glFinish();
+        }
+#else
         glFinish();
+#endif
     }
 
     const int beforeSwap = Sys_Milliseconds();
     if (r_showSwapBuffers.GetBool() && beforeSwap - beforeFinish > 1) {
         common->Printf("%i msec to glFinish\n", beforeSwap - beforeFinish);
     }
+
+    // the verification (framework/VitaVerify.cpp): its video test, and on
+    // the PC its screenshots
+    extern void VitaVerify_BeforeSwap();
+    VitaVerify_BeforeSwap();
 
     GLimp_SwapBuffers();
 
@@ -550,6 +639,9 @@ void RB_ExecuteBackEndCommands(const emptyCommand_t* cmds)
             break;
         case RC_SET_BUFFER:
             c_setBuffers++;
+#if defined(__vita__)
+            RB_VitaClearRenderCorner();
+#endif
             break;
         case RC_COPY_RENDER:
             RB_CopyRender(cmds);

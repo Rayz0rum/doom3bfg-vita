@@ -31,12 +31,25 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 
+#if defined(__vita__)
+#include "../sys/vita/vita_public.h"
+#endif
+
 // do this with a pointer, in case we want to make the actual manager
 // a private virtual subclass
 idImageManager imageManager;
 idImageManager* globalImages = &imageManager;
 
+#if defined(__vita__)
+// Preloading walks the map's entire manifest and makes every image resident at
+// once - 2181 of them for mars_city2, 54 seconds of work, and the single
+// largest reason a map load runs the pools dry. Images are loaded lazily by
+// idImage::Bind() anyway, so turning this off costs nothing but a first-use
+// hitch, and keeps only what is actually drawn in memory.
+idCVar preLoad_Images("preLoad_Images", "0", CVAR_SYSTEM | CVAR_BOOL, "preload images during beginlevelload");
+#else
 idCVar preLoad_Images("preLoad_Images", "1", CVAR_SYSTEM | CVAR_BOOL, "preload images during beginlevelload");
+#endif
 
 /*
 ===============
@@ -110,6 +123,33 @@ static int R_QsortImageName(const void* a, const void* b)
 
     return idStr::Icmp(ea->image->GetName(), eb->image->GetName());
 }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+===============
+R_ListTextTextures_f
+
+The loaded textures the Vita keeps at full size for their text
+(R_VitaImageHasText), and how many world textures are shrunk around them.
+===============
+*/
+static void R_ListTextTextures_f(const idCmdArgs& args)
+{
+    int text = 0, world = 0;
+    for (int i = 0; i < globalImages->images.Num(); i++) {
+        idImage* image = globalImages->images[i];
+        if (image == NULL || !R_VitaImageCanShrink(image->GetName(), image->GetUsage(), image->GetOpts().textureType, Max(2, image->GetOpts().numLevels))) {
+            continue;
+        }
+        world++;
+        if (R_VitaImageHasText(image->GetName())) {
+            text++;
+            common->Printf("text texture: %s (%dx%d)\n", image->GetName(), image->GetUploadWidth(), image->GetUploadHeight());
+        }
+    }
+    common->Printf("%d of %d world textures loaded are kept at full size for their text\n", text, world);
+}
+#endif
 
 /*
 ===============
@@ -413,7 +453,12 @@ idImage* idImageManager::ImageFromFile(const char* _name, textureFilter_t filter
 
             if ((!insideLevelLoad || preloadingMapImages) && !image->IsLoaded()) {
                 image->referencedOutsideLevelLoad = (!insideLevelLoad && !preloadingMapImages);
-                image->ActuallyLoadImage(false); // load is from front end
+                image->referencedDuringPlay = image->referencedOutsideLevelLoad && firstLevelLoadStarted;
+                if (!R_IsGLThread()) {
+                    image->LoadHeaderOnly(); // the GL part happens at the first Bind()
+                } else {
+                    image->ActuallyLoadImage(false); // load is from front end
+                }
                 declManager->MediaPrint("%ix%i %s (reload for mixed referneces)\n", image->GetUploadWidth(), image->GetUploadHeight(), image->GetName());
             }
             return image;
@@ -434,7 +479,12 @@ idImage* idImageManager::ImageFromFile(const char* _name, textureFilter_t filter
     // load it if we aren't in a level preload
     if (!insideLevelLoad || preloadingMapImages) {
         image->referencedOutsideLevelLoad = (!insideLevelLoad && !preloadingMapImages);
-        image->ActuallyLoadImage(false); // load is from front end
+        image->referencedDuringPlay = image->referencedOutsideLevelLoad && firstLevelLoadStarted;
+        if (!R_IsGLThread()) {
+            image->LoadHeaderOnly(); // the GL part happens at the first Bind()
+        } else {
+            image->ActuallyLoadImage(false); // load is from front end
+        }
         declManager->MediaPrint("%ix%i %s\n", image->GetUploadWidth(), image->GetUploadHeight(), image->GetName());
     } else {
         declManager->MediaPrint("%s\n", image->GetName());
@@ -685,10 +735,16 @@ void idImageManager::Init()
     images.Resize(1024, 1024);
     imageHash.ResizeIndex(1024);
 
+    extern void R_ToksvigInit();
+    R_ToksvigInit(); // its work area, in cached RAM while the heap has room (Toksvig.cpp)
+
     CreateIntrinsicImages();
 
     cmdSystem->AddCommand("reloadImages", R_ReloadImages_f, CMD_FL_RENDERER, "reloads images");
     cmdSystem->AddCommand("listImages", R_ListImages_f, CMD_FL_RENDERER, "lists images");
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    cmdSystem->AddCommand("listTextTextures", R_ListTextTextures_f, CMD_FL_RENDERER, "lists the loaded textures kept at full size on the Vita for their text");
+#endif
     cmdSystem->AddCommand("combineCubeImages", R_CombineCubeImages_f, CMD_FL_RENDERER, "combines six images for roq compression");
 
     // should forceLoadImages be here?
@@ -711,10 +767,14 @@ idImageManager::BeginLevelLoad
 Frees all images used by the previous level
 ====================
 */
+idCVar image_debugPurgeAll("image_debugPurgeAll", "0", CVAR_RENDERER | CVAR_BOOL, "debug: at each level load also purge every image first used outside a level load, boot-time ones included");
+
 void idImageManager::BeginLevelLoad()
 {
     insideLevelLoad = true;
 
+    int transientPurged = 0;
+    int64 transientBytes = 0;
     for (int i = 0; i < images.Num(); i++) {
         idImage* image = images[i];
 
@@ -726,11 +786,22 @@ void idImageManager::BeginLevelLoad()
         if (!image->referencedOutsideLevelLoad && image->IsLoaded()) {
             image->PurgeImage();
             // idLib::Printf( "purging %s\n", image->GetName() );
+        } else if ((image->referencedDuringPlay || image_debugPurgeAll.GetBool()) && image->IsLoaded() && !R_ImageIsInterfaceArt(image->GetName())) {
+            // First used during play (an effect, a GUI, a video) rather than
+            // at boot. Stock BFG keeps these for the rest of the session, so
+            // over a campaign they pile up; drop them with the level they
+            // came from. Bind() reloads one on demand if it is used again.
+            transientBytes += image->StorageSize();
+            transientPurged++;
+            image->PurgeImage();
         } else {
             // idLib::Printf( "not purging %s\n", image->GetName() );
         }
 
         image->levelLoadReferenced = false;
+    }
+    if (transientPurged > 0) {
+        common->Printf("images: purged %d (%d KB) that were first used during the last level's play\n", transientPurged, (int)(transientBytes / 1024));
     }
 }
 
@@ -790,9 +861,105 @@ void idImageManager::Preload(const idPreloadManifest& manifest, const bool& mapP
 idImageManager::LoadLevelImages
 ===============
 */
+#if defined(__vita__)
+// What loading textures actually costs vitaGL's pools, against what the images
+// say they hold. A big gap means texture storage is being duplicated or
+// padded somewhere between the engine and the GPU.
+static int64 vitaImageExpectedBytes = 0;
+static int64 vitaImageMeasuredBytes = 0;
+static int vitaImageInflatedLogged = 0;
+static int64 Vita_PoolsFree()
+{
+    return (int64)vglMemFree(VGL_MEM_RAM) + (int64)vglMemFree(VGL_MEM_VRAM) + (int64)vglMemFree(VGL_MEM_SLOW);
+}
+
+/*
+===============
+Memory pressure while a level's textures load
+
+Textures are the one big allocation that can shrink. If memory runs low part
+way through, the rest of the level's world textures load a mip level
+smaller (vita_textureQualityDrop), and common_frame.cpp shrinks the ones
+already loaded once play starts. Below 32 MB free one level is dropped, below
+20 MB two. (It was 48 / 32: mc_underground and mars_city2 end their loads at
+47 MB free, so every world texture of both played at a quarter of its size -
+blurry signs and walls - with 43 MB still free in play. Shrinking in play
+reacts to what is really used, common_frame.cpp.)
+===============
+*/
+void Vita_FreeMemoryKB(unsigned int* allFreeKB, unsigned int* cachedFreeKB); // vita_main.cpp
+
+static void Vita_TextureMemoryGuard(int loaded)
+{
+    unsigned int freeKB = 0;
+    Vita_FreeMemoryKB(&freeKB, NULL);
+    const int want = (freeKB < 20 * 1024) ? 2 : ((freeKB < 32 * 1024) ? 1 : 0);
+    if (want > vita_textureQualityDrop) {
+        vita_textureQualityDrop = want;
+        common->Printf("vita: only %u MB free after %d textures - world textures now load %d mip level(s) smaller\n",
+            freeKB / 1024, loaded, vita_textureQualityDrop);
+    }
+}
+
+/*
+===============
+idImageManager::VitaShrinkLoadedTextures
+===============
+*/
+int idImageManager::VitaShrinkLoadedTextures(int budgetUs, int* shrunk, int64* savedBytes)
+{
+    // A slice of the list per call from a cursor that goes round, not the
+    // whole list: run 7 spent 1.2 ms a frame on the main thread (every fight)
+    // walking ~2000 images every third frame, with a clock syscall for each
+    // one still waiting. It returns 0 only once a whole round of the list has
+    // gone by with nothing left to shrink.
+    static int cursor = 0;
+    static int cleanRun = 0; // images seen in a row that want nothing
+    const int64 start = Sys_Microseconds();
+    const int num = images.Num();
+    if (num == 0) {
+        return 0;
+    }
+    const int slice = Min(num, 256);
+    int waiting = 0;
+    bool overBudget = false;
+    for (int n = 0; n < slice; n++) {
+        cursor = (cursor + 1) % num;
+        idImage* image = images[cursor];
+        if (!image->VitaWantsSmaller()) {
+            cleanRun++;
+            continue;
+        }
+        cleanRun = 0;
+        if (overBudget || Sys_Microseconds() - start > budgetUs) {
+            overBudget = true;
+            waiting++;
+            break; // the rest of the round next time
+        }
+        const int before = image->StorageSize();
+        image->PurgeImage();
+        image->ActuallyLoadImage(false);
+        if (shrunk != NULL) {
+            (*shrunk)++;
+        }
+        if (savedBytes != NULL) {
+            *savedBytes += before - image->StorageSize();
+        }
+    }
+    return (waiting > 0 || cleanRun < num) ? 1 : 0;
+}
+#endif
+
 int idImageManager::LoadLevelImages(bool pacifier)
 {
     int loadCount = 0;
+#if defined(__vita__)
+    // One pool measurement for the whole pass: the query walks every chunk
+    // header of vitaGL's heaps, in uncached memory, so per image it cost
+    // seconds over a level's two thousand textures.
+    const int64 passFreeBefore = Vita_PoolsFree();
+    int64 passExpected = 0;
+#endif
     for (int i = 0; i < images.Num(); i++) {
         if (pacifier) {
             common->UpdateLevelLoadPacifier();
@@ -804,9 +971,34 @@ int idImageManager::LoadLevelImages(bool pacifier)
         }
         if (image->levelLoadReferenced && !image->IsLoaded()) {
             loadCount++;
+#if defined(__vita__)
+            if ((loadCount & 63) == 1) {
+                Vita_TextureMemoryGuard(loadCount);
+            }
             image->ActuallyLoadImage(false);
+            passExpected += (int64)image->StorageSize() * (image->opts.textureType == TT_CUBIC ? 6 : 1);
+            // vitaGL pads compressed textures to power-of-two sizes: name the
+            // big ones that are not (SWF atlases, some GUI art)
+            if (image->IsCompressed() && ((image->opts.width & (image->opts.width - 1)) != 0 || (image->opts.height & (image->opts.height - 1)) != 0)
+                && image->StorageSize() > 256 * 1024 && vitaImageInflatedLogged < 12) {
+                vitaImageInflatedLogged++;
+                Vita_Checkpoint("image '%s' %dx%d fmt %d levels %d: %d KB, padded to a power of two by vitaGL",
+                    image->GetName(), image->opts.width, image->opts.height, (int)image->opts.format, image->opts.numLevels,
+                    image->StorageSize() / 1024);
+            }
+#else
+            image->ActuallyLoadImage(false);
+#endif
         }
     }
+#if defined(__vita__)
+    if (loadCount > 0) {
+        vitaImageExpectedBytes += passExpected;
+        vitaImageMeasuredBytes += passFreeBefore - Vita_PoolsFree();
+        Vita_Checkpoint("images: %d loaded this pass; running totals: they hold %d KB, the pools lost %d KB",
+            loadCount, (int)(vitaImageExpectedBytes / 1024), (int)(vitaImageMeasuredBytes / 1024));
+    }
+#endif
     return loadCount;
 }
 
@@ -825,8 +1017,107 @@ void idImageManager::EndLevelLoad()
 
     int end = Sys_Milliseconds();
     common->Printf("%5i images loaded in %5.1f seconds\n", loadCount, (end - start) * 0.001);
+    PrintMemorySummary("after level load");
+
+#if defined(__vita__)
+    // Totals for the two load paths - see the note in idImage::ActuallyLoadImage.
+    // Anything non-zero in the second number means textures are being DXT
+    // compressed on the console instead of using the shipped .bimage files.
+    extern int vitaImagesFromBimage;
+    extern int vitaImagesRecompressed;
+    extern int vitaImagesYCoCg;
+    extern int vitaRGB565Images, vitaRGB565Levels;
+    extern int vitaCoverageImages, vitaCoverageLevels, vitaCoverageMaxError;
+    extern int vitaUploadVerifyOk, vitaUploadVerifyBad, vitaUploadVerifyDropped;
+    Vita_Checkpoint("images: %d from .bimage, %d recompressed on the Vita, %d are YCoCg-DXT5 diffuse",
+        vitaImagesFromBimage, vitaImagesRecompressed, vitaImagesYCoCg);
+    Vita_Checkpoint("images: %d RGB565 light images (%d levels) byte-swapped; %d coverage/font images (%d levels) transcoded DXT1->BC4, worst error %d/255",
+        vitaRGB565Images, vitaRGB565Levels, vitaCoverageImages, vitaCoverageLevels, vitaCoverageMaxError);
+    Vita_Checkpoint("images: uncompressed upload check: %d levels intact in GPU memory, %d CORRUPTED, %d not allocated by vitaGL (running totals)",
+        vitaUploadVerifyOk, vitaUploadVerifyBad, vitaUploadVerifyDropped);
+#endif
     common->Printf("----------------------------------------\n");
     // R_ListImages_f( idCmdArgs( "sorted sorted", false ) );
+}
+
+/*
+===============
+idImageManager::PrintMemorySummary
+
+Texture memory by usage. On the Vita the sizes are what was allocated (after
+vita_imageDownSize); elsewhere a second figure estimates what the Vita would
+hold with the same rule (one top mip level dropped from 2D diffuse, bump and
+specular maps of 64 px and up).
+===============
+*/
+idCVar r_imageSummaryTop("r_imageSummaryTop", "0", CVAR_RENDERER | CVAR_INTEGER, "also list this many of the biggest loaded images after a level load");
+
+void idImageManager::PrintMemorySummary(const char* when)
+{
+    static const char* names[] = { "specular", "diffuse", "default", "bump", "font", "light", "lut", "lut", "lut", "lut", "coverage", "depth" };
+    int64 bytes[12] = { 0 };
+    int counts[12] = { 0 };
+    int64 total = 0, vitaTotal = 0, outsideBytes = 0;
+    int loaded = 0, outside = 0;
+    for (int i = 0; i < images.Num(); i++) {
+        const idImage* img = images[i];
+        if (img == NULL || !img->IsLoaded()) {
+            continue;
+        }
+        int64 sz = img->StorageSize();
+        if (img->opts.textureType == TT_CUBIC) {
+            sz *= 6;
+        }
+        const int u = idMath::ClampInt(0, 11, (int)img->usage);
+        bytes[u] += sz;
+        counts[u]++;
+        total += sz;
+        loaded++;
+        if (img->referencedOutsideLevelLoad) {
+            outside++;
+            outsideBytes += sz;
+        }
+#if defined(__vita__)
+        vitaTotal += sz;
+#else
+        const bool shrinks = R_VitaImageCanShrink(img->GetName(), img->usage, img->opts.textureType, img->opts.numLevels)
+            && img->opts.numLevels > 1 && img->opts.width >= 64 && img->opts.height >= 64;
+        vitaTotal += shrinks ? sz / 4 : sz;
+#endif
+    }
+    common->Printf("images %s: %d loaded, %d KB (Vita: %d KB) - diffuse %d (%d KB), bump %d (%d KB), specular %d (%d KB), default %d (%d KB), light %d (%d KB), other %d KB\n",
+        when, loaded, (int)(total / 1024), (int)(vitaTotal / 1024),
+        counts[TD_DIFFUSE], (int)(bytes[TD_DIFFUSE] / 1024), counts[TD_BUMP], (int)(bytes[TD_BUMP] / 1024),
+        counts[TD_SPECULAR], (int)(bytes[TD_SPECULAR] / 1024), counts[TD_DEFAULT], (int)(bytes[TD_DEFAULT] / 1024),
+        counts[TD_LIGHT], (int)(bytes[TD_LIGHT] / 1024),
+        (int)((total - bytes[TD_DIFFUSE] - bytes[TD_BUMP] - bytes[TD_SPECULAR] - bytes[TD_DEFAULT] - bytes[TD_LIGHT]) / 1024));
+    common->Printf("images %s: %d of them (%d KB) were first used outside a level load and are kept across levels\n",
+        when, outside, (int)(outsideBytes / 1024));
+    extern void R_ToksvigReport(const char* when);
+    R_ToksvigReport(when); // the normal maps filtered since the last report (Toksvig.cpp)
+
+    const int top = r_imageSummaryTop.GetInteger();
+    if (top > 0) {
+        idList<int> order;
+        for (int i = 0; i < images.Num(); i++) {
+            if (images[i] != NULL && images[i]->IsLoaded()) {
+                order.Append(i);
+            }
+        }
+        // selection of the biggest few; the list is short enough
+        for (int n = 0; n < top && n < order.Num(); n++) {
+            int best = n;
+            for (int k = n + 1; k < order.Num(); k++) {
+                if (images[order[k]]->StorageSize() > images[order[best]]->StorageSize()) {
+                    best = k;
+                }
+            }
+            SwapValues(order[n], order[best]);
+            const idImage* img = images[order[n]];
+            common->Printf("  %6d KB %4dx%-4d %s usage %d fmt %d levels %d %s\n", img->StorageSize() / 1024, img->opts.width, img->opts.height,
+                img->opts.textureType == TT_CUBIC ? "cube" : "2d  ", (int)img->usage, (int)img->opts.format, img->opts.numLevels, img->GetName());
+        }
+    }
 }
 
 /*

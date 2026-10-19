@@ -117,10 +117,33 @@ void idMenuScreen_Shell_GameOptions::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
     options->AddChild(control);
 
+#if defined(__vita__)
+    // Flashlight Shadows is not shown (held on, Vita_ApplyFixedSettings);
+    // Language takes its row
+    control = new (TAG_SWF) idMenuWidget_ControlButton();
+    control->SetOptionType(OPTION_SLIDER_TEXT);
+    control->SetLabel("#str_vita_language");
+    control->SetDescription("#str_vita_language_desc");
+    control->SetDataSource(&systemData, idMenuDataSource_GameSettings::GAME_FIELD_LANGUAGE);
+    control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
+    options->AddChild(control);
+#else
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TOGGLE);
     control->SetLabel("#str_swf_flashlight_shadows");
     control->SetDataSource(&systemData, idMenuDataSource_GameSettings::GAME_FIELD_FLASHLIGHT_SHADOWS);
+    control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
+    options->AddChild(control);
+#endif
+
+    // online play on / off: off, multiplayer is the local network (and
+    // friends added by address) only
+    control = new (TAG_SWF) idMenuWidget_ControlButton();
+    control->SetOptionType(OPTION_SLIDER_TOGGLE);
+    control->SetLabel("Online Play");
+    control->SetDataSource(&systemData, idMenuDataSource_GameSettings::GAME_FIELD_ONLINE);
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
     options->AddChild(control);
@@ -274,6 +297,67 @@ extern idCVar aa_targetAimAssistEnable;
 extern idCVar in_alwaysRun;
 extern idCVar g_checkpoints;
 extern idCVar g_weaponShadows;
+extern idCVar net_online; // sys_net_online.cpp (or its local-only stand-in)
+
+#if defined(__vita__)
+extern idCVar vita_language;
+extern idCVar sys_lang;
+
+// The languages this install has strings for (strings/<language>*.lang), in
+// the engine's order, and their own names.
+static idStrList vitaLanguages;
+static const char* VitaLanguageName(const char* lang)
+{
+    static const char* names[][2] = {
+        { ID_LANG_ENGLISH, "English" },
+        { ID_LANG_FRENCH, "Fran\xC3\xA7" "ais" },
+        { ID_LANG_ITALIAN, "Italiano" },
+        { ID_LANG_GERMAN, "Deutsch" },
+        { ID_LANG_SPANISH, "Espa\xC3\xB1" "ol" },
+        { ID_LANG_JAPANESE, "Japanese" },
+    };
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
+        if (idStr::Icmp(lang, names[i][0]) == 0) {
+            return names[i][1];
+        }
+    }
+    return lang;
+}
+
+static void VitaFindLanguages()
+{
+    if (vitaLanguages.Num() > 0) {
+        return;
+    }
+    idFileList* files = fileSystem->ListFilesTree("strings", ".lang", true);
+    for (int l = 0; l < Sys_NumLangs(); l++) {
+        const char* lang = Sys_Lang(l);
+        for (int i = 0; i < files->GetNumFiles(); i++) {
+            idStr name = files->GetFile(i);
+            name.StripPath();
+            if (idStr::Icmpn(name.c_str(), lang, idStr::Length(lang)) == 0) {
+                vitaLanguages.Append(lang);
+                break;
+            }
+        }
+    }
+    fileSystem->FreeFileList(files);
+    if (vitaLanguages.Num() == 0) {
+        vitaLanguages.Append(sys_lang.GetString());
+    }
+    idStr list;
+    for (int i = 0; i < vitaLanguages.Num(); i++) {
+        list += va("%s%s", i ? ", " : "", vitaLanguages[i].c_str());
+    }
+    common->Printf("vita: languages with strings installed: %s (running in %s)\n", list.c_str(), sys_lang.GetString());
+}
+
+// the language the next start uses
+static const char* VitaPendingLanguage()
+{
+    return vita_language.GetString()[0] ? vita_language.GetString() : sys_lang.GetString();
+}
+#endif
 
 /*
 ========================
@@ -300,6 +384,12 @@ void idMenuScreen_Shell_GameOptions::idMenuDataSource_GameSettings::LoadData()
     fields[GAME_FIELD_AIM_ASSIST].SetBool(aa_targetAimAssistEnable.GetBool());
     fields[GAME_FIELD_ALWAYS_SPRINT].SetBool(in_alwaysRun.GetBool());
     fields[GAME_FIELD_FLASHLIGHT_SHADOWS].SetBool(g_weaponShadows.GetBool());
+    fields[GAME_FIELD_ONLINE].SetBool(net_online.GetBool());
+#if defined(__vita__)
+    VitaFindLanguages();
+    vitaPickedLanguage = VitaPendingLanguage();
+    SetVitaLanguageField();
+#endif
     originalFields = fields;
 }
 
@@ -320,6 +410,17 @@ void idMenuScreen_Shell_GameOptions::idMenuDataSource_GameSettings::CommitData()
     aa_targetAimAssistEnable.SetBool(fields[GAME_FIELD_AIM_ASSIST].ToBool());
     in_alwaysRun.SetBool(fields[GAME_FIELD_ALWAYS_SPRINT].ToBool());
     g_weaponShadows.SetBool(fields[GAME_FIELD_FLASHLIGHT_SHADOWS].ToBool());
+    if (net_online.GetBool() != fields[GAME_FIELD_ONLINE].ToBool()) {
+        net_online.SetBool(fields[GAME_FIELD_ONLINE].ToBool());
+        common->Printf("net: online play switched %s in Game Options (%s)\n", net_online.GetBool() ? "ON" : "off",
+            net_online.GetBool() ? "the multiplayer lobbies look for players over the internet" : "multiplayer is the local network and friends added by address only");
+    }
+#if defined(__vita__)
+    if (idStr::Icmp(vitaPickedLanguage, VitaPendingLanguage()) != 0) {
+        vita_language.SetString(vitaPickedLanguage);
+        common->Printf("vita: language %s picked in Game Options (running in %s; applies at the next start)\n", vitaPickedLanguage.c_str(), sys_lang.GetString());
+    }
+#endif
 
     cvarSystem->SetModifiedFlags(CVAR_ARCHIVE);
 
@@ -336,10 +437,43 @@ void idMenuScreen_Shell_GameOptions::idMenuDataSource_GameSettings::AdjustField(
 {
     if (fieldIndex == GAME_FIELD_FOV) {
         fields[fieldIndex].SetInteger(idMath::ClampInt(MIN_FOV, MAX_FOV, fields[fieldIndex].ToInteger() + adjustAmount * 5));
+#if defined(__vita__)
+    } else if (fieldIndex == GAME_FIELD_LANGUAGE) {
+        VitaFindLanguages();
+        int cur = 0;
+        for (int i = 0; i < vitaLanguages.Num(); i++) {
+            if (idStr::Icmp(vitaLanguages[i], vitaPickedLanguage) == 0) {
+                cur = i;
+            }
+        }
+        const int n = vitaLanguages.Num();
+        cur = ((cur + adjustAmount) % n + n) % n;
+        vitaPickedLanguage = vitaLanguages[cur];
+        SetVitaLanguageField();
+#endif
     } else {
         fields[fieldIndex].SetBool(!fields[fieldIndex].ToBool());
     }
 }
+
+#if defined(__vita__)
+/*
+========================
+idMenuScreen_Shell_GameOptions::idMenuDataSource_GameSettings::SetVitaLanguageField
+
+The picked language's own name, marked when it is not the one running now.
+========================
+*/
+void idMenuScreen_Shell_GameOptions::idMenuDataSource_GameSettings::SetVitaLanguageField()
+{
+    const char* name = VitaLanguageName(vitaPickedLanguage);
+    if (idStr::Icmp(vitaPickedLanguage, sys_lang.GetString()) != 0) {
+        fields[GAME_FIELD_LANGUAGE].SetString(va("%s %s", name, idLocalization::GetString("#str_vita_after_restart")));
+    } else {
+        fields[GAME_FIELD_LANGUAGE].SetString(name);
+    }
+}
+#endif
 
 /*
 ========================
@@ -376,6 +510,16 @@ bool idMenuScreen_Shell_GameOptions::idMenuDataSource_GameSettings::IsDataChange
     if (fields[GAME_FIELD_FLASHLIGHT_SHADOWS].ToBool() != originalFields[GAME_FIELD_FLASHLIGHT_SHADOWS].ToBool()) {
         return true;
     }
+
+    if (fields[GAME_FIELD_ONLINE].ToBool() != originalFields[GAME_FIELD_ONLINE].ToBool()) {
+        return true;
+    }
+
+#if defined(__vita__)
+    if (idStr::Icmp(vitaPickedLanguage, VitaPendingLanguage()) != 0) {
+        return true;
+    }
+#endif
 
     return false;
 }

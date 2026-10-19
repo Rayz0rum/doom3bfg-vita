@@ -50,6 +50,9 @@ public:
         , ret()
         , numGameFrames()
         , isClient()
+#if defined(__vita__)
+        , renderSound(false)
+#endif
     {
     }
 
@@ -85,6 +88,15 @@ public:
         return threadRenderTime;
     }
 
+#if defined(__vita__)
+    // this frame's sound update runs at the end of the thread's work
+    // (vita_soundOnGameThread), not on the main thread after the wait
+    bool RendersSound() const
+    {
+        return renderSound;
+    }
+#endif
+
 private:
     virtual int Run();
 
@@ -97,6 +109,9 @@ private:
     gameReturn_t ret;
     int numGameFrames;
     bool isClient;
+#if defined(__vita__)
+    bool renderSound;
+#endif
 };
 
 enum errorParm_t {
@@ -314,6 +329,11 @@ public: // These are public because they are called directly by static functions
     {
         return currentMapName.c_str();
     }
+    // the benchmark (VitaBench.cpp): the map being played, or NULL
+    const char* GetSpawnedMapName() const
+    {
+        return mapSpawned ? currentMapName.c_str() : NULL;
+    }
 
     // loads a map and starts a new game on it
     void StartNewGame(const char* mapName, bool devmap, int gameMode);
@@ -365,6 +385,13 @@ private:
 
     idFile_SaveGame saveFile;
     idFile_SaveGame stringsFile;
+#if defined(__vita__)
+    size_t vitaLastSaveBytes;    // the last save's size (the buffer is made that big at once)
+    size_t vitaLastStringsBytes;
+public:
+    void VitaReleaseSaveBuffers(const char* why);
+private:
+#endif
     idFile_SaveGamePipelined* pipelineFile;
 
     // The main render world and sound world
@@ -513,12 +540,25 @@ private:
     currentGame_t idealCurrentGame; // Defer game switching so that bad things don't happen in the middle of the frame.
     const idMaterial* doomClassicMaterial;
 
+#if defined(__vita__)
+    // matches GLOBAL_IMAGE_SCALER in doomclassic/doom/Precompiled.h; the
+    // texture the frame is drawn from is DOOMCLASSIC_UPSCALE times bigger
+    // (always 960x600 in the end)
+#ifndef VITA_CLASSIC_SCALE
+#define VITA_CLASSIC_SCALE 3
+#endif
+    static const int DOOMCLASSIC_RENDERWIDTH = 320 * VITA_CLASSIC_SCALE;
+    static const int DOOMCLASSIC_RENDERHEIGHT = 200 * VITA_CLASSIC_SCALE;
+    static const int DOOMCLASSIC_UPSCALE = 3 / VITA_CLASSIC_SCALE;
+#else
     static const int DOOMCLASSIC_RENDERWIDTH = 320 * 3;
     static const int DOOMCLASSIC_RENDERHEIGHT = 200 * 3;
+#endif
     static const int DOOMCLASSIC_BYTES_PER_PIXEL = 4;
     static const int DOOMCLASSIC_IMAGE_SIZE_IN_BYTES = DOOMCLASSIC_RENDERWIDTH * DOOMCLASSIC_RENDERHEIGHT * DOOMCLASSIC_BYTES_PER_PIXEL;
 
-    idArray<byte, DOOMCLASSIC_IMAGE_SIZE_IN_BYTES> doomClassicImageData;
+    // aligned: the Vita path fills it with 32-bit stores
+    alignas(16) idArray<byte, DOOMCLASSIC_IMAGE_SIZE_IN_BYTES> doomClassicImageData;
 #endif
     // RB end
 
@@ -593,7 +633,11 @@ private:
     // RB begin
 #if defined(USE_DOOMCLASSIC)
     // Doom classic support
+#if defined(__vita__)
+    void RunDoomClassicFrame(int framesDue); // framesDue: 35 Hz frames that came due
+#else
     void RunDoomClassicFrame();
+#endif
     void RenderDoomClassic();
     bool IsPlayingDoomClassic() const
     {

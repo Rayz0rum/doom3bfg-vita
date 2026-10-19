@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "snd_local.h"
+#include "../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 idCVar s_noSound("s_noSound", "0", CVAR_BOOL, "returns NULL for all sounds loaded and does not update the sound rendering");
 
@@ -43,7 +44,15 @@ idCVar s_playDefaultSound("s_playDefaultSound", "1", CVAR_BOOL, "play a beep for
 idCVar s_maxSamples("s_maxSamples", "5", CVAR_INTEGER, "max samples to load per shader");
 #endif
 
+#if defined(__vita__)
+// Same reasoning as preLoad_Images, and worse per item: every ADPCM sample is
+// decoded to 16-bit PCM and then copied again by alBufferData, so an ambience
+// loop costs several megabytes twice over. Loading them when first played keeps
+// the map's whole sound set from having to be resident at once.
+idCVar preLoad_Samples("preLoad_Samples", "0", CVAR_SYSTEM | CVAR_BOOL, "preload samples during beginlevelload");
+#else
 idCVar preLoad_Samples("preLoad_Samples", "1", CVAR_SYSTEM | CVAR_BOOL, "preload samples during beginlevelload");
+#endif
 
 idSoundSystemLocal soundSystemLocal;
 idSoundSystem* soundSystem = &soundSystemLocal;
@@ -323,10 +332,14 @@ void idSoundSystemLocal::Render()
     SCOPED_PROFILE_EVENT("SoundSystem::Render");
 
     if (currentSoundWorld != NULL) {
+        VITA_ZONE("sound: world update");
         currentSoundWorld->Update();
     }
 
-    hardware.Update();
+    {
+        VITA_ZONE("sound: hardware update");
+        hardware.Update();
+    }
 
     // The sound system doesn't use game time or anything like that because the sounds are decoded in real time.
     soundTime = Sys_Milliseconds();
@@ -628,6 +641,10 @@ void idSoundSystemLocal::EndLevelLoad()
     int end = Sys_Milliseconds();
 
     common->Printf("%5i sounds loaded in %5.1f seconds\n", loadCount, (end - start) * 0.001);
+#if defined(ID_SOUND_STREAM)
+    SoundStream_PrintStats("after level load");
+    idSoundVoice_OpenAL::StreamSelfTest();
+#endif
     common->Printf("----------------------------------------\n");
 }
 

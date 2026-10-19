@@ -78,6 +78,9 @@ struct staticShadowVolumeParms_t {
     // next in chain on view entity
     staticShadowVolumeParms_t* next;
     int pad[3];
+    // for the log (slow jobs): the model and the light (its index)
+    const char* debugModel;
+    int debugLight;
 };
 
 void StaticShadowVolumeJob(const staticShadowVolumeParms_t* parms);

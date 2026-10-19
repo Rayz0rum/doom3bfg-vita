@@ -31,6 +31,28 @@ If you have questions concerning this license or the applicable additional terms
 
 const static int NUM_CONTROLS_OPTIONS = 8;
 
+#if defined(__vita__)
+// The stock handlers use the command id as the option's position in the list.
+// That holds only while every option exists; with options compiled out on the
+// Vita a command id can point past the end of the list, and SetFocusIndex()
+// then dereferences a widget that is not there (crash entering the Gamepad
+// screen from Controls). Find where the pressed option really is instead.
+static int VitaSlotOfWidget(idMenuWidget_DynamicList* list, const idMenuWidget* widget)
+{
+    if (list == NULL || widget == NULL) {
+        return -1;
+    }
+    const idMenuWidgetList& children = list->GetChildren();
+    for (int i = 0; i < children.Num(); i++) {
+        if (children[i] == widget) {
+            const int slot = i - list->GetViewOffset();
+            return (slot >= 0 && slot < list->GetNumVisibleOptions()) ? slot : -1;
+        }
+    }
+    return -1;
+}
+#endif
+
 enum gamepadMenuCmds_t {
 #ifndef ID_PC
     GAMEPAD_CMD_CONFIG,
@@ -42,7 +64,18 @@ enum gamepadMenuCmds_t {
     GAMEPAD_CMD_VERT_SENS,
     GAMEPAD_CMD_ACCELERATION,
     GAMEPAD_CMD_THRESHOLD,
+#if defined(__vita__)
+    GAMEPAD_CMD_REAR_LEFT_DEADZONE,
+    GAMEPAD_CMD_REAR_RIGHT_DEADZONE,
+#endif
 };
+
+#if defined(__vita__)
+extern idCVar vita_rearTouchLeftDeadzone;
+extern idCVar vita_rearTouchRightDeadzone;
+// the sliders run 0..100; the deadzone cvars 0..0.9 of a half
+static const float VITA_REAR_DEADZONE_MAX = 0.9f;
+#endif
 
 /*
 ========================
@@ -73,9 +106,13 @@ void idMenuScreen_Shell_Gamepad::Initialize(idMenuHandler* data)
 
     btnBack = new (TAG_SWF) idMenuWidget_Button();
     btnBack->Initialize(data);
+#if defined(__vita__)
+    btnBack->SetLabel("#str_swf_settings"); // Settings -> Controls is this screen
+#else
     idStr controls(idLocalization::GetString("#str_04158"));
     controls.ToUpper();
     btnBack->SetLabel(controls);
+#endif
     btnBack->SetSpritePath(GetSpritePath(), "info", "btnBack");
     btnBack->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_GO_BACK);
     AddChild(btnBack);
@@ -84,13 +121,19 @@ void idMenuScreen_Shell_Gamepad::Initialize(idMenuHandler* data)
 #ifndef ID_PC
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_BUTTON_TEXT);
+#if defined(__vita__)
+    control->SetLabel("#str_swf_controller_layout"); // CONTROLLER LAYOUT: view the fixed Vita scheme
+#else
     control->SetLabel("#str_swf_gamepad_config"); // Gamepad Configuration
+#endif
     control->SetDescription("#str_swf_config_desc");
     control->RegisterEventObserver(helpWidget);
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, GAMEPAD_CMD_CONFIG);
     options->AddChild(control);
 #endif
 
+#if !defined(__vita__)
+    // fixed Vita scheme: no lefty flip (it swaps the sticks)
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TOGGLE);
     control->SetLabel("#str_swf_lefty_flip");
@@ -99,6 +142,7 @@ void idMenuScreen_Shell_Gamepad::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, GAMEPAD_CMD_LEFTY);
     control->RegisterEventObserver(helpWidget);
     options->AddChild(control);
+#endif
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TOGGLE);
@@ -109,6 +153,8 @@ void idMenuScreen_Shell_Gamepad::Initialize(idMenuHandler* data)
     control->RegisterEventObserver(helpWidget);
     options->AddChild(control);
 
+#if !defined(__vita__)
+    // the Vita has no rumble motor
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_TOGGLE);
     control->SetLabel("#str_swf_vibration");
@@ -117,6 +163,7 @@ void idMenuScreen_Shell_Gamepad::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, GAMEPAD_CMD_VIBRATE);
     control->RegisterEventObserver(helpWidget);
     options->AddChild(control);
+#endif
 
     control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_SLIDER_BAR);
@@ -153,6 +200,29 @@ void idMenuScreen_Shell_Gamepad::Initialize(idMenuHandler* data)
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, GAMEPAD_CMD_THRESHOLD);
     control->RegisterEventObserver(helpWidget);
     options->AddChild(control);
+
+#if defined(__vita__)
+    control = new (TAG_SWF) idMenuWidget_ControlButton();
+    control->SetOptionType(OPTION_SLIDER_BAR);
+    control->SetLabel("#str_vita_rear_left");
+    // the help line above the prompts fits 42 characters
+    control->SetDescription("#str_vita_rear_left_desc");
+    control->SetDataSource(&gamepadData, idMenuDataSource_GamepadSettings::GAMEPAD_FIELD_REAR_LEFT_DEADZONE);
+    control->SetupEvents(2, options->GetChildren().Num());
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, GAMEPAD_CMD_REAR_LEFT_DEADZONE);
+    control->RegisterEventObserver(helpWidget);
+    options->AddChild(control);
+
+    control = new (TAG_SWF) idMenuWidget_ControlButton();
+    control->SetOptionType(OPTION_SLIDER_BAR);
+    control->SetLabel("#str_vita_rear_right");
+    control->SetDescription("#str_vita_rear_right_desc");
+    control->SetDataSource(&gamepadData, idMenuDataSource_GamepadSettings::GAMEPAD_FIELD_REAR_RIGHT_DEADZONE);
+    control->SetupEvents(2, options->GetChildren().Num());
+    control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_COMMAND, GAMEPAD_CMD_REAR_RIGHT_DEADZONE);
+    control->RegisterEventObserver(helpWidget);
+    options->AddChild(control);
+#endif
 
     options->AddEventAction(WIDGET_EVENT_SCROLL_DOWN).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_SCROLL_DOWN_START_REPEATER, WIDGET_EVENT_SCROLL_DOWN));
     options->AddEventAction(WIDGET_EVENT_SCROLL_UP).Set(new (TAG_SWF) idWidgetActionHandler(options, WIDGET_ACTION_EVENT_SCROLL_UP_START_REPEATER, WIDGET_EVENT_SCROLL_UP));
@@ -266,7 +336,11 @@ bool idMenuScreen_Shell_Gamepad::HandleAction(idWidgetAction& action, const idWi
 
     switch (actionType) {
     case WIDGET_ACTION_GO_BACK: {
+#if defined(__vita__)
+        menuData->SetNextScreen(SHELL_AREA_SETTINGS, MENU_TRANSITION_SIMPLE);
+#else
         menuData->SetNextScreen(SHELL_AREA_CONTROLS, MENU_TRANSITION_SIMPLE);
+#endif
         return true;
     }
     case WIDGET_ACTION_COMMAND: {
@@ -276,9 +350,16 @@ bool idMenuScreen_Shell_Gamepad::HandleAction(idWidgetAction& action, const idWi
         }
 
         int selectionIndex = options->GetFocusIndex();
+#if defined(__vita__)
+        const int slot = VitaSlotOfWidget(options, widget);
+        if (slot >= 0) {
+            selectionIndex = slot;
+        }
+#else
         if (parms.Num() > 0) {
             selectionIndex = parms[0].ToInteger();
         }
+#endif
 
         if (selectionIndex != options->GetFocusIndex()) {
             options->SetViewIndex(options->GetViewOffset() + selectionIndex);
@@ -327,6 +408,18 @@ bool idMenuScreen_Shell_Gamepad::HandleAction(idWidgetAction& action, const idWi
             options->Update();
             break;
         }
+#if defined(__vita__)
+        case GAMEPAD_CMD_REAR_LEFT_DEADZONE: {
+            gamepadData.AdjustField(idMenuDataSource_GamepadSettings::GAMEPAD_FIELD_REAR_LEFT_DEADZONE, 1);
+            options->Update();
+            break;
+        }
+        case GAMEPAD_CMD_REAR_RIGHT_DEADZONE: {
+            gamepadData.AdjustField(idMenuDataSource_GamepadSettings::GAMEPAD_FIELD_REAR_RIGHT_DEADZONE, 1);
+            options->Update();
+            break;
+        }
+#endif
         }
 
         return true;
@@ -389,6 +482,10 @@ void idMenuScreen_Shell_Gamepad::idMenuDataSource_GamepadSettings::LoadData()
     fields[GAMEPAD_FIELD_VERT_SENS].SetFloat(100.0f * ((joy_pitchSpeed.GetFloat() - 60.0f) / 200.0f));
     fields[GAMEPAD_FIELD_ACCELERATION].SetBool(joy_gammaLook.GetBool());
     fields[GAMEPAD_FIELD_THRESHOLD].SetBool(joy_mergedThreshold.GetBool());
+#if defined(__vita__)
+    fields[GAMEPAD_FIELD_REAR_LEFT_DEADZONE].SetFloat(100.0f * vita_rearTouchLeftDeadzone.GetFloat() / VITA_REAR_DEADZONE_MAX);
+    fields[GAMEPAD_FIELD_REAR_RIGHT_DEADZONE].SetFloat(100.0f * vita_rearTouchRightDeadzone.GetFloat() / VITA_REAR_DEADZONE_MAX);
+#endif
 
     originalFields = fields;
 }
@@ -407,11 +504,19 @@ void idMenuScreen_Shell_Gamepad::idMenuDataSource_GamepadSettings::CommitData()
     joy_pitchSpeed.SetFloat(((fields[GAMEPAD_FIELD_VERT_SENS].ToFloat() / 100.0f) * 200.0f) + 60.0f);
     joy_gammaLook.SetBool(fields[GAMEPAD_FIELD_ACCELERATION].ToBool());
     joy_mergedThreshold.SetBool(fields[GAMEPAD_FIELD_THRESHOLD].ToBool());
+#if defined(__vita__)
+    vita_rearTouchLeftDeadzone.SetFloat(VITA_REAR_DEADZONE_MAX * fields[GAMEPAD_FIELD_REAR_LEFT_DEADZONE].ToFloat() / 100.0f);
+    vita_rearTouchRightDeadzone.SetFloat(VITA_REAR_DEADZONE_MAX * fields[GAMEPAD_FIELD_REAR_RIGHT_DEADZONE].ToFloat() / 100.0f);
+    common->Printf("vita: rear touch deadzones set from the menu: left %.0f%%, right %.0f%% of each half\n",
+        100.0f * vita_rearTouchLeftDeadzone.GetFloat(), 100.0f * vita_rearTouchRightDeadzone.GetFloat());
+#endif
 
+#if !defined(__vita__)
     idPlayerProfile* profile = session->GetProfileFromMasterLocalUser();
     if (profile != NULL) {
         profile->SetLeftyFlip(fields[GAMEPAD_FIELD_LEFTY].ToBool());
     }
+#endif
     cvarSystem->SetModifiedFlags(CVAR_ARCHIVE);
 
     // make the committed fields into the backup fields
@@ -469,6 +574,14 @@ bool idMenuScreen_Shell_Gamepad::idMenuDataSource_GamepadSettings::IsDataChanged
     if (fields[GAMEPAD_FIELD_THRESHOLD].ToBool() != originalFields[GAMEPAD_FIELD_THRESHOLD].ToBool()) {
         return true;
     }
+#if defined(__vita__)
+    if (fields[GAMEPAD_FIELD_REAR_LEFT_DEADZONE].ToFloat() != originalFields[GAMEPAD_FIELD_REAR_LEFT_DEADZONE].ToFloat()) {
+        return true;
+    }
+    if (fields[GAMEPAD_FIELD_REAR_RIGHT_DEADZONE].ToFloat() != originalFields[GAMEPAD_FIELD_REAR_RIGHT_DEADZONE].ToFloat()) {
+        return true;
+    }
+#endif
 
     return false;
 }

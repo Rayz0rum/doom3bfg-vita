@@ -92,6 +92,8 @@ public:
     virtual void PushPointIntoAreaNum(int areaNum, idVec3& origin) const = 0;
     // Returns a reachable point inside the given area.
     virtual idVec3 AreaCenter(int areaNum) const = 0;
+    // Returns the number of areas (the benchmark's scan walks them).
+    virtual int NumAreas() const = 0;
     // Returns the area flags.
     virtual int AreaFlags(int areaNum) const = 0;
     // Returns the travel flags for traveling through the area.

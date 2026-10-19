@@ -103,7 +103,10 @@ Sys_ClockTicksPerSecond
 double Sys_ClockTicksPerSecond()
 {
     static double ticks = 0;
-#if 0
+#if defined(_WIN64)
+    // Sys_GetClockTicks() reads QueryPerformanceCounter on 64-bit builds, so
+    // its rate is QueryPerformanceFrequency - not the CPU's MHz from the
+    // registry, which made Sys_Microseconds() run hundreds of times slow
 
 	if ( !ticks ) {
 		LARGE_INTEGER li;

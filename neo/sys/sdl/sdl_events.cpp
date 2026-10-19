@@ -44,6 +44,33 @@ If you have questions concerning this license or the applicable additional terms
 #include "sdl_local.h"
 #include "../posix/posix_public.h"
 
+#if defined(__vita__)
+#include <psp2/touch.h>
+
+/*
+Rear touch pad as two buttons: the left half is JOY15, the right half JOY16
+(the Vita scheme binds them to the 180 degree quick turn and toggle sprint).
+Each half covers its whole height; only its outer edge can be made dead, so a
+finger resting on the rim of the pad while holding the Vita does nothing.
+
+The pad is read straight from sceTouchPeek once per input poll rather than
+through SDL's finger events, which stay ignored (they arrive continuously
+and nothing else in the engine wants them).
+*/
+idCVar vita_rearTouch("vita_rearTouch", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL,
+    "Vita: the rear touch pad's left and right halves act as buttons JOY15 and JOY16");
+idCVar vita_rearTouchLeftDeadzone("vita_rearTouchLeftDeadzone", "0.15", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT,
+    "Vita: part of the rear pad's LEFT half, measured in from its outer (left) edge, that ignores touches. "
+    "0 = the whole half counts, 0.5 = only the inner half of it, 0.9 = only a strip next to the centre", 0.0f, 0.9f);
+idCVar vita_rearTouchRightDeadzone("vita_rearTouchRightDeadzone", "0.15", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT,
+    "Vita: part of the rear pad's RIGHT half, measured in from its outer (right) edge, that ignores touches. "
+    "0 = the whole half counts, 0.5 = only the inner half of it, 0.9 = only a strip next to the centre", 0.0f, 0.9f);
+idCVar vita_rearTouchSwap("vita_rearTouchSwap", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL,
+    "Vita: mirror the rear pad left/right, should a unit report it mirrored");
+idCVar vita_rearTouchDebug("vita_rearTouchDebug", "0", CVAR_SYSTEM | CVAR_BOOL,
+    "Vita: log every rear touch report with its position, half and deadzone verdict");
+#endif
+
 #if !SDL_VERSION_ATLEAST(2, 0, 0)
 #define SDL_Keycode SDLKey
 #define SDLK_APPLICATION SDLK_COMPOSE
@@ -110,8 +137,249 @@ struct mouse_poll_t {
     }
 };
 
+struct joy_poll_t {
+    int action;
+    int value;
+
+    joy_poll_t()
+    {
+    }
+
+    joy_poll_t(int a, int v)
+    {
+        action = a;
+        value = v;
+    }
+};
+
 static idList<kbd_poll_t> kbd_polls;
 static idList<mouse_poll_t> mouse_polls;
+
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+
+/*
+================================================================================
+Gamepad input
+
+This backend previously left every Sys_*JoystickInputEvent* function as a stub,
+which is survivable on a desktop and fatal on a console: the PS Vita has no
+keyboard and no mouse, so the pad is the only input device there is.
+
+SDL's game controller layer is used rather than the raw joystick API because it
+normalises everything to the Xbox layout that the rest of the engine already
+assumes - axes in -32768..32767 with +Y downward, triggers in 0..32767. That is
+the same shape win_input.cpp gets out of XInput, so the J_* mapping below is a
+straight transliteration of the joyRemap[] table there and the default binds in
+the shipped .cfg files keep their meaning. SDL carries a built-in "PSVita
+Controller" mapping, so this works on the Vita with no gamecontrollerdb entry.
+
+Two consumers have to be fed, and they are not the same thing:
+  - UsercmdGen reads the J_* action/value stream for gameplay (analog look/move)
+  - menus and the console read SE_KEY events with K_JOY* keys
+
+Buttons produce one of each. Axes produce an action/value pair every time they
+move, plus a synthetic key press/release when they cross the threshold, so stick
+and trigger input can drive menus. Sys_GetEvent() hands back a single event per
+call, so those synthetic keys go through a small pending queue.
+================================================================================
+*/
+static idList<joy_poll_t> joy_polls;
+static SDL_GameController* gameController = NULL;
+
+// Fraction of full deflection at which a stick or trigger counts as "pressed"
+// for menu navigation. Matches the range argument win_input.cpp passes.
+static const int JOY_KEY_THRESHOLD = 16384;
+
+static const int MAX_PENDING_JOY_KEYS = 32;
+static sysEvent_t pendingJoyKeys[MAX_PENDING_JOY_KEYS];
+static int numPendingJoyKeys = 0;
+
+// Tracks which K_JOY* keys are currently down so that an axis held past the
+// threshold does not re-send a press every frame.
+static bool joyKeyState[K_JOY_DPAD_RIGHT - K_JOY1 + 1];
+
+// Last quantised value reported per axis, so SE_JOYSTICK is only sent on change.
+static int joyAxisPercent[MAX_JOYSTICK_AXIS];
+
+static void QueueJoyKey(int key, bool down)
+{
+    const int idx = key - K_JOY1;
+    if (idx < 0 || idx >= (int)(sizeof(joyKeyState) / sizeof(joyKeyState[0]))) {
+        return;
+    }
+    if (joyKeyState[idx] == down) {
+        return;
+    }
+    joyKeyState[idx] = down;
+
+    if (numPendingJoyKeys >= MAX_PENDING_JOY_KEYS) {
+        return;
+    }
+    sysEvent_t& ev = pendingJoyKeys[numPendingJoyKeys++];
+    ev.evType = SE_KEY;
+    ev.evValue = key;
+    ev.evValue2 = down ? 1 : 0;
+    ev.evPtrLength = 0;
+    ev.evPtr = NULL;
+}
+
+#if defined(__vita__)
+static bool vitaRearDown[2] = { false, false };
+static SceTouchPanelInfo vitaRearPanel;
+static int vitaRearPanelState = 0; // 0 = not asked yet, 1 = ok, -1 = unavailable
+
+static void PollVitaRearTouch()
+{
+    bool want[2] = { false, false };
+
+    if (vita_rearTouch.GetBool() && vitaRearPanelState >= 0) {
+        if (vitaRearPanelState == 0) {
+            memset(&vitaRearPanel, 0, sizeof(vitaRearPanel));
+            const int err = sceTouchGetPanelInfo(SCE_TOUCH_PORT_BACK, &vitaRearPanel);
+            if (err < 0 || vitaRearPanel.maxAaX <= vitaRearPanel.minAaX || vitaRearPanel.maxAaY <= vitaRearPanel.minAaY) {
+                common->Warning("vita: rear touch pad unavailable (sceTouchGetPanelInfo 0x%08X, area %d..%d x %d..%d) - rear touch controls off",
+                    (unsigned)err, vitaRearPanel.minAaX, vitaRearPanel.maxAaX, vitaRearPanel.minAaY, vitaRearPanel.maxAaY);
+                vitaRearPanelState = -1;
+                return;
+            }
+            vitaRearPanelState = 1;
+            common->Printf("vita: rear touch pad area x %d..%d, y %d..%d: left half = JOY15 (%s), right half = JOY16 (%s); "
+                           "outer deadzones %.0f%% / %.0f%% of each half%s\n",
+                vitaRearPanel.minAaX, vitaRearPanel.maxAaX, vitaRearPanel.minAaY, vitaRearPanel.maxAaY,
+                idKeyInput::GetBinding(K_JOY15), idKeyInput::GetBinding(K_JOY16),
+                100.0f * vita_rearTouchLeftDeadzone.GetFloat(), 100.0f * vita_rearTouchRightDeadzone.GetFloat(),
+                vita_rearTouchSwap.GetBool() ? ", mirrored" : "");
+        }
+
+        SceTouchData data;
+        memset(&data, 0, sizeof(data));
+        if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &data, 1) >= 0) {
+            const float x0 = vitaRearPanel.minAaX;
+            const float w = (float)(vitaRearPanel.maxAaX - vitaRearPanel.minAaX);
+            const float y0 = vitaRearPanel.minAaY;
+            const float h = (float)(vitaRearPanel.maxAaY - vitaRearPanel.minAaY);
+            const int reports = Min((int)data.reportNum, (int)(sizeof(data.report) / sizeof(data.report[0])));
+            for (int i = 0; i < reports; i++) {
+                float nx = idMath::ClampFloat(0.0f, 1.0f, (data.report[i].x - x0) / w);
+                const float ny = idMath::ClampFloat(0.0f, 1.0f, (data.report[i].y - y0) / h);
+                if (vita_rearTouchSwap.GetBool()) {
+                    nx = 1.0f - nx;
+                }
+                const int half = (nx < 0.5f) ? 0 : 1;
+                // 0 at the half's outer edge, 1 at the centre line
+                const float inward = (half == 0) ? nx * 2.0f : (1.0f - nx) * 2.0f;
+                float dead = (half == 0) ? vita_rearTouchLeftDeadzone.GetFloat() : vita_rearTouchRightDeadzone.GetFloat();
+                // a little hysteresis: a held touch drifting on the edge of the
+                // deadzone must not stutter the button (which would re-toggle sprint)
+                if (vitaRearDown[half]) {
+                    dead -= 0.04f;
+                }
+                const bool counts = inward >= dead;
+                if (counts) {
+                    want[half] = true;
+                }
+                if (vita_rearTouchDebug.GetBool()) {
+                    common->Printf("vita: rear touch id %d at (%d,%d) = (%.2f,%.2f): %s half, %.0f%% in from its edge, deadzone %.0f%% -> %s\n",
+                        data.report[i].id, data.report[i].x, data.report[i].y, nx, ny, half == 0 ? "left" : "right",
+                        100.0f * inward, 100.0f * dead, counts ? "PRESS" : "ignored");
+                }
+            }
+        }
+    }
+
+    for (int h = 0; h < 2; h++) {
+        if (want[h] == vitaRearDown[h]) {
+            continue;
+        }
+        vitaRearDown[h] = want[h];
+        const int key = (h == 0) ? K_JOY15 : K_JOY16;
+        // gameplay reads joy_polls (usercmd buttons such as _speed), menus and
+        // command binds (vita_quickTurn) read the SE_KEY event
+        joy_polls.Append(joy_poll_t((h == 0) ? J_ACTION15 : J_ACTION16, want[h] ? 1 : 0));
+        QueueJoyKey(key, want[h]);
+        common->Printf("vita: rear touch %s half %s (%s)\n", h == 0 ? "left" : "right", want[h] ? "pressed" : "released",
+            idKeyInput::GetBinding(key));
+    }
+}
+#endif
+
+// Maps an SDL controller button to the engine's J_* action, and to the K_JOY*
+// key the menus listen for. Returns false for buttons the engine has no slot for.
+static bool JoyButtonToAction(Uint8 sdlButton, int& action, int& key)
+{
+    switch (sdlButton) {
+    case SDL_CONTROLLER_BUTTON_A:             action = J_ACTION1;  break;
+    case SDL_CONTROLLER_BUTTON_B:             action = J_ACTION2;  break;
+    case SDL_CONTROLLER_BUTTON_X:             action = J_ACTION3;  break;
+    case SDL_CONTROLLER_BUTTON_Y:             action = J_ACTION4;  break;
+    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  action = J_ACTION5;  break;
+    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: action = J_ACTION6;  break;
+    case SDL_CONTROLLER_BUTTON_LEFTSTICK:     action = J_ACTION7;  break;
+    case SDL_CONTROLLER_BUTTON_RIGHTSTICK:    action = J_ACTION8;  break;
+    case SDL_CONTROLLER_BUTTON_START:         action = J_ACTION9;  break;
+    case SDL_CONTROLLER_BUTTON_BACK:          action = J_ACTION10; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_UP:       action = J_DPAD_UP;    key = K_JOY_DPAD_UP;    return true;
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     action = J_DPAD_DOWN;  key = K_JOY_DPAD_DOWN;  return true;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:     action = J_DPAD_LEFT;  key = K_JOY_DPAD_LEFT;  return true;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:    action = J_DPAD_RIGHT; key = K_JOY_DPAD_RIGHT; return true;
+    default:
+        return false;
+    }
+    key = K_JOY1 + (action - J_ACTION1);
+    return true;
+}
+
+// Maps an SDL controller axis to the engine's J_AXIS_* action plus the pair of
+// K_JOY* keys its negative and positive halves stand for. Triggers only have a
+// positive half, so negKey comes back as 0.
+static bool JoyAxisToAction(Uint8 sdlAxis, int& action, int& negKey, int& posKey)
+{
+    switch (sdlAxis) {
+    case SDL_CONTROLLER_AXIS_LEFTX:
+        action = J_AXIS_LEFT_X;  negKey = K_JOY_STICK1_LEFT; posKey = K_JOY_STICK1_RIGHT; return true;
+    case SDL_CONTROLLER_AXIS_LEFTY:
+        action = J_AXIS_LEFT_Y;  negKey = K_JOY_STICK1_UP;   posKey = K_JOY_STICK1_DOWN;  return true;
+    case SDL_CONTROLLER_AXIS_RIGHTX:
+        action = J_AXIS_RIGHT_X; negKey = K_JOY_STICK2_LEFT; posKey = K_JOY_STICK2_RIGHT; return true;
+    case SDL_CONTROLLER_AXIS_RIGHTY:
+        action = J_AXIS_RIGHT_Y; negKey = K_JOY_STICK2_UP;   posKey = K_JOY_STICK2_DOWN;  return true;
+    case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+        action = J_AXIS_LEFT_TRIG;  negKey = 0; posKey = K_JOY_TRIGGER1; return true;
+    case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
+        action = J_AXIS_RIGHT_TRIG; negKey = 0; posKey = K_JOY_TRIGGER2; return true;
+    default:
+        return false;
+    }
+}
+
+static void OpenGameController()
+{
+    if (gameController != NULL) {
+        return;
+    }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (!SDL_IsGameController(i)) {
+            continue;
+        }
+        gameController = SDL_GameControllerOpen(i);
+        if (gameController != NULL) {
+            common->Printf("Gamepad: %s\n", SDL_GameControllerName(gameController));
+            return;
+        }
+    }
+}
+
+static void CloseGameController()
+{
+    if (gameController != NULL) {
+        SDL_GameControllerClose(gameController);
+        gameController = NULL;
+    }
+    memset(joyKeyState, 0, sizeof(joyKeyState));
+    numPendingJoyKeys = 0;
+}
+
+#endif // SDL2
 
 // RB begin
 static int SDL_KeyToDoom3Key(SDL_Keycode key, bool& isChar)
@@ -549,6 +817,42 @@ void Sys_InitInput()
     kbd_polls.SetGranularity(64);
     mouse_polls.SetGranularity(64);
 
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+    joy_polls.SetGranularity(64);
+    memset(joyKeyState, 0, sizeof(joyKeyState));
+    memset(joyAxisPercent, 0, sizeof(joyAxisPercent));
+    numPendingJoyKeys = 0;
+
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) < 0) {
+        common->Warning("Could not init SDL game controller subsystem: %s", SDL_GetError());
+    } else {
+        OpenGameController();
+    }
+
+    // The Vita's front and rear touchpads emit these continuously and nothing
+    // in the engine reads them, so keep them out of the queue entirely rather
+    // than paying to enqueue, gesture-process and then discard each one.
+    //
+    // The raw SDL_JOY* events are NOT suppressed this way even though they are
+    // pure duplicates of the GameController ones: SDL_PrivateJoystickAxis()
+    // checks SDL_GetEventState() before it pushes, and the GameController
+    // layer is an event *watcher* on that push, so ignoring the raw event
+    // would stop the translated one from ever being generated. They are
+    // swallowed in the Sys_GetEvent() switch instead.
+    static const Uint32 unusedEvents[] = {
+        SDL_FINGERDOWN, SDL_FINGERUP, SDL_FINGERMOTION,
+        SDL_MULTIGESTURE, SDL_DOLLARGESTURE, SDL_DOLLARRECORD
+    };
+    for (size_t i = 0; i < sizeof(unusedEvents) / sizeof(unusedEvents[0]); i++) {
+        SDL_EventState(unusedEvents[i], SDL_IGNORE);
+    }
+#if defined(__vita__)
+    // and no fake mouse clicks from either touch panel: K_MOUSE1 is bound to
+    // _attack by default.cfg, so a palm on the screen would fire the gun
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+#endif
+#endif
+
 #if !SDL_VERSION_ATLEAST(2, 0, 0)
     SDL_EnableUNICODE(1);
     SDL_EnableKeyRepeat(SDL_DEFAULT_REPEAT_DELAY, SDL_DEFAULT_REPEAT_INTERVAL);
@@ -566,6 +870,11 @@ void Sys_ShutdownInput()
 {
     kbd_polls.Clear();
     mouse_polls.Clear();
+
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+    CloseGameController();
+    joy_polls.Clear();
+#endif
 }
 
 /*
@@ -677,6 +986,73 @@ void Sys_GrabMouseCursor(bool grabIt)
 Sys_GetEvent
 ================
 */
+// Deferred events: produced while handling some other SDL event, and handed
+// back on a later call because Sys_GetEvent() can only return one at a time.
+// These live at file scope so PopDeferredEvent() can drain them both before
+// and after the SDL queue is polled.
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+static char* pendingChars = NULL; // SDL_TEXTINPUT string, one SE_CHAR per call
+static size_t pendingCharPos = 0;
+static int mwheelRel = 0;         // synthetic "mousewheel released" for SDL2
+#endif
+static byte pendingChar = 0;      // single SE_CHAR (console key, backspace)
+
+/*
+================
+PopDeferredEvent
+
+Returns true and fills res if a synthetic event is waiting. The order matches
+the sequence the original inline checks ran in.
+================
+*/
+static bool PopDeferredEvent(sysEvent_t& res)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+    if (pendingChars) {
+        res.evType = SE_CHAR;
+        res.evValue = pendingChars[pendingCharPos];
+
+        pendingCharPos++;
+        if (!pendingChars[pendingCharPos]) {
+            free(pendingChars);
+            pendingChars = NULL;
+            pendingCharPos = 0;
+        }
+        return true;
+    }
+
+    // DG: fake a "mousewheel not pressed anymore" event for SDL2
+    // so scrolling in menus stops after one step
+    if (mwheelRel) {
+        res.evType = SE_KEY;
+        res.evValue = mwheelRel;
+        res.evValue2 = 0; // "not pressed anymore"
+        mwheelRel = 0;
+        return true;
+    }
+    // DG end
+
+    // Synthetic K_JOY* presses from axis crossings.
+    if (numPendingJoyKeys > 0) {
+        res = pendingJoyKeys[0];
+        numPendingJoyKeys--;
+        for (int i = 0; i < numPendingJoyKeys; i++) {
+            pendingJoyKeys[i] = pendingJoyKeys[i + 1];
+        }
+        return true;
+    }
+#endif
+
+    if (pendingChar) {
+        res.evType = SE_CHAR;
+        res.evValue = pendingChar;
+        pendingChar = 0;
+        return true;
+    }
+
+    return false;
+}
+
 sysEvent_t Sys_GetEvent()
 {
     SDL_Event ev;
@@ -685,49 +1061,24 @@ sysEvent_t Sys_GetEvent()
 
     static const sysEvent_t res_none = { SE_NONE, 0, 0, 0, NULL };
 
-#if SDL_VERSION_ATLEAST(2, 0, 0)
-    static char* s = NULL;
-    static size_t s_pos = 0;
-
-    if (s) {
-        res.evType = SE_CHAR;
-        res.evValue = s[s_pos];
-
-        s_pos++;
-        if (!s[s_pos]) {
-            free(s);
-            s = NULL;
-            s_pos = 0;
-        }
-
+    if (PopDeferredEvent(res)) {
         return res;
     }
 
-    // DG: fake a "mousewheel not pressed anymore" event for SDL2
-    // so scrolling in menus stops after one step
-    static int mwheelRel = 0;
-    if (mwheelRel) {
-        res.evType = SE_KEY;
-        res.evValue = mwheelRel;
-        res.evValue2 = 0; // "not pressed anymore"
-        mwheelRel = 0;
-        return res;
-    }
-    // DG end
-#endif
+    // This used to poll a single SDL event per call and return SE_NONE for any
+    // event the engine has no use for - raw joystick duplicates, touchpad
+    // motion, an axis that moved but not far enough to change the quantised
+    // value the menus read. idEventLoop::RunEventLoop() stops the moment it
+    // sees SE_NONE, so every one of those cost a whole frame of draining: the
+    // pad pushes hundreds of events a second and the engine removed about one
+    // per frame. The backlog grew without bound, which is why input started
+    // out responsive and got steadily worse the longer the game ran.
+    //
+    // Now the uninteresting cases continue instead, so SE_NONE is only
+    // returned once the SDL queue is genuinely empty.
+    bool deferred = false;
 
-    static byte c = 0;
-
-    if (c) {
-        res.evType = SE_CHAR;
-        res.evValue = c;
-
-        c = 0;
-
-        return res;
-    }
-
-    if (SDL_PollEvent(&ev)) {
+    while (!deferred && SDL_PollEvent(&ev)) {
         switch (ev.type) {
 #if SDL_VERSION_ATLEAST(2, 0, 0)
         case SDL_WINDOWEVENT:
@@ -777,7 +1128,7 @@ sysEvent_t Sys_GetEvent()
                 // DG end
             }
 
-            return res_none;
+            continue;
 #else
         case SDL_ACTIVEEVENT: {
             // DG: (un-)pause the game when focus is gained, that also (un-)grabs the input
@@ -800,10 +1151,10 @@ sysEvent_t Sys_GetEvent()
             cvarSystem->SetCVarBool("com_pause", pause);
         }
 
-            return res_none;
+            continue;
 
         case SDL_VIDEOEXPOSE:
-            return res_none;
+            continue;
 
             // DG: handle resizing and moving of window
         case SDL_VIDEORESIZE: {
@@ -816,7 +1167,7 @@ sysEvent_t Sys_GetEvent()
             glConfig.nativeScreenHeight = h;
             // for some reason this needs a vid_restart in SDL1 but not SDL2 so GLimp_SetScreenParms() is called
             PushConsoleEvent("vid_restart");
-            return res_none;
+            continue;
         }
         // DG end
 #endif
@@ -833,7 +1184,7 @@ sysEvent_t Sys_GetEvent()
                 cvarSystem->SetCVarInteger("r_fullscreen", fullscreen);
                 // DG end
                 PushConsoleEvent("vid_restart");
-                return res_none;
+                continue;
             }
 
             // DG: ctrl-g to un-grab mouse - yeah, left ctrl shoots, then just use right ctrl :)
@@ -841,7 +1192,7 @@ sysEvent_t Sys_GetEvent()
                 bool grab = cvarSystem->GetCVarBool("in_nograb");
                 grab = !grab;
                 cvarSystem->SetCVarBool("in_nograb", grab);
-                return res_none;
+                continue;
             }
             // DG end
 
@@ -849,7 +1200,7 @@ sysEvent_t Sys_GetEvent()
             // DG: only do this for key-down, don't care about isChar from SDL_KeyToDoom3Key.
             //     if unicode is not 0 and is translatable to ASCII it should work..
             if (ev.key.state == SDL_PRESSED && (ev.key.keysym.unicode & 0xff80) == 0) {
-                c = ev.key.keysym.unicode & 0x7f;
+                pendingChar = ev.key.keysym.unicode & 0x7f;
             }
             // DG end
 #endif
@@ -861,7 +1212,7 @@ sysEvent_t Sys_GetEvent()
             // DG: special case for SDL_SCANCODE_GRAVE - the console key under Esc
             if (ev.key.keysym.scancode == SDL_SCANCODE_GRAVE) {
                 key = K_GRAVE;
-                c = K_BACKSPACE; // bad hack to get empty console inputline..
+                pendingChar = K_BACKSPACE; // bad hack to get empty console inputline..
             } // DG end, the original code is in the else case
             else {
                 key = SDL_KeyToDoom3Key(ev.key.keysym.sym, isChar);
@@ -872,17 +1223,17 @@ sysEvent_t Sys_GetEvent()
                     if (ev.type == SDL_KEYDOWN) // FIXME: don't complain if this was an ASCII char and the console is open?
                         common->Warning("unmapped SDL key %d scancode %d", ev.key.keysym.sym, ev.key.keysym.scancode);
 
-                    return res_none;
+                    continue;
 #else
                     unsigned char uc = ev.key.keysym.unicode & 0xff;
                     // check if its an unmapped console key
                     if (uc == Sys_GetConsoleKey(false) || uc == Sys_GetConsoleKey(true)) {
                         key = K_GRAVE;
-                        c = K_BACKSPACE; // bad hack to get empty console inputline..
+                        pendingChar = K_BACKSPACE; // bad hack to get empty console inputline..
                     } else {
                         if (ev.type == SDL_KEYDOWN) // FIXME: don't complain if this was an ASCII char and the console is open?
                             common->Warning("unmapped SDL key %d (0x%x) scancode %d", ev.key.keysym.sym, ev.key.keysym.unicode, ev.key.keysym.scancode);
-                        return res_none;
+                        continue;
                     }
 #endif
                 }
@@ -895,7 +1246,7 @@ sysEvent_t Sys_GetEvent()
             kbd_polls.Append(kbd_poll_t(key, ev.key.state == SDL_PRESSED));
 
             if (key == K_BACKSPACE && ev.key.state == SDL_PRESSED)
-                c = key;
+                pendingChar = key;
 
             return res;
         }
@@ -904,12 +1255,17 @@ sysEvent_t Sys_GetEvent()
         case SDL_TEXTINPUT:
             if (ev.text.text && *ev.text.text) {
                 if (!ev.text.text[1])
-                    c = *ev.text.text;
+                    pendingChar = *ev.text.text;
                 else
-                    s = strdup(ev.text.text);
+                    pendingChars = strdup(ev.text.text);
+
+                // A second SDL_TEXTINPUT in the same drain would overwrite
+                // (and leak) what was just stashed, so stop here and let the
+                // post-loop PopDeferredEvent() hand this one back first.
+                deferred = true;
             }
 
-            return res_none;
+            continue;
 #endif
 
         case SDL_MOUSEMOTION:
@@ -989,9 +1345,125 @@ sysEvent_t Sys_GetEvent()
 
             return res;
 
+        case SDL_CONTROLLERDEVICEADDED:
+            OpenGameController();
+            continue;
+
+        case SDL_CONTROLLERDEVICEREMOVED:
+            if (gameController != NULL
+                && ev.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gameController))) {
+                CloseGameController();
+            }
+            continue;
+
+        case SDL_CONTROLLERBUTTONDOWN:
+        case SDL_CONTROLLERBUTTONUP: {
+            int action = 0;
+            int key = 0;
+            if (!JoyButtonToAction(ev.cbutton.button, action, key)) {
+                continue;
+            }
+
+            const bool down = (ev.cbutton.state == SDL_PRESSED);
+            joy_polls.Append(joy_poll_t(action, down ? 1 : 0));
+
+            const int idx = key - K_JOY1;
+            if (idx >= 0 && idx < (int)(sizeof(joyKeyState) / sizeof(joyKeyState[0]))) {
+                joyKeyState[idx] = down;
+            }
+
+            // UsercmdGen picks the button up from joy_polls via Joystick();
+            // this event is what the menus and console read.
+            res.evType = SE_KEY;
+            res.evValue = key;
+            res.evValue2 = down ? 1 : 0;
+            return res;
+        }
+
+        case SDL_CONTROLLERAXISMOTION: {
+            int action = 0;
+            int negKey = 0;
+            int posKey = 0;
+            if (!JoyAxisToAction(ev.caxis.axis, action, negKey, posKey)) {
+                continue;
+            }
+
+            const int value = ev.caxis.value;
+
+            // idUsercmdGenLocal::Joystick() handles an axis poll as a plain
+            // "set this axis to this value", so position in the list does not
+            // matter and only the newest sample of each axis survives anyway.
+            // Overwriting the existing entry keeps the list at six entries
+            // instead of however many samples a frame's worth of stick jitter
+            // produced. Buttons are never merged - Key() has edge semantics,
+            // so a press and its release have to stay as two ordered entries.
+            int existing = -1;
+            for (int i = joy_polls.Num() - 1; i >= 0; i--) {
+                if (joy_polls[i].action == action) {
+                    existing = i;
+                    break;
+                }
+            }
+            if (existing >= 0) {
+                joy_polls[existing].value = value;
+            } else {
+                joy_polls.Append(joy_poll_t(action, value));
+            }
+
+            // Let the stick drive menus as well. These are queued rather than
+            // returned because one axis move can release one key and press another.
+            if (negKey != 0) {
+                QueueJoyKey(negKey, value < -JOY_KEY_THRESHOLD);
+            }
+            QueueJoyKey(posKey, value > JOY_KEY_THRESHOLD);
+
+            // Menus read SE_JOYSTICK and scale evValue2 by 1/32 (SWF_Events.cpp),
+            // so it has to carry the same quantised -16..16 that win_input.cpp
+            // sends, not the raw axis. Only emit when that quantised value
+            // actually changes, otherwise a resting stick floods the queue.
+            const int axis = action - J_AXIS_MIN;
+            const int percent = (value * 16) / 32768;
+            if (axis >= 0 && axis < MAX_JOYSTICK_AXIS && joyAxisPercent[axis] != percent) {
+                joyAxisPercent[axis] = percent;
+                res.evType = SE_JOYSTICK;
+                res.evValue = axis;
+                res.evValue2 = percent;
+                return res;
+            }
+            continue;
+        }
+
+        // SDL reports every pad movement twice: once through the GameController
+        // layer we actually read above, and once as the raw joystick event
+        // underneath it. Swallow the raw ones. Warning about them costs a full
+        // open/write/close of ux0:data/doom3bfg/console.txt per axis sample,
+        // which is hundreds of file operations a second on a resting stick.
+        case SDL_JOYAXISMOTION:
+        case SDL_JOYBALLMOTION:
+        case SDL_JOYHATMOTION:
+        case SDL_JOYBUTTONDOWN:
+        case SDL_JOYBUTTONUP:
+        case SDL_JOYDEVICEADDED:
+        case SDL_JOYDEVICEREMOVED:
+            continue;
+
+        // The Vita's front and rear touchpads emit these continuously, and the
+        // engine does not use them. Falling through to the default case below
+        // logged one warning per event - hundreds of console.txt writes a
+        // second - and the event loop spent its time blocked on the SD card
+        // instead of delivering input, which is why the controller felt
+        // massively delayed. Same trap as the joystick axes above.
+        case SDL_FINGERDOWN:
+        case SDL_FINGERUP:
+        case SDL_FINGERMOTION:
+        case SDL_MULTIGESTURE:
+        case SDL_DOLLARGESTURE:
+        case SDL_DOLLARRECORD:
+            continue;
+
         case SDL_QUIT:
             PushConsoleEvent("quit");
-            return res_none;
+            continue;
 
         case SDL_USEREVENT:
             switch (ev.user.code) {
@@ -1002,12 +1474,28 @@ sysEvent_t Sys_GetEvent()
                 return res;
             default:
                 common->Warning("unknown user event %u", ev.user.code);
-                return res_none;
+                continue;
             }
         default:
-            common->Warning("unknown event %u", ev.type);
-            return res_none;
+            // Rate-limited deliberately. Every warning is a separate
+            // open/write/close of console.txt on this platform, so an event
+            // type that arrives every frame turns a diagnostic into a hang.
+            // Report each type once and then stay quiet.
+            {
+                static idList<unsigned int> reported;
+                if (reported.Find(ev.type) == NULL && reported.Num() < 16) {
+                    reported.Append(ev.type);
+                    common->Warning("unknown event %u (further reports of this type suppressed)", ev.type);
+                }
+            }
+            continue;
         }
+    }
+
+    // Anything queued while draining (text input, joystick threshold keys) is
+    // delivered here instead of waiting for the next call.
+    if (PopDeferredEvent(res)) {
+        return res;
     }
 
     return res_none;
@@ -1110,21 +1598,48 @@ int Sys_PollMouseInputEvents(int mouseEvents[MAX_MOUSE_EVENTS][2])
 
 void Sys_SetRumble(int device, int low, int hi)
 {
-    // TODO;
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+    if (gameController != NULL) {
+        // The engine passes 0..65535 per motor, which is what SDL wants too.
+        SDL_GameControllerRumble(gameController, (Uint16)low, (Uint16)hi, 100);
+    }
+#endif
 }
 
 int Sys_PollJoystickInputEvents(int deviceNum)
 {
-    // TODO;
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+    // Only one pad is tracked; the Vita has exactly one and the desktop builds
+    // have never used more.
+    if (deviceNum != 0 || gameController == NULL) {
+        return 0;
+    }
+#if defined(__vita__)
+    PollVitaRearTouch();
+#endif
+    return joy_polls.Num();
+#else
     return 0;
+#endif
 }
 
 int Sys_ReturnJoystickInputEvent(const int n, int& action, int& value)
 {
-    // TODO;
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+    if (n < 0 || n >= joy_polls.Num()) {
+        return 0;
+    }
+    action = joy_polls[n].action;
+    value = joy_polls[n].value;
+    return 1;
+#else
     return 0;
+#endif
 }
 
 void Sys_EndJoystickInputEvents()
 {
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+    joy_polls.SetNum(0);
+#endif
 }

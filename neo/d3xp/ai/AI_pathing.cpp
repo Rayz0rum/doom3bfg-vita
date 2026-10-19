@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 
 #include "../Game_local.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 /*
 ===============================================================================
@@ -966,11 +967,15 @@ bool idAI::FindPathAroundObstacles(const idPhysics* physics, const idAAS* aas, c
     bounds[1].z = 32.0f;
 
     // get the AAS area number and a valid point inside that area
+    VITA_ZONE_BEGIN(area, "obstacles: start area");
     areaNum = aas->PointReachableAreaNum(path.startPosOutsideObstacles, bounds, (AREA_REACHABLE_WALK | AREA_REACHABLE_FLY));
     aas->PushPointIntoAreaNum(areaNum, path.startPosOutsideObstacles);
+    VITA_ZONE_END(area);
 
     // get all the nearby obstacles
+    VITA_ZONE_BEGIN(gather, "obstacles: gather (entities + AAS walls)");
     numObstacles = GetObstacles(physics, aas, ignore, areaNum, path.startPosOutsideObstacles, path.seekPosOutsideObstacles, obstacles, MAX_OBSTACLES, clipBounds);
+    VITA_ZONE_END(gather);
 
     // get a source position outside the obstacles
     GetPointOutsideObstacles(obstacles, numObstacles, path.startPosOutsideObstacles.ToVec2(), &insideObstacle, NULL);
@@ -992,7 +997,9 @@ bool idAI::FindPathAroundObstacles(const idPhysics* physics, const idAAS* aas, c
     }
 
     // build a path tree
+    VITA_ZONE_BEGIN(tree, "obstacles: build path tree");
     root = BuildPathTree(obstacles, numObstacles, clipBounds, path.startPosOutsideObstacles.ToVec2(), path.seekPosOutsideObstacles.ToVec2(), path);
+    VITA_ZONE_END(tree);
 
     // draw the path tree
     if (ai_showObstacleAvoidance.GetBool()) {
@@ -1003,7 +1010,9 @@ bool idAI::FindPathAroundObstacles(const idPhysics* physics, const idAAS* aas, c
     PrunePathTree(root, path.seekPosOutsideObstacles.ToVec2());
 
     // find the optimal path
+    VITA_ZONE_BEGIN(optimal, "obstacles: optimal path");
     pathToGoalExists = FindOptimalPath(root, obstacles, numObstacles, physics->GetOrigin().z, physics->GetLinearVelocity(), path.seekPos);
+    VITA_ZONE_END(optimal);
 
     // free the tree
     FreePathTree_r(root);
@@ -1368,6 +1377,94 @@ static float HeightForTrajectory( const idVec3& start, float zVel, float gravity
 }
 #endif
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+/*
+=====================
+Vita: aim traces that leave the target out
+
+PredictTrajectory / TestTrajectory only ask whether the first thing the
+projectile's path hits counts as the target (gameLocal.GetTraceEntity: the
+target, or an entity bound to it such as the player's head), or whether
+nothing is hit. The target is usually an animated model traced triangle by
+triangle (posed for it, 1-2 ms on the Vita per check in a fight); the rest of
+the path is cheaper. So each segment is traced first without the target
+(idClip::TranslationSkipping), which also says whether any of the target's
+clip models could be touched before what it found:
+
+- nothing found, target out of reach: the stock trace finds nothing either
+- nothing found, target in reach: the stock trace finds the target or nothing
+  - yes either way, unless a later segment is blocked (then: stock trace)
+- something found, target out of reach before it (and not possibly hit on an
+  earlier segment): the stock trace finds that same thing first - no
+- something found, target in reach before it: the stock trace decides
+
+So the answer is the stock one in every case; vita_aimSkipTargetVerify runs
+the stock trace too and reports any difference. Left out: the stock trace's
+side effects on the target (its render model posed, its clip model's id set
+to the joint hit), which nothing reads back from these checks.
+=====================
+*/
+idCVar vita_aimSkipTarget("vita_aimSkipTarget", "1", CVAR_GAME | CVAR_BOOL, "AI aim checks trace the projectile path without the target first, and skip the target's triangles whenever they cannot change the answer");
+idCVar vita_aimSkipTargetVerify("vita_aimSkipTargetVerify", "0", CVAR_GAME | CVAR_BOOL, "test: also run the stock aim trace when the target was skipped, and report any difference");
+
+// 1 yes, 0 no, -1 the stock trace must decide
+static int Vita_AimWithoutTarget(const idVec3* points, int numSegments, const idClipModel* clip, int clipmask, const idEntity* ignore, const idEntity* targetEntity)
+{
+    bool targetMaybeHit = false;
+    for (int i = 0; i < numSegments; i++) {
+        trace_t trace;
+        bool reachable;
+        gameLocal.clip.TranslationSkipping(trace, points[i], points[i + 1], clip, mat3_identity, clipmask, ignore, targetEntity, &reachable);
+        if (trace.fraction >= 1.0f) {
+            targetMaybeHit |= reachable;
+            continue;
+        }
+        if (reachable || targetMaybeHit) {
+            VITA_ZONE_COUNT("ai aim: blocked, the target may come first (stock trace)");
+            return -1;
+        }
+        VITA_ZONE_COUNT("ai aim: no - blocked before the target's reach");
+        return 0;
+    }
+    VITA_ZONE_COUNT("ai aim: yes - nothing but the target on the path");
+    return 1;
+}
+
+static int Vita_StockAim(const idVec3* points, int numSegments, const idClipModel* clip, int clipmask, const idEntity* ignore, const idEntity* targetEntity)
+{
+    for (int i = 0; i < numSegments; i++) {
+        trace_t trace;
+        gameLocal.clip.Translation(trace, points[i], points[i + 1], clip, mat3_identity, clipmask, ignore);
+        if (trace.fraction < 1.0f) {
+            return (gameLocal.GetTraceEntity(trace) == targetEntity) ? 1 : 0;
+        }
+    }
+    return 1;
+}
+
+static void Vita_VerifyAimSkip(int fast, int stock)
+{
+    static int checks, mismatches;
+    checks++;
+    if (fast != stock && mismatches++ < 20) {
+        common->Printf("vita_aimSkipTargetVerify: MISMATCH - answered %s without the target, the stock trace says %s\n", fast ? "yes" : "no", stock ? "yes" : "no");
+    }
+    if ((checks % 200) == 0) {
+        common->Printf("vita_aimSkipTargetVerify: %d aim checks answered without the target's triangles, %d differ from the stock trace\n", checks, mismatches);
+    }
+}
+
+// the answer without the target where it can be had, else -1
+static int Vita_AimFastPath(const idVec3* points, int numSegments, const idClipModel* clip, int clipmask, const idEntity* ignore, const idEntity* targetEntity)
+{
+    const int fast = Vita_AimWithoutTarget(points, numSegments, clip, clipmask, ignore, targetEntity);
+    if (fast >= 0 && vita_aimSkipTargetVerify.GetBool()) {
+        Vita_VerifyAimSkip(fast, Vita_StockAim(points, numSegments, clip, clipmask, ignore, targetEntity));
+    }
+    return fast;
+}
+#endif
+
 /*
 =====================
 idAI::TestTrajectory
@@ -1428,6 +1525,15 @@ bool idAI::TestTrajectory(const idVec3& start, const idVec3& end, float zVel, fl
             return false;
         }
     }
+
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    if (vita_aimSkipTarget.GetBool() && !drawtime && targetEntity != NULL) {
+        const int fast = Vita_AimFastPath(points, numSegments, clip, clipmask, ignore, targetEntity);
+        if (fast >= 0) {
+            return (fast != 0);
+        }
+    }
+#endif
 
     result = true;
     for (i = 0; i < numSegments; i++) {
@@ -1490,6 +1596,15 @@ bool idAI::PredictTrajectory(const idVec3& firePos, const idVec3& target, float 
         aimDir = target - firePos;
         aimDir.Normalize();
 
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+        if (vita_aimSkipTarget.GetBool() && !drawtime) {
+            const idVec3 path[2] = { firePos, target };
+            const int fast = Vita_AimFastPath(path, 1, clip, clipmask, ignore, targetEntity);
+            if (fast >= 0) {
+                return (fast != 0);
+            }
+        }
+#endif
         gameLocal.clip.Translation(trace, firePos, target, clip, mat3_identity, clipmask, ignore);
 
         if (drawtime) {

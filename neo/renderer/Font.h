@@ -54,6 +54,9 @@ public:
 
     float GetGlyphWidth(float scale, uint32 idx) const;
     void GetScaledGlyph(float scale, uint32 idx, scaledGlyphInfo_t& glyphInfo) const;
+    // the verification (framework/VitaVerify.cpp): whether the font, following
+    // its aliases, has a glyph for this character
+    bool HasGlyph(uint32 idx) const;
 
 private:
     static idFont* RemapFont(const char* baseName);

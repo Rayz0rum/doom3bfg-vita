@@ -160,7 +160,11 @@ R_RenderMaskedSegRange
 			}
 
 			::g->sprtopscreen = ::g->centeryfrac - FixedMul( ::g->dc_texturemid, ::g->spryscale );
+#if defined(__vita__)
+			::g->dc_iscale = ( unsigned )( 4294967295.0 / ( double )( unsigned )::g->spryscale ); // VFP divide, same result
+#else
 			::g->dc_iscale = 0xffffffffu / ( unsigned )::g->spryscale;
+#endif
 
 			// draw the texture
 			col = ( postColumn_t* )(
@@ -266,7 +270,13 @@ void R_RenderSegLoop( void )
 
 			::g->dc_colormap = ::g->walllights[index];
 			::g->dc_x = ::g->rw_x;
+#if defined(__vita__)
+			// the A9 has no integer divide (a library call per column); the
+			// VFP double divide truncates to the same value
+			::g->dc_iscale = ( unsigned )( 4294967295.0 / ( double )( unsigned )::g->rw_scale );
+#else
 			::g->dc_iscale = 0xffffffffu / ( unsigned )::g->rw_scale;
+#endif
 		}
 
 		// draw the wall tiers

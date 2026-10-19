@@ -384,7 +384,7 @@ idTrigger_Multi::CheckFacing
 bool idTrigger_Multi::CheckFacing(idEntity* activator)
 {
     if (spawnArgs.GetBool("facing")) {
-        if (!activator->IsType(idPlayer::Type)) {
+        if (activator == NULL || !activator->IsType(idPlayer::Type)) {
             return true;
         }
         idPlayer* player = static_cast<idPlayer*>(activator);
@@ -892,14 +892,14 @@ void idTrigger_Timer::Event_Use(idEntity* activator)
 {
     // if on, turn it off
     if (on) {
-        if (offName.Length() && offName.Icmp(activator->GetName())) {
+        if (offName.Length() && (activator == NULL || offName.Icmp(activator->GetName()))) {
             return;
         }
         on = false;
         CancelEvents(&EV_Timer);
     } else {
         // turn it on
-        if (onName.Length() && onName.Icmp(activator->GetName())) {
+        if (onName.Length() && (activator == NULL || onName.Icmp(activator->GetName()))) {
             return;
         }
         on = true;

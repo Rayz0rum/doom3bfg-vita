@@ -920,6 +920,11 @@ public:
     void DebugDraw(const idVec4& color) const;
 
 private:
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // Physics_AF.cpp: Solve and Response with the side-by-side kernels
+    void VitaSolveFast(int auxiliaryIndex) const;
+    void VitaResponseFast(const idAFConstraint* constraint, int row, int auxiliaryIndex, idVecX& v) const;
+#endif
     idList<idAFBody*, TAG_IDLIB_LIST_PHYSICS> sortedBodies;
 };
 
@@ -991,6 +996,13 @@ public:
     void SetSuspendTolerance(const float noMoveTime, const float translationTolerance, const float rotationTolerance);
     // set minimum and maximum simulation time in seconds
     void SetSuspendTime(const float minTime, const float maxTime);
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // the .af file's own max move time, when vita_afMaxMoveTime set a shorter one
+    void VitaSetFileMaxMoveTime(float t)
+    {
+        vitaFileMaxMoveTime = t;
+    }
+#endif
     // set the time scale value
     void SetTimeScale(const float ts)
     {
@@ -1146,6 +1158,23 @@ private:
     float noMoveRotation;       // maximum rotation considered no movement
     float minMoveTime;          // if > 0 the simulation is never suspended before running this many seconds
     float maxMoveTime;          // if > 0 the simulation is always suspeded after running this many seconds
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+public:
+    // the full verification's view (VitaVerify_game.cpp)
+    float VitaActivateTime() const
+    {
+        return current.activateTime;
+    }
+private:
+    float vitaFileMaxMoveTime = -1.0f; // the file's (maxMoveTime is vita_afMaxMoveTime's cap), -1: not capped
+#endif
+#if defined(__vita__) || defined(ID_VITA_PHYSCHECK)
+    // VitaPhysCheck.h: where this activation started and its fastest body
+    bool vpcFromSet;
+    bool vpcLongLogged;     // "still moving" logged for this activation
+    idVec3 vpcFrom;
+    float vpcTopSpeedSqr;
+#endif
     float impulseThreshold;     // threshold below which impulses are ignored to avoid continuous activation
 
     float timeScale;          // the time is scaled with this value for slow motion effects

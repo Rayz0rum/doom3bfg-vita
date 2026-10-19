@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #pragma hdrstop
 #include "precompiled.h"
+#include "../../sys/vita/vita_zones.h" // VITA_ZONE: timing zones for the perf log
 
 #include "../Game_local.h"
 
@@ -1641,7 +1642,7 @@ void idPhysics_Player::Restore(idRestoreGame* savefile)
     savefile->ReadBool(ladder);
     savefile->ReadVec3(ladderNormal);
 
-    savefile->ReadInt((int&)waterLevel);
+    savefile->ReadEnum(waterLevel);
     savefile->ReadInt(waterType);
 }
 
@@ -1738,6 +1739,7 @@ idPhysics_Player::Evaluate
 */
 bool idPhysics_Player::Evaluate(int timeStepMSec, int endTimeMSec)
 {
+    VITA_ZONE("physics player");
     idVec3 masterOrigin, oldOrigin;
     idMat3 masterAxis;
 

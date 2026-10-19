@@ -381,6 +381,9 @@ private:
     short animNum;
     bool allowMove;
     bool allowFrameCommands;
+    // the start time whose frame commands have begun (vita: the first pass
+    // of a newly started animation always includes its first frame)
+    mutable int vitaCmdStart;
 
     friend class idAnimator;
 

@@ -379,13 +379,19 @@ void HU_Start( void )
 		default:
 			if( DoomLib::expansionSelected == 5 )
 			{
+				// No Rest for the Living has 9 maps. Any other map number is
+				// one of DOOM II's (its attract demos, played from DOOM2.WAD,
+				// start on MAP11 and later): stock code read mapNames[ -1 ]
+				// there and crashed sitting on the title screen
 				int map = ::g->gamemap;
-				if( ::g->gamemap > 9 )
+				if( map >= 1 && map <= 9 )
 				{
-					map = 0;
+					s = DoomLib::GetCurrentExpansion()->mapNames[ map - 1 ];
 				}
-
-				s = DoomLib::GetCurrentExpansion()->mapNames[ map - 1 ];
+				else
+				{
+					s = DoomLib::GetExpansion( doom2 )->mapNames[ idMath::ClampInt( 1, 32, map ) - 1 ];
+				}
 			}
 			else
 			{

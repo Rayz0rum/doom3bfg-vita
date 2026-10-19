@@ -28,10 +28,18 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 #include "precompiled.h"
 #include "../Game_local.h"
+#if defined(__vita__)
+#include "../../sys/vita/vita_ui.h"
+#endif
 
 const static int NUM_LAYOUT_OPTIONS = 1;
 
 const static int MAX_CONTROLLER_CONFIGS = 2;
+
+static const char* LayoutName(int configSet)
+{
+    return idLocalization::GetString(va("#str_swf_config_360_%i", configSet));
+}
 
 typedef struct
 {
@@ -75,7 +83,13 @@ void idMenuScreen_Shell_ControllerLayout::Initialize(idMenuHandler* data)
     SetSpritePath("menuControllerLayout");
 
     options = new (TAG_SWF) idMenuWidget_DynamicList();
+#if defined(__vita__)
+    // no layout selector on the Vita (see below): no slots, so the list never
+    // goes looking for an option to show
+    options->SetNumVisibleOptions(0);
+#else
     options->SetNumVisibleOptions(NUM_LAYOUT_OPTIONS);
+#endif
     options->SetSpritePath(GetSpritePath(), "info", "controlInfo", "options");
     options->SetWrappingAllowed(true);
     options->SetControlList(true);
@@ -89,6 +103,18 @@ void idMenuScreen_Shell_ControllerLayout::Initialize(idMenuHandler* data)
     btnBack->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_GO_BACK);
     AddChild(btnBack);
 
+#if defined(__vita__)
+    // the game stepper under the picture: left / right (D-pad or left stick)
+    // switches between the DOOM 3: BFG and the DOOM I & II schemes
+    AddEventAction(WIDGET_EVENT_SCROLL_LEFT).Set(WIDGET_ACTION_COMMAND, -1);
+    AddEventAction(WIDGET_EVENT_SCROLL_RIGHT).Set(WIDGET_ACTION_COMMAND, 1);
+    AddEventAction(WIDGET_EVENT_SCROLL_LEFT_LSTICK).Set(WIDGET_ACTION_COMMAND, -1);
+    AddEventAction(WIDGET_EVENT_SCROLL_RIGHT_LSTICK).Set(WIDGET_ACTION_COMMAND, 1);
+#endif
+
+#if !defined(__vita__)
+    // the Vita has one fixed scheme: this screen only shows it, so there is
+    // no layout selector
     idMenuWidget_ControlButton* control = new (TAG_SWF) idMenuWidget_ControlButton();
     control->SetOptionType(OPTION_BUTTON_FULL_TEXT_SLIDER);
     control->SetLabel("CONTROL LAYOUT"); // Auto Weapon Reload
@@ -96,6 +122,7 @@ void idMenuScreen_Shell_ControllerLayout::Initialize(idMenuHandler* data)
     control->SetupEvents(DEFAULT_REPEAT_TIME, options->GetChildren().Num());
     control->AddEventAction(WIDGET_EVENT_PRESS).Set(WIDGET_ACTION_PRESS_FOCUSED, options->GetChildren().Num());
     options->AddChild(control);
+#endif
 }
 
 /*
@@ -117,8 +144,10 @@ void idMenuScreen_Shell_ControllerLayout::Update()
             }
             buttonInfo->action.Set(WIDGET_ACTION_GO_BACK);
 
+#if !defined(__vita__)
             buttonInfo = cmdBar->GetButton(idMenuWidget_CommandBar::BUTTON_JOY1);
             buttonInfo->action.Set(WIDGET_ACTION_PRESS_FOCUSED);
+#endif
         }
     }
 
@@ -134,6 +163,14 @@ void idMenuScreen_Shell_ControllerLayout::Update()
         if (gradient != NULL && heading != NULL) {
             gradient->SetXPos(heading->GetTextLength());
         }
+
+#if defined(__vita__)
+        // no "Default Config" bar under the picture
+        idSWFSpriteInstance* layoutOptions = GetSprite()->GetScriptObject()->GetNestedSprite("info", "controlInfo", "options");
+        if (layoutOptions != NULL) {
+            layoutOptions->SetVisible(false);
+        }
+#endif
 
         if (menuData != NULL) {
             idSWFSpriteInstance* layout = NULL;
@@ -179,10 +216,42 @@ void idMenuScreen_Shell_ControllerLayout::ShowScreen(const mainMenuTransition_t 
             layout360->SetVisible(true);
             layoutPS3->SetVisible(false);
         }
+#if defined(__vita__)
+        // the 360 picture and its labels still "render" so we learn where they
+        // would be, but draw nothing; the Vita picture goes there instead
+        if (GetSWFObject() != NULL) {
+            GetSWFObject()->VitaSetCaptureSprite(layout360);
+        }
+        Vita_UI_ControllerLayoutShown();
+        idLib::Printf("vita: controller layout screen shown (layout360 sprite %s)\n", layout360 != NULL ? "found" : "MISSING");
+#endif
     }
 
     UpdateBindingInfo();
 }
+
+#if defined(__vita__)
+/*
+========================
+idMenuScreen_Shell_ControllerLayout::VitaDrawOverlay
+========================
+*/
+void idMenuScreen_Shell_ControllerLayout::VitaDrawOverlay()
+{
+    idSWF* swf = GetSWFObject();
+    if (swf == NULL) {
+        return;
+    }
+    idVec2 mins, maxs;
+    float alpha = 1.0f;
+    // nothing captured means the stock picture was not on screen this frame
+    // (screen sliding in/out, hidden): draw nothing either
+    if (!swf->VitaGetCaptureBounds(mins, maxs, &alpha)) {
+        return;
+    }
+    Vita_UI_DrawControllerLayout(swf, alpha);
+}
+#endif
 
 /*
 ========================
@@ -193,6 +262,8 @@ void idMenuScreen_Shell_ControllerLayout::HideScreen(const mainMenuTransition_t 
 {
     layoutData.CommitData();
     idMenuScreen::HideScreen(transitionType);
+    // (Vita: the capture stays set, so the stock 360 picture stays suppressed
+    // while this screen slides out; it is only a pointer comparison)
 }
 
 /*
@@ -253,6 +324,18 @@ bool idMenuScreen_Shell_ControllerLayout::HandleAction(idWidgetAction& action, c
     const idSWFParmList& parms = action.GetParms();
 
     switch (actionType) {
+#if defined(__vita__)
+    case WIDGET_ACTION_COMMAND: {
+        if (parms.Num() == 1) {
+            const int game = Vita_UI_GetControllerLayoutGame() + parms[0].ToInteger();
+            if (game >= 0 && game <= 1 && game != Vita_UI_GetControllerLayoutGame()) {
+                Vita_UI_SetControllerLayoutGame(game);
+                menuData->PlaySound(GUI_SOUND_SCROLL);
+            }
+        }
+        return true;
+    }
+#endif
     case WIDGET_ACTION_GO_BACK: {
         menuData->SetNextScreen(SHELL_AREA_GAMEPAD, MENU_TRANSITION_SIMPLE);
         return true;
@@ -331,7 +414,7 @@ void idMenuScreen_Shell_ControllerLayout::idMenuDataSource_LayoutSettings::LoadD
 
     int configSet = profile->GetConfig();
 
-    fields[LAYOUT_FIELD_LAYOUT].SetString(idLocalization::GetString(va("#str_swf_config_360_%i", configSet)));
+    fields[LAYOUT_FIELD_LAYOUT].SetString(LayoutName(configSet));
 
     originalFields = fields;
 }
@@ -376,7 +459,7 @@ void idMenuScreen_Shell_ControllerLayout::idMenuDataSource_LayoutSettings::Adjus
         }
     }
 
-    fields[LAYOUT_FIELD_LAYOUT].SetString(idLocalization::GetString(va("#str_swf_config_360_%i", configSet)));
+    fields[LAYOUT_FIELD_LAYOUT].SetString(LayoutName(configSet));
 
     profile->SetConfig(configSet, false);
 }

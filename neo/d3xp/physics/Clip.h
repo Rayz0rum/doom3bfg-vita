@@ -281,6 +281,14 @@ public:
     // clip versus the rest of the world
     bool Translation(trace_t& results, const idVec3& start, const idVec3& end,
         const idClipModel* mdl, const idMat3& trmAxis, int contentMask, const idEntity* passEntity);
+    // Translation that also leaves out every clip model a contact with would
+    // count as skipEntity (gameLocal.GetTraceEntity: its own, or those of the
+    // entities bound to it). skippedReachable (if given): whether any of those
+    // models could have been touched before the contact found (or the end) -
+    // false means none could, so the stock Translation's result is this one.
+    bool TranslationSkipping(trace_t& results, const idVec3& start, const idVec3& end,
+        const idClipModel* mdl, const idMat3& trmAxis, int contentMask, const idEntity* passEntity, const idEntity* skipEntity,
+        bool* skippedReachable = NULL);
     bool Rotation(trace_t& results, const idVec3& start, const idRotation& rotation,
         const idClipModel* mdl, const idMat3& trmAxis, int contentMask, const idEntity* passEntity);
     bool Motion(trace_t& results, const idVec3& start, const idVec3& end, const idRotation& rotation,
