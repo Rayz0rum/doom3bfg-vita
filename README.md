@@ -26,7 +26,7 @@
 BFG Edition experience - and on Rinnegatamante's vitaGL.
 
 The BFG Edition was made for consoles with 512 MB of unified memory and far stronger processors. Getting it onto a
-handheld with a 500 Mhz CPU (with the bundled plugin), a 222 MHz GPU and memory split between separate pools
+handheld with a 500 MHz CPU (with the bundled plugin), a 222 MHz GPU and memory split between separate pools
 meant reworking most of the engine's hot paths for the Vita: the renderer's shadow volumes, skinning and culling on
 NEON, streamed and compressed sound, dynamic resolution for the 3D view, texture budgets, the job system across the
 Vita's cores, a hardware video player, and a test harness (hold **L + R** at the title screen) that plays through
