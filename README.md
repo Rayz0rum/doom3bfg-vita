@@ -96,6 +96,7 @@ The PC game's videos are Bink files, which the Vita cannot play. Convert them on
 
 ```
 python tools/vita/convert_video.py <path to ffmpeg> "<PC game>/base/video" <output folder>
+python tools/vita/convert_video.py <path to ffmpeg> "<PC game>/base/sound/VO/video" <output folder>
 python tools/vita/make_roq.py <path to ffmpeg> "<PC game>/base" <output base folder>
 ```
 
@@ -104,7 +105,7 @@ python tools/vita/make_roq.py <path to ffmpeg> "<PC game>/base" <output base fol
 - `make_roq.py` makes the few `.roq` software videos for the screens that play at the same time as another one
   (the Vita's hardware decoder runs one video at a time).
 
-Copy the results into `ux0:data/doom3bfg/base/video/` keeping the sub-folders. Without them the game runs fine;
+Copy the appropriate results into `ux0:data/doom3bfg/base/video/` and `ux0:data/doom3bfg/base/sound/VO/video/` keeping the sub-folders. Without them the game runs fine;
 the screens and cutscenes just show no video.
 
 ## Building
